@@ -2,8 +2,9 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { startHarness, type Harness } from "./helpers/tool-harness.js";
 import { BridgeReplyError, SILENT } from "./helpers/fake-bridge.js";
-import { registerPositionTools, quatFromEuler, quatEquivalent, mirrorAcrossCentre, expandPlan, type Quat, type Vec3 } from "../src/tools/positions.js";
+import { registerPositionTools, placeFixtures, quatFromEuler, quatEquivalent, mirrorAcrossCentre, expandPlan, type Quat, type Vec3 } from "../src/tools/positions.js";
 import { Validator } from "../src/validate.js";
+import { BridgeError } from "../src/bridge.js";
 
 /**
  * SU-04 position tools. The rotation maths is checked against the quaternions onPC 2.5.1 reported
@@ -372,4 +373,67 @@ test("review round 2: a write that executed without a reply is state unknown, ne
   } finally {
     await h.close();
   }
+});
+
+test("placeFixtures: the supplied guarded writer exclusively applies every property and keeps read-back verification", async () => {
+  const { h, s, sets } = await setup();
+  try {
+    const writes: Array<{ fid: number; property: string; value: number | string; timeoutMs: number }> = [];
+    const result = await placeFixtures(h.ctx, { placements: [{ fid: 101, position: { x: 1.234567, y: 2, z: 3 }, rotation: { x: 0, y: 0, z: 90 }, mirror_mesh: true }] }, async (write: typeof writes[number]) => {
+      writes.push(write);
+      const fixture = s.fixtures.get(write.fid)!;
+      if (write.property.startsWith("POS")) fixture.pos[write.property.slice(3).toLowerCase() as "x" | "y" | "z"] = Number(write.value);
+      if (write.property === "ROTDIRECT") fixture.q = String(write.value).split(",").map(Number) as Quat;
+      if (write.property === "MESHMIRRORX") fixture.mirror = write.value === "1";
+      return { value: write.value };
+    });
+    assert.equal(result.outcome, "succeeded");
+    assert.equal(result.verification.status, "matched");
+    assert.deepEqual(writes.map(({ property, value }) => ({ property, value })), [
+      { property: "POSX", value: 1.23457 }, { property: "POSY", value: 2 }, { property: "POSZ", value: 3 },
+      { property: "ROTDIRECT", value: quatFromEuler({ x: 0, y: 0, z: 90 }).map((n) => Math.round(n * 1e9) / 1e9).join(",") },
+      { property: "MESHMIRRORX", value: "1" },
+    ]);
+    assert(writes.every((write) => write.fid === 101 && write.timeoutMs === h.ctx.requestTimeoutMs));
+    assert.deepEqual(sets(), [], "no FID-only set bypasses the supplied writer");
+    assert.deepEqual(s.fixtures.get(101)!.pos, { x: 1.23457, y: 2, z: 3 });
+    assert.equal(s.fixtures.get(101)!.mirror, true);
+  } finally { await h.close(); }
+});
+
+test("placeFixtures: a guarded writer refusal stops later properties and fixtures without a generic-set fallback", async () => {
+  const { h, s, sets } = await setup();
+  try {
+    const writes: string[] = [];
+    const result = await placeFixtures(h.ctx, { placements: [{ fid: 101, position: { x: 1, y: 2, z: 3 } }, { fid: 102, position: { x: 4 } }] }, async (write: { fid: number; property: string; value: number | string }) => {
+      writes.push(`${write.fid}.${write.property}`);
+      if (write.property === "POSY") throw new BridgeError("[target-changed] UUID changed before Set", "lua", false, "target-changed");
+      s.fixtures.get(write.fid)!.pos.x = Number(write.value);
+      return { value: write.value };
+    });
+    assert.equal(result.outcome, "partial");
+    assert.equal(result.verification.status, "matched", "the confirmed first property is still read back");
+    assert.deepEqual(writes, ["101.POSX", "101.POSY"]);
+    assert.deepEqual(result.steps.filter((step) => step.op === "set").map((step) => `${step.name}:${step.status}`), ["101.POSX:succeeded", "101.POSY:failed", "101.POSZ:skipped", "102.POSX:skipped"]);
+    assert.deepEqual(sets(), [], "a refused guarded write never falls back to an unguarded set");
+    assert.deepEqual(s.fixtures.get(101)!.pos, { x: 1, y: 0, z: 0 });
+    assert.deepEqual(s.fixtures.get(102)!.pos, { x: 0, y: 0, z: 0 });
+  } finally { await h.close(); }
+});
+
+test("placeFixtures: a guarded writer lost reply remains unknown and is never replayed", async () => {
+  const { h, s, sets } = await setup();
+  try {
+    let calls = 0;
+    const result = await placeFixtures(h.ctx, { placements: [{ fid: 101, position: { x: 2, y: 3 } }] }, async (write: { fid: number; value: number | string }) => {
+      calls++;
+      s.fixtures.get(write.fid)!.pos.x = Number(write.value);
+      throw new BridgeError("reply lost after guarded Set", "lua", true);
+    });
+    assert.equal(result.outcome, "unknown");
+    assert.equal(calls, 1);
+    assert.deepEqual(sets(), []);
+    assert.deepEqual(result.uncertainWrites, [{ fid: 101, property: "POSX", applied: true, observed: 2 }]);
+    assert.deepEqual(s.fixtures.get(101)!.pos, { x: 2, y: 0, z: 0 });
+  } finally { await h.close(); }
 });

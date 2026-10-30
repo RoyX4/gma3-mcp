@@ -348,6 +348,32 @@ interface ProgrammerResult {
   limitations?: string[];
 }
 
+/** One immutable, complete read. It may be shared only across checks at the same mutation-free point and scope. */
+export interface ProgrammerObservation {
+  readonly scope: "selection" | "fixtures";
+  readonly fixtures?: string;
+  readonly result?: ProgrammerResult;
+  readonly reason?: string;
+}
+function freezeRead<T>(value: T): T {
+  if (value && typeof value === "object") {
+    for (const item of Object.values(value)) freezeRead(item);
+    Object.freeze(value);
+  }
+  return value;
+}
+export async function captureProgrammer(bridge: Gma3Bridge, args: { scope: "selection" | "fixtures"; fixtures?: string }): Promise<ProgrammerObservation> {
+  const read = await readProgrammerPages(bridge, args, true);
+  return freezeRead({ ...args, ...read });
+}
+async function programmerRead(bridge: Gma3Bridge, args: { scope: "selection" | "fixtures"; fixtures?: string }, observed?: ProgrammerObservation): Promise<{ result: ProgrammerResult } | { reason: string }> {
+  if (!observed) return readProgrammerPages(bridge, args);
+  if (observed.scope !== args.scope || observed.fixtures !== args.fixtures) return { reason: "the supplied programmer snapshot has a different scope; it cannot verify this target" };
+  if (!observed.result) return { reason: observed.reason ?? "the supplied programmer snapshot has no result" };
+  if (observed.result.coverage?.complete !== true || observed.result.fixturesTruncated) return { reason: "the supplied programmer snapshot is incomplete" };
+  return { result: observed.result };
+}
+
 interface ScannedFixture {
   subfixtureIndex?: number;
   fid?: string | null;
@@ -360,16 +386,20 @@ interface ScannedFixture {
 /** Rows per request page and the hard cap on pages fetched before giving up on completeness. */
 const PROGRAMMER_PAGE = 5000;
 const PROGRAMMER_MAX_PAGES = 10;
+/** Whole-rig coverage budget, distinct from the number of active rows returned per page. */
+export const PROGRAMMER_MAX_CHANNELS = 50000;
 
 /**
  * Read a programmer scan completely: the op paginates `rows`, so every page is fetched until the
  * returned rows reach `total`. Returns the merged result, or a reason when it could not be completed.
  */
-async function readProgrammerPages(bridge: Gma3Bridge, args: Record<string, unknown>): Promise<{ result: ProgrammerResult } | { reason: string; partial?: ProgrammerResult }> {
+async function readProgrammerPages(bridge: Gma3Bridge, args: Record<string, unknown>, strictCoverage = false): Promise<{ result: ProgrammerResult } | { reason: string; partial?: ProgrammerResult }> {
   // Every page is a fresh scan on the console, so each one reports its own coverage and fixture
   // list. A page that is incomplete or truncated makes the whole read unavailable, whatever the
   // first page said; the merged result carries the strictest flags and every limitation seen.
-  const first = (await bridge.request("programmer", { ...args, limit: PROGRAMMER_PAGE, offset: 0 })) as ProgrammerResult;
+  const scanArgs = { maxChannels: PROGRAMMER_MAX_CHANNELS, ...args, limit: PROGRAMMER_PAGE };
+  const first = (await bridge.request("programmer", { ...scanArgs, offset: 0 })) as ProgrammerResult;
+  if (strictCoverage && first.coverage?.complete !== true) return { reason: "the programmer snapshot did not declare complete coverage" };
   const rows = [...(first.rows ?? [])];
   const total = typeof first.total === "number" ? first.total : rows.length;
   const limitations = [...(first.limitations ?? [])];
@@ -388,7 +418,8 @@ async function readProgrammerPages(bridge: Gma3Bridge, args: Record<string, unkn
     if (pages >= PROGRAMMER_MAX_PAGES) {
       return { reason: `the programmer scan returned ${total} rows but only ${rows.length} were fetched within ${PROGRAMMER_MAX_PAGES} pages`, partial: merged() };
     }
-    const page = (await bridge.request("programmer", { ...args, limit: PROGRAMMER_PAGE, offset: rows.length })) as ProgrammerResult;
+    const page = (await bridge.request("programmer", { ...scanArgs, offset: rows.length })) as ProgrammerResult;
+    if (strictCoverage && page.coverage?.complete !== true) return { reason: `page ${pages + 1} did not declare complete programmer coverage` };
     pages++;
     limitations.push(...(page.limitations ?? []));
     if (page.coverage?.complete === false) {
@@ -547,12 +578,12 @@ function judgeFixture(label: string, key: string, entries: ScannedFixture[], row
  * scan was complete and fully paginated; `mismatched` on any wrong or missing value or a fixture
  * without the attribute; `unavailable` when a read could not be completed or interpreted.
  */
-export async function verifyProgrammer(bridge: Gma3Bridge, expectations: Expectation[], steps: StepResult[], warnings: string[]): Promise<{ verification: Verification; summary: Record<string, unknown> }> {
-  const checked = `programmer values of the selected fixtures (${expectations.map((e) => `${e.attribute} = ${formatValue(e.value)} ${e.unit}`).join(", ")}), tolerance ${VERIFY_TOLERANCE_PERCENT} % of range${expectations.some((e) => isDecimalUnit(e.unit)) ? "; decimal values exactly, as DMX values" : ""}`;
+export async function verifyProgrammer(bridge: Gma3Bridge, expectations: Expectation[], steps: StepResult[], warnings: string[], targetFixtures?: string, observed?: ProgrammerObservation): Promise<{ verification: Verification; summary: Record<string, unknown> }> {
+  const checked = `programmer values of ${targetFixtures ?? "the selected fixtures"} (${expectations.map((e) => `${e.attribute} = ${formatValue(e.value)} ${e.unit}`).join(", ")}), tolerance ${VERIFY_TOLERANCE_PERCENT} % of range${expectations.some((e) => isDecimalUnit(e.unit)) ? "; decimal values exactly, as DMX values" : ""}`;
   const unavailableReasons: string[] = [];
   let primary: ProgrammerResult;
   try {
-    const read = await readProgrammerPages(bridge, { scope: "selection" });
+    const read = await programmerRead(bridge, targetFixtures ? { scope: "fixtures", fixtures: targetFixtures } : { scope: "selection" }, observed);
     if ("reason" in read) {
       steps.push({ name: "read_programmer", kind: "read", status: "failed", op: "programmer", error: read.reason });
       return { verification: unavailable(read.reason, checked), summary: { performed: true, complete: false } };
@@ -642,7 +673,7 @@ export async function verifyProgrammer(bridge: Gma3Bridge, expectations: Expecta
   if (expectations.some((e) => e.unit === "readout")) {
     warnings.push("no unit was given, so the read-back assumed the user profile's readout is Natural (percent for Dimmer and colour, physical units for Pan/Tilt); if the profile uses another readout the comparison may mismatch");
   }
-  const actual = { rows: (primary.rows ?? []).map((r) => ({ fixture: r.fixture, fid: r.fid, attribute: r.attribute, value: r.value, physicalFrom: r.physicalFrom, physicalTo: r.physicalTo, readout: r.readout })) };
+  const actual = { rows: (primary.rows ?? []).map((r) => ({ fixture: r.fixture, fid: r.fid, subfixtureIndex: r.subfixtureIndex, attribute: r.attribute, value: r.value, physicalFrom: r.physicalFrom, physicalTo: r.physicalTo, readout: r.readout })) };
   if (problems.length) {
     return { verification: { status: "mismatched", checked, expected: expectations, actual, detail: problems.join("; ") }, summary };
   }
@@ -774,12 +805,12 @@ const anySucceeded = (steps: StepResult[], names: string[]): boolean => steps.so
  * itself and its cells (a compound fixture's values live on its cells). The link proves the recall reached the
  * channel; it also survives a later manual value, so the check belongs right after the recall.
  */
-export async function verifyPresetLink(bridge: Gma3Bridge, preset: { addrNative: string; label: string }, steps: StepResult[]): Promise<{ verification: Verification; summary: Record<string, unknown> }> {
+export async function verifyPresetLink(bridge: Gma3Bridge, preset: { addrNative: string; label: string }, steps: StepResult[], observed?: ProgrammerObservation): Promise<{ verification: Verification; summary: Record<string, unknown> }> {
   const checked = `every selected fixture (or its cells) holds programmer values linked to ${preset.label}`;
   const linkedRows = (rows: ProgrammerRow[]) => rows.filter((r) => r.absPreset?.addrNative === preset.addrNative);
   let primary: ProgrammerResult;
   try {
-    const read = await readProgrammerPages(bridge, { scope: "selection" });
+    const read = await programmerRead(bridge, { scope: "selection" }, observed);
     if ("reason" in read) {
       steps.push({ name: "read_programmer", kind: "read", status: "failed", op: "programmer", error: read.reason });
       return { verification: unavailable(read.reason, checked), summary: { performed: true, complete: false } };

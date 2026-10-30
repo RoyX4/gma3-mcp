@@ -114,7 +114,7 @@ class Console {
       ids.forEach((f, k) => {
         for (const v of this.prog[this.env].get(f)?.values() ?? []) if (v.steps && v.steps.length > 1) v.phase = ids.length > 1 ? +m![1] + ((+m![2] - +m![1]) * k) / (ids.length - 1) : +m![1];
       });
-    } else if ((m = cmd.match(/^At Speed ([\d.]+)$/))) {
+    } else if ((m = cmd.match(/^At Speed BPM ([\d.]+)$/))) {
       for (const f of sel) for (const v of this.prog[this.env].get(f)?.values() ?? []) if (v.steps && v.steps.length > 1) v.speed = +m[1] / 60;
     } else if ((m = cmd.match(/^Fixture (.+)$/))) {
       for (const part of m[1].split("+").map((x) => x.trim())) {
@@ -729,7 +729,7 @@ test("SU-14 a look with a phaser: built in Preview after the look's values, chec
     assert.equal(isError, false, JSON.stringify(result).slice(0, 3000));
     assert.equal(result.cues[0].verification, "matched");
     const pre = c.commands.slice(c.commands.indexOf("[P] At 100") + 1);
-    assert.deepEqual(pre.slice(0, 6), ["[P] Step 1", '[P] Attribute "ColorRGB_R" At Absolute 100', "[P] Step 2", '[P] Attribute "ColorRGB_R" At Absolute 0', "[P] At Speed 120", "[P] At Phase 0 Thru 180"]);
+    assert.deepEqual(pre.slice(0, 6), ["[P] Step 1", '[P] Attribute "ColorRGB_R" At Absolute Percent 100', "[P] Step 2", '[P] Attribute "ColorRGB_R" At Absolute Percent 0', "[P] At Speed BPM 120", "[P] At Phase 0 Thru 180"]);
     // A phaser that does not take (the console refuses the phase) is a mismatch and the cue is not stored.
     c.reject = /^At Phase/;
     const bad = await h.callJson("gma3_store_cues", { sequence: 967, mode: "create", exclusive: true, cues: [{ cue: 1, fixtures: "101 + 102", phaser: { steps: [{ values: { ColorRGB_R: 100 } }, { values: { ColorRGB_R: 0 } }], phaser: { phase: { from: 0, to: 180 } } } }] });
@@ -1037,5 +1037,85 @@ test("SU-15: cue commands' $variables must exist or be set by an earlier cue com
     assert.match(errors(edit), /\$Nope \(cue 1\) do not exist/);
   } finally {
     await h.close();
+  }
+});
+
+test("phaser cost: repeated fixture/attribute coverage uses one preflight and one snapshot per cue", async () => {
+  const { h, c } = await setup();
+  try {
+    const effect = (reverse: boolean) => ({ steps: [
+      { values: reverse ? { ColorRGB_G: 0, ColorRGB_R: 100 } : { ColorRGB_R: 100, ColorRGB_G: 0 } },
+      { values: reverse ? { ColorRGB_G: 100, ColorRGB_R: 0 } : { ColorRGB_R: 0, ColorRGB_G: 100 } },
+    ] });
+    const { result, isError } = await h.callJson("gma3_store_cues", {
+      sequence: 910, mode: "create", exclusive: true,
+      cues: [1, 2, 3].map(cue => ({ cue, fixtures: "101 + 102", phaser: effect(cue % 2 === 0) })),
+    });
+    assert.equal(isError, false, JSON.stringify(result).slice(0, 1800));
+    const scans = h.fake.requests.filter(r => r.op === "programmer" && r.args.scope === "fixtures");
+    assert.equal(scans.length, 4, "one deduplicated preflight plus one complete phaser snapshot per cue");
+    assert.deepEqual(scans.map(r => r.args.limit), [1, 5000, 5000, 5000]);
+    assert.deepEqual(new Set(scans[0].args.attributes as string[]), new Set(["ColorRGB_R", "ColorRGB_G"]), "metadata preflight skips unrelated native phaser reads");
+    assert.ok(scans.slice(1).every(r => r.args.attributes === undefined), "full look read-back still sees activation siblings and unexpected values");
+    assert.equal(c.seqs.get(910)?.cues.length, 3);
+    normalUntouched(c);
+  } finally { await h.close(); }
+});
+
+test("phaser cost: a compound fixture's cell coverage comes from the same snapshot as its phaser rows", async () => {
+  const { h, c } = await setup();
+  const original = h.fake.handlerFor("programmer")!;
+  h.fake.on("programmer", async (args, req) => {
+    const reply = await original(args, req) as any;
+    if (args.scope === "fixtures") {
+      reply.scannedFixtures = [
+        { subfixtureIndex: 101, fid: "101", rootFid: "101", name: "Parent", attributes: ["Dimmer"] },
+        { subfixtureIndex: 1001, fid: "None", rootFid: "101", name: "Cell", attributes: ["ColorRGB_R"] },
+      ];
+      reply.rows = reply.rows.map((r: any) => ({ ...r, subfixtureIndex: 1001, fid: "None" }));
+    }
+    return reply;
+  });
+  try {
+    const r = await h.callJson("gma3_store_cues", { sequence: 911, mode: "create", exclusive: true, cues: [{ cue: 1, fixtures: "101", phaser: { steps: [{ values: { ColorRGB_R: 100 } }, { values: { ColorRGB_R: 0 } }] } }] });
+    assert.equal(r.isError, false, JSON.stringify(r.result).slice(0, 1800));
+    assert.equal(r.result.cues[0].verification, "matched");
+    assert.equal(h.fake.requests.filter(r => r.op === "programmer" && r.args.scope === "fixtures").length, 2);
+    assert.ok(c.cue(911, 1));
+  } finally { await h.close(); }
+});
+
+test("phaser cost: truncated preflight metadata refuses all programming", async () => {
+  const { h, c } = await setup();
+  const original = h.fake.handlerFor("programmer")!;
+  h.fake.on("programmer", async (args, req) => {
+    const reply = await original(args, req) as any;
+    return args.scope === "fixtures" ? { ...reply, fixturesTruncated: true } : reply;
+  });
+  try {
+    const r = await h.callJson("gma3_store_cues", { sequence: 912, mode: "create", exclusive: true, cues: [{ cue: 1, fixtures: "101", phaser: { steps: [{ values: { ColorRGB_R: 100 } }, { values: { ColorRGB_R: 0 } }] } }] });
+    assert.equal(r.isError, true);
+    assert.deepEqual(c.commands, []);
+    assert.equal(c.cue(912, 1), undefined);
+  } finally { await h.close(); }
+});
+
+test("phaser cost: incomplete, truncated or partially paged phaser snapshots never store the cue", async () => {
+  for (const mode of ["incomplete", "truncated", "paged"] as const) {
+    const { h, c } = await setup();
+    const original = h.fake.handlerFor("programmer")!;
+    h.fake.on("programmer", async (args, req) => {
+      const reply = await original(args, req) as any;
+      if (args.scope !== "fixtures" || args.limit !== 5000) return reply;
+      if (mode === "incomplete") return { ...reply, coverage: { ...reply.coverage, complete: false } };
+      if (mode === "truncated") return { ...reply, fixturesTruncated: true };
+      return { ...reply, total: reply.rows.length + 1 };
+    });
+    try {
+      const r = await h.callJson("gma3_store_cues", { sequence: 913, mode: "create", exclusive: true, cues: [{ cue: 1, fixtures: "101", phaser: { steps: [{ values: { ColorRGB_R: 100 } }, { values: { ColorRGB_R: 0 } }] } }] });
+      assert.equal(r.isError, true, `${mode}: unavailable verification must stop the build`);
+      assert.equal(c.cue(913, 1), undefined, `${mode}: no Store after an incomplete phaser read`);
+      normalUntouched(c);
+    } finally { await h.close(); }
   }
 });

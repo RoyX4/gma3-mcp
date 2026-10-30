@@ -7,6 +7,18 @@ the live test procedure on a disposable show.
 
 | Area | Tools | Page |
 | --- | --- | --- |
+| Connection diagnosis and persistent sessions | `gma3_connection_check`, `gma3_reconnect` | [connection.md](connection.md) |
+| Tracking compilation and provenance | `gma3_compile_tracking`, `gma3_explain_tracking_cue`, `gma3_compare_tracking_cues`, `gma3_lint_tracking` | [tracking.md](tracking.md) |
+| Durable jobs, progress and resume | `gma3_programming_job` | [jobs.md](jobs.md) |
+| Saved-show checkpoints | `gma3_show_checkpoint` | [checkpoint.md](checkpoint.md) |
+| Stored native values and fixture diagnosis | `gma3_native_cue_data`, `gma3_diagnose_fixture` | [native-cues.md](native-cues.md) |
+| Native batches and frozen programmer paging | `gma3_fast_context`, `gma3_writer_lease`, `gma3_batch`, `gma3_programmer_snapshot` | [fastpath.md](fastpath.md) |
+| Calibrated stage targets | `gma3_focus_target` | [focus.md](focus.md) |
+| Fixture-aware colour | `gma3_set_fixture_color` | [colour.md](colour.md) |
+| MVR files and revisions | `gma3_inspect_mvr`, `gma3_compare_mvr`, `gma3_mvr_import_plan`, `gma3_apply_mvr_positions`, `gma3_export_mvr` | [mvr.md](mvr.md) |
+| Camera poses and actual 2D Layouts | `gma3_cameras`, `gma3_configure_camera`, `gma3_build_layout` | [workspace.md](workspace.md) |
+| Appearances and native screen windows | `gma3_configure_appearance`, `gma3_build_workspace` | [workspace-ui.md](workspace-ui.md) |
+| Local extension: Views, UI and hidden observation | `gma3_views`, `gma3_store_view`, `gma3_recall_view`, `gma3_assign_view_button`, `gma3_ui`, `gma3_ui_click`, `gma3_screenshot`, `gma3_window` | [local-ui.md](local-ui.md) |
 | Fixture programming (FR-03) | `gma3_select`, `gma3_set_attribute`, `gma3_set_color`, `gma3_set_position`, `gma3_clear_programmer` | [fixtures.md](fixtures.md) |
 | Looks, presets and release (SU-05; preset read-back needs bridge 0.27.0) | `gma3_set_attributes`, `gma3_apply_preset`, `gma3_release_attributes` | [fixtures.md](fixtures.md) |
 | Cue storage and editing (FR-04, FR-05) | `gma3_store_cue`, `gma3_store_cue_part`, `gma3_set_cue_timing`, `gma3_set_cue_trigger`, `gma3_goto_cue`, `gma3_delete_cue` | [cues.md](cues.md) |
@@ -119,3 +131,5 @@ The console input tools add a bridge-side guard that does reach every client: wh
 (an open interaction, a running sequence, a held key), the bridge refuses `cmd`, `set`, `setfader`, `lua` and the mutating `patch.*` ops
 (`patch.enter`, `patch.add`, `patch.set`, `patch.remove`, `patch.commit`, `patch.import`, `patch.removeType`) from every connection with `[busy]`, so a mutating tool can fail with that error while someone else types or holds a key. Reads are
 never refused, `gma3_feedback` included. See [input.md](input.md#who-owns-an-interaction).
+
+Named routes and separate Node/plugin qualification: [instances.md](../setup/instances.md). MVR decision and after-import verification: [mvr-import.md](mvr-import.md).

@@ -696,7 +696,10 @@ export async function configureExecutor(ctx: ToolContext, raw: ConfigureExecutor
     let resulting: Record<string, unknown> | null = null;
     if (verify) {
       const expected: Record<string, string> = {};
-      for (const c of changes) expected[c.property] = c.to;
+      // A setter may couple properties (e.g. Encoder also changes Fader). Verify the complete
+      // requested postcondition, including values that matched before any setter ran.
+      for (const k of Object.keys(wanted) as FunctionKey[]) expected[EXECUTOR_FUNCTIONS[k].property] = wanted[k]!;
+      if (fix !== undefined) expected.Fix = fix ? "Yes" : "No";
       const finalExecLock = lock !== undefined ? lock : execLocked;
       const rb = await readBackObject(bridge, ref, expected, finalExecLock);
       readBackSteps.push(rb.step);
@@ -862,8 +865,19 @@ export async function configureSequence(ctx: ToolContext, raw: ConfigureSequence
 
     const activeBefore = await playbackActive(bridge, ref, t);
     if (preview || (changes.length === 0 && !lockChange)) {
-      const what = preview ? "Preview only; nothing was sent." : `Every requested setting is already set on ${ref}; nothing was sent.`;
-      return buildResult({ operation: op, target, steps: inspect.steps, verification: notRequested(), summary: what, warnings, extra: { ...extra, preview, noop: !preview, playback: { activeBefore } } });
+      let what = preview ? "Preview only; nothing was sent." : `Every requested setting is already set on ${ref}; nothing was sent.`;
+      let verification = notRequested();
+      let resulting: Record<string, unknown> | null = null;
+      const steps = [...inspect.steps];
+      // A no-op is a verified postcondition when verify:true. Callers such as cue jobs must not downgrade an
+      // already-correct Tracking setting to unavailable, and a fresh read catches drift since planning.
+      if (!preview && verify) {
+        const expected = Object.fromEntries(Object.entries(wanted).map(([k, to]) => [SEQUENCE_SETTINGS[k].property, to]));
+        const rb = await readBackObject(bridge, ref, expected, lock !== undefined ? lock : seqLocked);
+        steps.push(rb.step); verification = rb.verification; resulting = rb.values;
+        if (verification.status !== "matched") what = `No write was needed at preflight; the final settings of ${ref} ${verification.status === "mismatched" ? "changed" : "could not be verified"}.`;
+      }
+      return buildResult({ operation: op, target, steps, verification, summary: what, warnings, extra: { ...extra, preview, noop: !preview, resulting, playback: { activeBefore } } });
     }
 
     const { steps: mut, relockFailed } = await executePlan(ctx, plan);
@@ -874,7 +888,7 @@ export async function configureSequence(ctx: ToolContext, raw: ConfigureSequence
     let resulting: Record<string, unknown> | null = null;
     if (verify) {
       const expected: Record<string, string> = {};
-      for (const c of changes) expected[c.property] = c.to;
+      for (const [k, to] of Object.entries(wanted)) expected[SEQUENCE_SETTINGS[k].property] = to;
       const rb = await readBackObject(bridge, ref, expected, lock !== undefined ? lock : seqLocked);
       readBackSteps.push(rb.step);
       verification = rb.verification;

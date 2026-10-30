@@ -78,7 +78,7 @@ test("set replies are compared per property", () => {
 // Fake console
 // ---------------------------------------------------------------------------
 
-interface FLine { cls: string; group: number | null; preset: string | null; matricks: number | null; enabled: boolean; name: string; mode: string; filter?: string }
+interface FLine { cls: string; group: number | null; preset: string | null; matricks: number | null; enabled: boolean; name: string; mode: string; filter?: string; filterRef?: { kind: string; number: number }; properties?: Record<string, unknown> }
 interface FRow { fixture: string; sfIndex: number; attribute: string; value: number; cooked: boolean }
 interface FTarget { lines: FLine[]; rows: FRow[] }
 
@@ -173,7 +173,7 @@ class Console {
             Selection: l.group !== null ? { name: `Group ${l.group}`, class: "Group", index: l.group, addr: `g.${l.group}` } : "",
             Values: l.preset ? { name: this.presetOf(l.preset)?.[0] ?? "?", class: "Preset", addr: l.preset } : "",
             MAtricks: l.matricks !== null ? { name: `M${l.matricks}`, class: "MAtrick", index: l.matricks } : "",
-            Filter: l.filter ? { name: l.filter, class: "Filter" } : "", SelectionMode: l.mode, SelectionFromValue: false, FailedCookedPart: "None", EmptyLastCooking: false,
+            ...l.properties, Filter: l.filterRef ? { name: `${l.filterRef.kind} ${l.filterRef.number}`, class: l.filterRef.kind === "world" ? "World" : "Filter", index: l.filterRef.number } : l.filter ? { name: l.filter, class: "Filter" } : "", SelectionMode: l.mode, SelectionFromValue: false, FailedCookedPart: "None", EmptyLastCooking: false,
           },
         })),
       };
@@ -207,6 +207,9 @@ class Console {
       return { total: 2, offset: 0, count: 2, attributes: [{ attribute: "ColorRGB_R" }, { attribute: "Dimmer" }] };
     });
     h.fake.on("objects", (args) => {
+      const line = this.find(String(args.ref));
+      if (line?.line) return { items: [{ fields: { ...line.t.lines[line.line - 1].properties } }] };
+      if (/^(World|Filter|Shape) [1-9]$/.test(String(args.ref))) return { items: [{ name: String(args.ref) }] };
       const n = Number(String(args.ref).replace("MAtricks ", ""));
       if (!this.matricks.has(n)) throw new Error(`no object found for '${args.ref}'`);
       return { items: [{ name: `M${n}` }] };
@@ -220,14 +223,15 @@ class Console {
       if (prop === "Enabled") l.enabled = args.value === "Yes";
       if (prop === "SelectionMode") l.mode = String(args.value);
       if (prop === "Values") l.preset = null;
+      if (!["Name", "Enabled", "SelectionMode", "Values"].includes(prop)) l.properties = { ...l.properties, [prop]: args.value === "None" ? "None" : Number(args.value) };
       this.cook(f.t, "/MergeLowPriority");
-      return { value: prop === "Enabled" ? l.enabled : prop === "Values" ? "" : prop === "Name" ? l.name : l.mode };
+      return { value: prop === "Enabled" ? l.enabled : prop === "Values" ? "" : prop === "Name" ? l.name : prop === "SelectionMode" ? l.mode : l.properties?.[prop] };
     });
     h.fake.on("cmd", (args) => {
       const c = String(args.command);
       this.commands.push(c);
       let m: RegExpMatchArray | null;
-      if ((m = c.match(/^Assign (Group|Preset|MAtricks) (\S+) At (.+)$/))) {
+      if ((m = c.match(/^Assign (Group|Preset|MAtricks|World|Filter) (\S+) At (.+)$/))) {
         const f = this.find(m[3]);
         if (!f) return { feedback: "Illegal object" };
         let l = f.t.lines[f.line! - 1];
@@ -236,6 +240,7 @@ class Console {
         if (m[1] === "Group") l.group = Number(m[2]);
         if (m[1] === "Preset") l.preset = this.presets.get(m[2])!.addr;
         if (m[1] === "MAtricks") l.matricks = Number(m[2]);
+        if (m[1] === "World" || m[1] === "Filter") l.filterRef = { kind: m[1].toLowerCase(), number: Number(m[2]) };
         this.cook(f.t, "/MergeLowPriority");
         return { feedback: "OK" };
       }
@@ -578,4 +583,41 @@ test("global rows without a fixture type for a member make it uncertain", async 
   const merge = await cook({ mode: "merge" });
   assert.match(stepError(merge.result, "check_uncooked"), /401 ColorRGB_R \(possibly/);
   assert.match(merge.result.warnings.join(), /fixture type of 401 could not be read/);
+});
+
+
+test("recipe filters, worlds and per-axis timing are previewed and read back completely", async () => {
+  seeded();
+  const filter = { kind: "world", number: 3 };
+  const timing = { FadeFromX: 1.5, FadeToX: 3, DelayFromY: 0, DelayToY: null };
+  const preview = await edit({ action: "set", line: 1, filter, timing, preview: true });
+  assert.equal(preview.isError, false, JSON.stringify(preview.result));
+  assert.match(preview.result.intended.commands.join(), /Assign World 3/);
+  assert.match(preview.result.intended.commands.join(), /FadeFromX=1.5/);
+  assert.equal(con.commands.length, 0);
+  const result = await edit({ action: "set", line: 1, filter, timing });
+  assert.equal(result.result.verification.status, "matched", JSON.stringify(result.result));
+  assert.deepEqual(result.result.linesAfter[0].filterRef, filter);
+  assert.equal(result.result.linesAfter[0].properties.FadeFromX, 1.5);
+});
+
+test("recipe timing rejects unknown or non-finite fields before sending anything", async () => {
+  seeded();
+  const result = await edit({ action: "set", line: 1, timing: { FadeFromX: -1 } });
+  assert.equal(result.isError, true);
+  assert.equal(con.commands.length, 0);
+});
+
+
+test("recipe timing compares stored BPM/degrees rather than display-role Hz and degree labels", async () => {
+  seeded();
+  const original = h.fake.handlerFor("set")!;
+  h.fake.on("set", async (args, request) => {
+    const result = await original(args, request) as { value: unknown };
+    return String(args.property).startsWith("Speed") ? { ...result, value: String(Number(result.value) / 60) } : String(args.property).startsWith("Phase") ? { ...result, value: `${result.value}°` } : result;
+  });
+  const r = await edit({ action: "set", line: 1, timing: { SpeedFromX: 120, PhaseFromX: 0 } });
+  assert.equal(r.isError, false, JSON.stringify(r.result));
+  assert.equal(r.result.verification.status, "matched");
+  assert.equal(r.result.linesAfter[0].properties.SpeedFromX, 120);
 });

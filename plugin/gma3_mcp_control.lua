@@ -226,6 +226,19 @@
 --     deps.busy(sessionId, now) may return another owner's busy descriptor.
 --   * Input is disabled on a new instance. enableInput(adapter) is the operator's explicit decision.
 
+-- Fingerprint of the bytecode actually imported into this Lua VM, computed once per component load.
+-- This is a non-cryptographic runtime identity, not a source-file SHA or a version-label claim.
+local COMPONENT_FINGERPRINT
+do
+  local chunk = debug.getinfo(1, "f").func
+  local ok, bytes = pcall(string.dump, chunk, true)
+  if ok then
+    local a, b = 1, 0
+    for i = 1, #bytes do a = (a + bytes:byte(i)) % 65521; b = (b + a) % 65521 end
+    COMPONENT_FINGERPRINT = string.format("lua-bytecode-adler32:%08x:%d", b * 65536 + a, #bytes)
+  end
+end
+
 local NAME        = "gma3_mcp_control"
 local VERSION     = "0.7.0"
 local API_VERSION = 1
@@ -1746,6 +1759,7 @@ local function consoleDeps(env)
 end
 
 local M = {
+  RUNTIME_FINGERPRINT = COMPONENT_FINGERPRINT,
   NAME = NAME, VERSION = VERSION, API_VERSION = API_VERSION,
   EVENT_TYPES = { "relative", "absolute", "touch", "button" }, ELEMENTS = { "fader", "key", "encoder" },
   STATEFUL_FUNCTIONS = shallowCopy(STATEFUL_FUNCTIONS),

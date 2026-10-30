@@ -105,6 +105,25 @@ export function fidNumber(field: string, value: unknown): number | undefined {
   return finiteNumber(field, value, { integer: true, min: 1, max: MAX_FID });
 }
 
+export interface BreakAddress { break: number; address: string }
+export function parseBreakAddresses(field: string, raw: unknown): BreakAddress[] | undefined {
+  if (raw === undefined) return undefined;
+  if (!Array.isArray(raw) || raw.length < 1 || raw.length > 8) throw new ValidationError(`${field} must have 1-8 {break,address} entries`, field);
+  const seen = new Set<number>();
+  return raw.map((value, i) => {
+    if (!value || typeof value !== "object" || Object.keys(value).some((k) => k !== "break" && k !== "address")) throw new ValidationError(`${field}[${i}] must be {break,address}`, field);
+    const b = finiteNumber(`${field}[${i}].break`, value.break, { integer: true, min: 1, max: 8 })!;
+    if (seen.has(b)) throw new ValidationError(`${field} repeats break ${b}`, field);
+    seen.add(b);
+    return { break: b, address: value.address === "" ? "" : dmxAddress(`${field}[${i}].address`, value.address)! };
+  }).sort((a, b) => a.break - b.break);
+}
+
+function verifyBreaks(row: FixtureRow, expected: BreakAddress[]): string[] {
+  const actual = new Map((row.breaks ?? []).map((b) => [b.break, b.address]));
+  return expected.flatMap((b) => (actual.get(b.break) ?? "") === b.address ? [] : [`FID ${row.fid}: break ${b.break} reads ${JSON.stringify(actual.get(b.break) ?? "")}, expected ${JSON.stringify(b.address)}`]);
+}
+
 /** A fixture type or mode given by number or by name. */
 function numberOrName(field: string, value: unknown): number | string | undefined {
   if (typeof value === "number") return finiteNumber(field, value, { integer: true, min: 1 });
@@ -307,6 +326,7 @@ export interface SessionSpec {
   /** Read-back after a commit. */
   readBack?: () => Promise<{ steps: StepResult[]; verification: Verification; extra?: Record<string, unknown> }>;
   verify: boolean;
+  preview?: boolean;
   extra?: () => Record<string, unknown>;
 }
 
@@ -352,6 +372,7 @@ export async function runSessionLocked(ctx: ToolContext, spec: SessionSpec): Pro
       return finish("failed", `${spec.operation} was not performed; nothing was sent to the console: ${badPre.error ?? badPre.name}.`, spec.verify ? unavailable("the request stopped before anything was sent") : notRequested(), { committed: false, copyLeftOpen: false });
     }
 
+    if (spec.preview) return finish("succeeded", "Preview only; no patch copy was opened and nothing was changed.", notRequested(), { preview: true, committed: false, plannedEdit: spec.edit?.(spec.stage), touchedFids: spec.touchedFids });
     // Phase 2: the session.
     let enter: StepResult;
     try {
@@ -499,6 +520,8 @@ interface AddArgs {
   count?: number;
   name?: string;
   address?: string;
+  breaks?: BreakAddress[];
+  preview?: boolean;
   findFreeFrom?: string;
   stage?: string;
   exclusive?: boolean;
@@ -524,6 +547,8 @@ export async function patchAdd(ctx: ToolContext, raw: AddArgs): Promise<Operatio
   const count = v.check(() => finiteNumber("count", raw.count ?? 1, { integer: true, min: 1, max: MAX_COUNT })) ?? 1;
   const name = v.check(() => objectName("name", raw.name, { optional: true }));
   const address = v.check(() => dmxAddress("address", raw.address, { optional: true }));
+  const breaks = v.check(() => parseBreakAddresses("breaks", raw.breaks));
+  if (breaks && (address !== undefined || raw.findFreeFrom !== undefined)) v.fail("give breaks or address/findFreeFrom, not both");
   const findFreeFrom = v.check(() => dmxAddress("findFreeFrom", raw.findFreeFrom, { optional: true }));
   if (address !== undefined && findFreeFrom !== undefined) v.fail("give address or findFreeFrom, not both");
   const stage = v.check(() => objectName("stage", raw.stage, { optional: true }));
@@ -535,18 +560,21 @@ export async function patchAdd(ctx: ToolContext, raw: AddArgs): Promise<Operatio
   let resolvedAddress: string | undefined = address;
   let footprint = 0;
   let modeName: string | undefined;
+  let breakChannels: Record<number, number> = {};
   let checkDetail: unknown;
   const fids = Array.from({ length: count }, (_, i) => fid + i);
 
   const result = await runSession(ctx, {
     operation: op,
     target,
+    preview: raw.preview,
     touchedFids: fids,
     stage,
     verify,
     preflight: async () => {
       try {
         const add: Record<string, unknown> = { type, mode, fid, count };
+        if (breaks) add.breaks = breaks;
         if (address) add.address = address;
         if (findFreeFrom) add.findFreeFrom = findFreeFrom;
         const c = (await ctx.bridge.request("patch.check", { add }, t)) as {
@@ -557,16 +585,18 @@ export async function patchAdd(ctx: ToolContext, raw: AddArgs): Promise<Operatio
           occupancyUnknown?: Array<{ fid: number | string; reason: string }>;
           suggested?: string | false;
           suggestedFree?: boolean;
-          mode: { name: string; footprint?: number };
+          mode: { name: string; footprint?: number; breakChannels?: number[]; breakNumbers?: number[] };
           type: { no: number; name: string };
         };
         checkDetail = c;
         footprint = c.mode.footprint ?? 0;
         modeName = c.mode.name;
+        breakChannels = Object.fromEntries((c.mode.breakChannels ?? []).map((n, i) => [c.mode.breakNumbers?.[i] ?? i + 1, n]));
         const problems: string[] = [];
-        if (!c.singleBreak) problems.push(`DMX mode ${c.mode.name} has more than one DMX break; multi-break modes are not supported`);
+        if (!c.singleBreak && (address || findFreeFrom)) problems.push(`DMX mode ${c.mode.name} needs explicit breaks instead of address/findFreeFrom`);
+        if (breaks && !c.dmxFree) problems.push(`the requested DMX breaks are not free: ${JSON.stringify(c.conflicts ?? [])}`);
         if (!c.fidFree) problems.push(`FID ${fid}${count > 1 ? `..${fid + count - 1}` : ""} is not free`);
-        if ((address || findFreeFrom) && c.occupancyUnknown?.length) problems.push(occupancyMessage(c.occupancyUnknown));
+        if ((breaks || address || findFreeFrom) && c.occupancyUnknown?.length) problems.push(occupancyMessage(c.occupancyUnknown));
         else if (address && !c.dmxFree) problems.push(`${address} for ${count} fixture(s) of ${footprint} channels is not free: ${JSON.stringify(c.conflicts ?? [])}`);
         if (findFreeFrom) {
           if (!c.suggested || !c.suggestedFree) problems.push(`no free block of ${count} x ${footprint} channels was found from ${findFreeFrom} inside one universe`);
@@ -581,8 +611,8 @@ export async function patchAdd(ctx: ToolContext, raw: AddArgs): Promise<Operatio
       }
     },
     editName: "add",
-    edit: (entered) => ({ op: "patch.add", args: { stage: entered ?? stage, type, mode, fid, count, ...(name ? { name } : {}), ...(resolvedAddress ? { address: resolvedAddress } : {}) } }),
-    extra: () => ({ address: resolvedAddress ?? null, footprint, check: checkDetail }),
+    edit: (entered) => ({ op: "patch.add", args: { stage: entered ?? stage, type, mode, fid, count, ...(name ? { name } : {}), ...(resolvedAddress ? { address: resolvedAddress } : {}), ...(breaks ? { breaks } : {}) } }),
+    extra: () => ({ address: resolvedAddress ?? null, breaks, footprint, check: checkDetail }),
     readBack: async () => {
       try {
         const byFid = await listFids(ctx.bridge, fids, t);
@@ -596,7 +626,8 @@ export async function patchAdd(ctx: ToolContext, raw: AddArgs): Promise<Operatio
             mismatches.push(`FID ${e.fid} is not in the patch`);
             continue;
           }
-          if ((r.patch ?? "") !== e.patch) mismatches.push(`FID ${e.fid}: patch ${JSON.stringify(r.patch ?? "")}, expected ${JSON.stringify(e.patch)}`);
+          if (breaks) mismatches.push(...verifyBreaks(r, breaks.map((b) => ({ ...b, address: b.address ? blockAddress(b.address, breakChannels[b.break] ?? 0, e.fid - fid) : "" }))));
+          else if ((r.patch ?? "") !== e.patch) mismatches.push(`FID ${e.fid}: patch ${JSON.stringify(r.patch ?? "")}, expected ${JSON.stringify(e.patch)}`);
           if (e.name !== undefined && r.name !== e.name) mismatches.push(`FID ${e.fid}: name ${JSON.stringify(r.name)}, expected ${JSON.stringify(e.name)}`);
           if (modeName && r.mode && !String(r.mode).endsWith(modeName)) mismatches.push(`FID ${e.fid}: mode ${JSON.stringify(r.mode)}, expected ${JSON.stringify(modeName)}`);
         }
@@ -635,12 +666,14 @@ export async function patchAdd(ctx: ToolContext, raw: AddArgs): Promise<Operatio
 interface EditArg {
   fid: number;
   address?: string;
+  breaks?: BreakAddress[];
   unpatch?: boolean;
   name?: string;
 }
 
 interface SetArgs {
   edits: EditArg[];
+  preview?: boolean;
   exclusive?: boolean;
   verify?: boolean;
 }
@@ -648,7 +681,7 @@ interface SetArgs {
 export async function patchSet(ctx: ToolContext, raw: SetArgs): Promise<OperationResult> {
   const op = "patch_set";
   const v = new Validator();
-  const edits: Array<{ fid: number; address?: string; name?: string }> = [];
+  const edits: Array<{ fid: number; address?: string; breaks?: BreakAddress[]; name?: string; expected?: FixtureRow }> = [];
   if (!Array.isArray(raw.edits) || raw.edits.length === 0) v.fail("edits must be a non-empty list");
   else if (raw.edits.length > MAX_COUNT) v.fail(`at most ${MAX_COUNT} edits per call`);
   else {
@@ -659,9 +692,11 @@ export async function patchSet(ctx: ToolContext, raw: SetArgs): Promise<Operatio
       if (fid !== undefined) seen.add(fid);
       if (e?.address !== undefined && e?.unpatch === true) v.fail(`edits[${i}]: give address or unpatch, not both`);
       const address = e?.unpatch === true ? "" : v.check(() => dmxAddress(`edits[${i}].address`, e?.address, { optional: true }));
+      const breaks = v.check(() => parseBreakAddresses(`edits[${i}].breaks`, e?.breaks));
+      if (breaks && (e?.address !== undefined || e?.unpatch)) v.fail(`edits[${i}]: give breaks or address/unpatch, not both`);
       const name = v.check(() => objectName(`edits[${i}].name`, e?.name, { optional: true }));
-      if (address === undefined && name === undefined) v.fail(`edits[${i}] changes nothing: give address, unpatch: true and/or name`);
-      if (fid !== undefined) edits.push({ fid, ...(address !== undefined ? { address } : {}), ...(name !== undefined ? { name } : {}) });
+      if (address === undefined && name === undefined && !breaks) v.fail(`edits[${i}] changes nothing: give address, unpatch: true and/or name`);
+      if (fid !== undefined) edits.push({ fid, ...(breaks ? { breaks } : {}), ...(address !== undefined ? { address } : {}), ...(name !== undefined ? { name } : {}) });
     });
   }
   requireExclusive(v, raw.exclusive);
@@ -674,6 +709,7 @@ export async function patchSet(ctx: ToolContext, raw: SetArgs): Promise<Operatio
   return runSession(ctx, {
     operation: op,
     target,
+    preview: raw.preview,
     touchedFids: edits.map((e) => e.fid),
     verify,
     preflight: async () => {
@@ -683,10 +719,12 @@ export async function patchSet(ctx: ToolContext, raw: SetArgs): Promise<Operatio
         const problems: string[] = [];
         for (const e of c.edits) {
           if (!e.exists) problems.push(`no fixture with FID ${e.fid}`);
-          else if (e.singleBreak === false) problems.push(`FID ${e.fid} uses a multi-break mode; readdressing it is not supported`);
+          else if (e.singleBreak === false && edits.find((x) => x.fid === e.fid)?.address) problems.push(`FID ${e.fid} uses a multi-break mode; use explicit breaks`);
+          const edit = edits.find((x) => x.fid === e.fid);
+          if (edit && e.current) edit.expected = e.current;
         }
         if (c.conflicts.length) problems.push(`the new addresses overlap patched fixtures: ${JSON.stringify(c.conflicts)}`);
-        if (edits.some((e) => e.address !== undefined && e.address !== "") && c.occupancyUnknown?.length) problems.push(occupancyMessage(c.occupancyUnknown));
+        if (edits.some((e) => e.breaks?.some((b) => b.address) || e.address !== undefined && e.address !== "") && c.occupancyUnknown?.length) problems.push(occupancyMessage(c.occupancyUnknown));
         if (problems.length) return asRead({ name: "check_edits", status: "failed", op: "patch.check", error: problems.join("; "), detail: c });
         return asRead({ name: "check_edits", status: "succeeded", op: "patch.check", detail: c });
       } catch (err) {
@@ -708,6 +746,12 @@ export async function patchSet(ctx: ToolContext, raw: SetArgs): Promise<Operatio
             continue;
           }
           actual.push(r);
+          if (e.breaks) {
+            const wanted = new Map((e.expected?.breaks ?? []).map((b) => [b.break, b.address]));
+            for (const b of e.breaks) wanted.set(b.break, b.address);
+            mismatches.push(...verifyBreaks(r, Array.from({ length: 8 }, (_, i) => ({ break: i + 1, address: wanted.get(i + 1) ?? "" }))));
+          }
+          if (e.address === "" && r.breaks?.length) mismatches.push(`FID ${e.fid}: some DMX breaks remain patched after unpatch`);
           if (e.address !== undefined && (r.patch ?? "") !== e.address) mismatches.push(`FID ${e.fid}: patch ${JSON.stringify(r.patch ?? "")}, expected ${JSON.stringify(e.address)}`);
           if (e.name !== undefined && r.name !== e.name) mismatches.push(`FID ${e.fid}: name ${JSON.stringify(r.name)}, expected ${JSON.stringify(e.name)}`);
         }
@@ -730,6 +774,8 @@ export async function patchSet(ctx: ToolContext, raw: SetArgs): Promise<Operatio
 
 interface RemoveArgs {
   fids: number[];
+  include_children?: boolean;
+  preview?: boolean;
   exclusive?: boolean;
   verify?: boolean;
 }
@@ -752,20 +798,29 @@ export async function patchRemove(ctx: ToolContext, raw: RemoveArgs): Promise<Op
   if (!v.ok) return validationFailure(op, target, v.errors);
   const t = ctx.requestTimeoutMs;
   let removed: unknown;
+  const touched = [...fids];
+  const expected: Record<string, unknown> = {};
 
   return runSession(ctx, {
     operation: op,
     target,
-    touchedFids: fids,
+    touchedFids: touched,
+    preview: raw.preview,
     verify,
     preflight: async () => {
       try {
-        const c = (await ctx.bridge.request("patch.check", { fids }, t)) as { fixtures: Array<{ fid: number; exists: boolean; current?: FixtureRow }> };
+        const c = (await ctx.bridge.request("patch.check", { fids }, t)) as { fixtures: Array<{ fid: number; exists: boolean; current?: FixtureRow; descendants?: FixtureRow[]; descendantCount?: number }>; descendants?: Array<FixtureRow & { rootFid: number }> };
+        for (const f of c.fixtures) if (c.descendants) f.descendants = c.descendants.filter((d) => d.rootFid === f.fid);
         removed = c.fixtures.map((f) => f.current ?? { fid: f.fid, exists: false });
         const problems: string[] = [];
         for (const f of c.fixtures) {
           if (!f.exists) problems.push(`no fixture with FID ${f.fid}`);
-          else if ((f.current?.subfixtures ?? 0) > 0) problems.push(`FID ${f.fid} has ${f.current?.subfixtures} sub-fixture(s); removing it is not supported`);
+          else if ((f.current?.subfixtures ?? 0) > 0 && raw.include_children !== true) problems.push(`FID ${f.fid} has ${f.current?.subfixtures} sub-fixture(s); include_children must be true to remove its complete subtree`);
+        }
+        for (const f of c.fixtures) {
+          if ((f.current?.subfixtures ?? 0) > 0 && raw.include_children && (!Array.isArray(f.descendants) || f.descendantCount !== undefined && f.descendants.length !== f.descendantCount)) problems.push(`FID ${f.fid}: the bridge did not return its descendant inventory; update the bridge`);
+          expected[String(f.fid)] = { current: f.current, descendants: f.descendants ?? [] };
+          for (const row of f.descendants ?? []) if (typeof row.fid === "number" && !touched.includes(row.fid)) touched.push(row.fid);
         }
         if (problems.length) return asRead({ name: "check_fixtures", status: "failed", op: "patch.check", error: problems.join("; "), detail: c });
         return asRead({ name: "check_fixtures", status: "succeeded", op: "patch.check", detail: c });
@@ -774,11 +829,11 @@ export async function patchRemove(ctx: ToolContext, raw: RemoveArgs): Promise<Op
       }
     },
     editName: "remove",
-    edit: () => ({ op: "patch.remove", args: { fids } }),
-    extra: () => ({ removed }),
+    edit: () => ({ op: "patch.remove", args: { fids, includeChildren: raw.include_children === true, expected } }),
+    extra: () => ({ removed, removalInventory: expected }),
     readBack: async () => {
       try {
-        const still = [...(await listFids(ctx.bridge, fids, t)).values()];
+        const still = [...(await listFids(ctx.bridge, touched, t)).values()];
         const checked = "the removed FIDs are absent from the patch";
         return {
           steps: [asRead({ name: "read_back", status: "succeeded", op: "patch.list", detail: still })],
@@ -1173,7 +1228,7 @@ export const registerPatchTools: RegisterTools = (server, ctx) => {
       title: "Add fixtures to the patch",
       description:
         "Add count fixtures of one fixture type and DMX mode at consecutive FIDs from fid, patched consecutively from a DMX address (address, or the first free block found from findFreeFrom), or unpatched when neither is given. " +
-        "Pre-checks (nothing sent on failure): the FIDs are free, the whole block is free and fits inside one universe, the mode has a single DMX break. Fixtures are added at the top level of a stage (default: the first stage). " +
+        "Pre-checks (nothing sent on failure): the FIDs are free, the whole block is free and fits inside one universe, explicit multi-break addresses are checked independently. Fixtures are added at the top level of a stage (default: the first stage). " +
         SESSION_DESC +
         " verify reads the new FIDs back: present, patch addresses, name (when given) and mode.",
       inputSchema: {
@@ -1183,6 +1238,8 @@ export const registerPatchTools: RegisterTools = (server, ctx) => {
         count: z.number().optional().describe(`Number of fixtures (1-${MAX_COUNT}, default 1).`),
         name: z.string().optional().describe("Optional name for the new fixtures (default: the console's naming)."),
         address: z.string().optional().describe('DMX start address "U.AAA" (e.g. "2.001"); the block must be free and inside one universe.'),
+        breaks: z.array(z.object({ break: z.number(), address: z.string() }).strict()).optional().describe("Explicit per-break addresses; each fixture advances separately by that break footprint. Cannot combine with address/findFreeFrom."),
+        preview: z.boolean().optional(),
         findFreeFrom: z.string().optional().describe('Instead of address: use the first free block from this "U.AAA".'),
         stage: z.string().optional().describe("Stage name (default: the first stage)."),
         exclusive: z.boolean().optional().describe(EXCLUSIVE_DESC),
@@ -1198,7 +1255,7 @@ export const registerPatchTools: RegisterTools = (server, ctx) => {
       title: "Readdress, unpatch or rename fixtures",
       description:
         "Change existing fixtures: per edit, a new DMX address (address), unpatch: true, and/or a new name. Addresses are applied together, so fixtures can swap addresses or move across their own current range. " +
-        "Pre-checks (nothing sent on failure): every FID exists, single-break modes only, and the new ranges overlap no other patched fixture. In the copy the bridge re-checks and restores every change of the call on any problem. " +
+        "Pre-checks (nothing sent on failure): every FID exists, all requested DMX breaks are valid, and the new ranges overlap no other patched fixture. In the copy the bridge re-checks and restores every change of the call on any problem. " +
         SESSION_DESC +
         " verify reads each edited fixture back (address and/or name).",
       inputSchema: {
@@ -1207,11 +1264,13 @@ export const registerPatchTools: RegisterTools = (server, ctx) => {
             z.object({
               fid: z.number().describe("Fixture ID to change."),
               address: z.string().optional().describe('New DMX address "U.AAA".'),
+              breaks: z.array(z.object({ break: z.number(), address: z.string() }).strict()).optional().describe("Change selected DMX breaks, preserving every omitted break; empty address unpatches that break."),
               unpatch: z.boolean().optional().describe("Remove the fixture's DMX address (it stays in the show)."),
               name: z.string().optional().describe("New fixture name."),
             }),
           )
           .describe(`Edits (1-${MAX_COUNT}); each FID at most once.`),
+        preview: z.boolean().optional(),
         exclusive: z.boolean().optional().describe(EXCLUSIVE_DESC),
         verify: z.boolean().optional().describe(VERIFY_DESC),
       },
@@ -1224,11 +1283,13 @@ export const registerPatchTools: RegisterTools = (server, ctx) => {
     {
       title: "Delete fixtures from the show",
       description:
-        "Delete fixtures by FID from the patch, removing them from the show (with everything that refers to them, e.g. their values in cues and groups: the console handles references). Fixtures with sub-fixtures are refused. " +
-        "Pre-check (nothing sent on failure): every FID exists and has no sub-fixtures. " +
+        "Delete fixtures by FID from the patch, removing them from the show (with everything that refers to them, e.g. their values in cues and groups: the console handles references). Grouping fixtures require include_children: true to remove their complete inventoried subtree. " +
+        "Pre-check (nothing sent on failure): every FID exists and all descendants of a grouping fixture are inventoried. " +
         SESSION_DESC +
         " verify reads the FIDs back and checks they are gone.",
       inputSchema: {
+        include_children: z.boolean().optional().describe("Explicitly remove grouping fixtures together with all descendant fixtures; preflight reports the complete inventory."),
+        preview: z.boolean().optional(),
         fids: z.array(z.number()).describe(`Fixture IDs to delete (1-${MAX_COUNT}).`),
         exclusive: z.boolean().optional().describe(EXCLUSIVE_DESC),
         verify: z.boolean().optional().describe(VERIFY_DESC),

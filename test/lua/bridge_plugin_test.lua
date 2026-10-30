@@ -867,8 +867,25 @@ do
   r = request("programmer", { scope = "all", limit = 1, offset = 1 })
   check("programmer: pagination", r.ok and r.result.total == 3 and r.result.count == 1 and r.result.rows[1].fid == "2", json.encode(r))
   r = request("programmer", { scope = "all", maxChannels = 2 })
-  check("programmer: channel budget cuts the scan and reports incomplete coverage", r.ok and r.result.coverage.complete == false and r.result.coverage.scannedFixtures == 3 and r.result.coverage.scannedChannels == 4 and has(r.result.limitations, "channel budget"), json.encode(r))
+  check("programmer: channel budget cuts within a fixture and reports incomplete coverage", r.ok and r.result.coverage.complete == false and r.result.coverage.scannedFixtures == 3 and r.result.coverage.scannedChannels == 2 and has(r.result.limitations, "channel budget"), json.encode(r))
   check("programmer: the fixture list only covers what was scanned", r.ok and #r.result.scannedFixtures == 3, json.encode(r.result and r.result.scannedFixtures))
+
+  do
+    local savedCount, savedSubfixture, savedChannels = GetSubfixtureCount, GetSubfixture, GetUIChannels
+    GetSubfixture = function() return fxDimmer end
+    GetUIChannels = function() return {} end
+    GetSubfixtureCount = function() return 1791 end
+    r = request("programmer", { scope = "all", maxChannels = 50000 })
+    check("programmer: a 1791-subfixture MVR rig retains complete fixture metadata",
+      r.ok and r.result.coverage.complete == true and #r.result.scannedFixtures == 1791 and r.result.scannedFixtures[1791].subfixtureIndex == 1790 and r.result.fixturesTruncated == false,
+      r.ok and ("fixture metadata count=" .. #r.result.scannedFixtures) or json.encode(r))
+    GetSubfixtureCount = function() return 5001 end
+    r = request("programmer", { scope = "all", maxChannels = 50000 })
+    check("programmer: fixture metadata stays bounded with an honest truncation flag",
+      r.ok and r.result.coverage.complete == true and #r.result.scannedFixtures == 5000 and r.result.fixturesTruncated == true,
+      r.ok and ("fixture metadata count=" .. #r.result.scannedFixtures) or json.encode(r))
+    GetSubfixtureCount, GetSubfixture, GetUIChannels = savedCount, savedSubfixture, savedChannels
+  end
 
   -- 0.30.1: patch indices are 0..count-1. In a show without MA's Universal fixture, index 0 is the first patched
   -- fixture; its programmer values must be in the scope "all" scan (it was skipped before).
@@ -2618,6 +2635,112 @@ do
 
   Root, GetPath, DirList, CmdIndirect, GetTopModal, Mouse = saved.Root, saved.GetPath, saved.DirList, saved.CmdIndirect, saved.GetTopModal, saved.Mouse
   Enums.PathType.Showfiles = saved.Showfiles
+end
+
+-------------------------------------------------------------------------------
+-- MVR environmental types normalize their Geometries naming policy in the copy.
+-- Live 2.5.1.1: SceneObject/Geometries IGNOREENFORCEUNIQUECHILDNAMES Yes -> No.
+-- This metadata must not hide real geometry, material, mode or fixture edits.
+-------------------------------------------------------------------------------
+do
+  local savedShowData, savedRoles = ShowData, Enums.Roles
+  Enums.Roles = { Display = 1 }
+  local function node(class, name, props, kids)
+    local n = { class = class, name = name, no = 1, props = props or {}, kids = kids or {}, names = {} }
+    for k in pairs(n.props) do n.names[#n.names + 1] = k end
+    table.sort(n.names)
+    for _, child in ipairs(n.kids) do child.parent = n end
+    function n:GetClass() return self.class end
+    function n:Children() return self.kids end
+    function n:Parent() return self.parent end
+    function n:PropertyCount() return #self.names end
+    function n:PropertyName(index) return self.names[index + 1] end
+    function n:Get(k) return self.props[k:upper()] end
+    return n
+  end
+  local function model(policy, purpose)
+    local geometry = node("Geometry", "Mesh", { POSX = "0", ROTX = "0", MATERIAL = "Matte" })
+    local geoms = node("Geometries", "Geometries", { IGNOREENFORCEUNIQUECHILDNAMES = policy }, { geometry })
+    local mode = node("DMXMode", "Scene mode", { TOTALFOOTPRINT = "0" })
+    local fixtureType = node("FixtureType", "SceneObject", { SPECIALPURPOSE = purpose or "MVR Environmental", GUID = "Scene-GUID" },
+      { geoms, node("DMXModes", "DMXModes", {}, { mode }) })
+    return node("Patch", "LivePatch", {}, { node("FixtureTypes", "FixtureTypes", {}, { fixtureType }) }),
+      geometry, mode, geoms
+  end
+  local function fingerprint(patch, collection)
+    ShowData = function() return { LivePatch = patch } end
+    local answer = request("patch.fingerprint", { side = "live", collection = collection or "FixtureTypes" })
+    assert(answer.ok and answer.result.complete, json.encode(answer))
+    return answer.result.hash
+  end
+  local live, copy = model("Yes"), model("No")
+  local liveHash, copyHash = fingerprint(live), fingerprint(copy)
+  check("mvr fingerprint: copy-normalized environmental Geometries metadata does not reject unchanged types", liveHash == copyHash)
+  for _, edit in ipairs({ { "POSX", "1" }, { "ROTX", "45" }, { "MATERIAL", "Mirror" } }) do
+    local a, geometry = model("Yes")
+    local before = fingerprint(a)
+    geometry.props[edit[1]] = edit[2]
+    check("mvr fingerprint: real geometry " .. edit[1] .. " edit is detected", fingerprint(a) ~= before)
+  end
+  local modeTree, _, mode = model("Yes")
+  local before = fingerprint(modeTree)
+  mode.props.TOTALFOOTPRINT = "1"
+  check("mvr fingerprint: real DMX mode edit is detected", fingerprint(modeTree) ~= before)
+  local otherLive, otherCopy = model("Yes", "Normal"), model("No", "Normal")
+  check("mvr fingerprint: unrelated fixture-type naming policies remain protected", fingerprint(otherLive) ~= fingerprint(otherCopy))
+  local unrelated = node("Patch", "LivePatch", {}, { node("AttributeDefinitions", "AttributeDefinitions", {},
+    { node("Geometries", "Geometries", { IGNOREENFORCEUNIQUECHILDNAMES = "Yes" }) }) })
+  before = fingerprint(unrelated, "AttributeDefinitions")
+  unrelated.kids[1].kids[1].props.IGNOREENFORCEUNIQUECHILDNAMES = "No"
+  check("mvr fingerprint: same-named containers outside fixture types remain protected", fingerprint(unrelated, "AttributeDefinitions") ~= before)
+  local fixture = node("Fixture", "Stage fixture", { FID = "1", POSX = "0" })
+  local stageTree = node("Patch", "LivePatch", {}, { node("Stages", "Stages", {},
+    { node("Stage", "Stage 1", {}, { node("Fixtures", "Fixtures", {}, { fixture }) }) }) })
+  before = fingerprint(stageTree, "Stages")
+  fixture.props.POSX = "2"
+  check("mvr fingerprint: real fixture pose edit is detected", fingerprint(stageTree, "Stages") ~= before)
+  -- An environmental Fixture's read-only Handle FIXTURE points to itself. Its display text
+  -- can transiently be empty or name the fixture appended after it; raw self-identity is stable.
+  local function ownerModel(display, purpose)
+    local ft = node("FixtureType", "SceneObject", { GUID = "Scene-GUID", SPECIALPURPOSE = purpose or "MVR Environmental" })
+    local f = node("Fixture", "Control_Booth_Desk", { FIXTURE = "", FIXTURETYPE = "SceneObject", POSX = "0", GUID = "Desk-GUID" })
+    f.owner, f.ownerDisplay, f.fixtureType = f, display, ft
+    f.ownerReadOnly = true
+    local get = f.Get
+    function f:Get(k, role)
+      if k:upper() == "FIXTURE" then return role == nil and self.owner or self.ownerDisplay end
+      if k:upper() == "FIXTURETYPE" and role == nil then return self.fixtureType end
+      return get(self, k, role)
+    end
+    function f:PropertyType(index) return self.names[index + 1] == "FIXTURE" and "Handle" or "String" end
+    function f:PropertyInfo(index) return { ReadOnly = self.names[index + 1] == "FIXTURE" and self.ownerReadOnly } end
+    local list = node("Fixtures", "Fixtures", {}, { f })
+    return node("Patch", "LivePatch", {}, { node("Stages", "Stages", {}, { node("Stage", "Stage 1", {}, { list }) }) }), f, list
+  end
+  local ownerLive = ownerModel("")
+  local ownerCopy = ownerModel("Stage 1.Fixtures.Local-Test-Light")
+  check("mvr fingerprint: read-only environmental Fixture self reference ignores transient display text",
+    fingerprint(ownerLive, "Stages") == fingerprint(ownerCopy, "Stages"))
+  local changed, changedFixture, changedList = ownerModel("")
+  before = fingerprint(changed, "Stages")
+  changedFixture.fixtureType = node("FixtureType", "Another Scene Type", { GUID = "Other-GUID", SPECIALPURPOSE = "MVR Environmental" })
+  check("mvr fingerprint: assigned fixture type edit remains protected", fingerprint(changed, "Stages") ~= before)
+  changed, changedFixture, changedList = ownerModel("")
+  before = fingerprint(changed, "Stages")
+  changedList.kids = { node("Fixture", "Grouping", { FID = "77" }, { changedFixture }) }
+  changedFixture.parent = changedList.kids[1]
+  check("mvr fingerprint: semantic fixture parent move remains protected", fingerprint(changed, "Stages") ~= before)
+  changed, changedFixture = ownerModel("")
+  before = fingerprint(changed, "Stages")
+  changedFixture.owner = node("Fixture", "Different owner", {})
+  check("mvr fingerprint: an actual non-self owner reference is not normalized", fingerprint(changed, "Stages") ~= before)
+  local writableA, fa = ownerModel("")
+  local writableB, fb = ownerModel("Other")
+  fa.ownerReadOnly, fb.ownerReadOnly = false, false
+  check("mvr fingerprint: writable fixture references are not normalized", fingerprint(writableA, "Stages") ~= fingerprint(writableB, "Stages"))
+  local ordinaryA, ordinaryB = ownerModel("", "Normal"), ownerModel("Other", "Normal")
+  check("mvr fingerprint: non-environmental fixture references are not normalized", fingerprint(ordinaryA, "Stages") ~= fingerprint(ordinaryB, "Stages"))
+  ShowData, Enums.Roles = savedShowData, savedRoles
 end
 
 print(string.format("%d passed, %d failed", passes, failures))

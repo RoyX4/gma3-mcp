@@ -1,8 +1,9 @@
 # Recipes and cooking (SB-05)
 
-Three tools combine groups, presets and MAtricks into programming that adapts to a changed rig:
+Four tools combine groups, presets and MAtricks into programming that adapts to a changed rig:
 - `gma3_recipes` reads the recipe lines of a preset or cue part and what the target holds;
 - `gma3_edit_recipe` adds, changes, moves or removes one line;
+- `gma3_edit_recipe_steps` edits existing phaser step/source values in a bounded batch;
 - `gma3_cook_recipes` cooks a preset, a cue part, a cue or a whole sequence with an explicit option, after listing
   every affected target.
 
@@ -51,8 +52,8 @@ extends to cue parts (see [the bridge protocol](../reference.md#cue-part-data-pl
 | Capability | Supported |
 | --- | --- |
 | Standard lines: group selection, preset values, MAtricks reference, Enabled, Name, SelectionMode | read, add, set, move, remove; coverage predicted and verified |
-| Standard lines with a filter or world, SelectionFromValue, the per-line timing columns | read and kept; not edited; coverage not predicted (named in the result; a merge treats what they reach as possibly replaced) |
-| Phaser recipe lines (PhaserRecipe), shapes | read and kept; not created or edited; coverage not predicted (likewise) |
+| Filter or World, SelectionFromValue and per-axis timing | edited and compared after write; filtered/from-value coverage remains unpredicted |
+| Phaser recipe lines (PhaserRecipe), shapes | created with a checked Shape reference; outer fields and existing step/source values edited; actual cooked coverage read, not predicted |
 | Targets | presets and cue parts (edit, read); a preset, cue part, cue or whole sequence (cook) |
 | Nested recipe presets (a line's preset embeds others) | noted; their own recipes are not re-cooked by this cook |
 
@@ -82,7 +83,7 @@ extends to cue parts (see [the bridge protocol](../reference.md#cue-part-data-pl
 | `remove` | `line` | `Delete <line> /NoConfirmation` |
 
 Before anything is sent:
-- the target and the line exist, and the line is a standard line (move and remove also take phaser lines);
+- the target and the line exist, with a compatible line class (Shape assignments require a phaser line);
 - the referenced group, preset and MAtricks exist.
 
 `enabled: false` switches a new line off before it gets values, so it never cooks.
@@ -157,3 +158,42 @@ A failed `Assign` can leave an empty line behind on 2.5.1; the line count catche
 bridge 0.24.0. It uses Sequence 906, Groups 910–911, Presets 23.931 and 4.931, the fixtures 401–404
 (`GMA3_LIVE_RECIPE_FIXTURES`) and the presets 4.4 and 1.11 (`GMA3_LIVE_RECIPE_COLOR`, `_DIMMER`), refuses to run when
 those objects exist, and deletes them at the end.
+
+
+## Extended recipe authoring
+
+`gma3_edit_recipe` additionally accepts `filter: {kind: "filter"|"world", number}` (or `null` to clear),
+`selection_from_value`, and `timing`. Timing keys are `FadeFromX/FadeToX`, `DelayFromX/DelayToX`,
+`SpeedFromX/SpeedToX`, `PhaseFromX/PhaseToX`, with the same pairs for Y and Z. Values are finite native
+numeric properties; `null` clears with `None`. Unknown property names and out-of-bound values fail before writes.
+References are checked before mutation and all requested properties plus untouched lines are compared afterward.
+
+For a phaser line, add `kind: "phaser", selection: <Group>, shape: <Shape>`. The Shape must exist.
+`gma3_edit_recipe_steps` takes the same target, `line`, and up to 64 `edits`:
+
+```json
+{"target":{"preset":"1.4"},"line":1,"edits":[{"step":1,"source":1,"attribute":"Dimmer","values":{"ValueAbsolute":100,"TransX":50}},{"step":2,"source":1,"values":{"ValueAbsolute":0}}],"preview":true}
+```
+
+The complete bounded source tree is read before any mutation (256 steps, 64 sources per step, 1024 total).
+Sources must already exist; assign a suitable Shape first. Supported source properties are `ValueAbsolute`,
+`ValueRelative` and `Trans/Width/Accel/Decel` on X/Y/Z. Numeric `null` clears a property. LinkSteps is disabled
+by default to make independent edits deterministic; `link_steps:true` explicitly permits native linked behavior,
+which final readback still reports if it changes untouched fields. Writes stop on the first failure or uncertainty.
+
+An edit can instead set `preset:"N.M"` for that step/source. The preset is checked and its exact assigned reference
+is compared; it cannot be combined with a hard absolute/relative value in the same edit. Setting a hard absolute
+value clears that source's preset reference. An attribute belongs to the source across every step, so conflicting
+attribute requests for the same source are refused before mutation. Effective values supplied by an assigned
+preset are reported rather than predicted.
+
+Timing verification reads raw properties: native display values can use hertz for speed and a degree suffix for
+phase. Nested hard values use numeric native Set commands and compare RawValueAbs/RawValueRel, avoiding inherited
+display wrappers. LinkSteps is checked on each nested value source, where the native writable flag actually lives.
+
+Property names and paths come from MA's bundled `system_test_phaser_recipe_basic.lua`,
+`system_test_phaser_recipe_shapes.lua`, `system_test_preset_recipe.lua`, and the bundled Recipe Editor manual.
+Mock tests verify planning, bounds and readback. Isolated onPC 2.5.1.1 qualification also added/cooked a phaser,
+changed its hard step values to 75/50, assigned a preset to a source, and compared the requested timing and references.
+This establishes stored recipe/cook behavior in that software version; physical output remains unqualified.
+Coverage for phaser and filtered recipes remains native observed coverage rather than an invented prediction.

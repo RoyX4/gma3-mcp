@@ -13,6 +13,8 @@ import { BATCH_TOOLS, COMMAND_FALLBACK_NOTE, LUA_FALLBACK_NOTE, OBSERVING_TOOLS,
 
 /** Registered tools the task map leaves out on purpose: infrastructure, low-level reads, console input, fallbacks. */
 const NOT_MAPPED = new Set([
+  // Optional local observation and Lua-backed UI fallbacks; tool descriptions explain their gates.
+  "gma3_ui", "gma3_ui_click", "gma3_screenshot", "gma3_window",
   "gma3_status", "gma3_start_bridge", "gma3_command", "gma3_lua", "gma3_lua_api", "gma3_help", "gma3_dump", "gma3_set_property",
   "gma3_pool", "gma3_fixtures", "gma3_executors", "gma3_executor_settings", "gma3_get_fader", "gma3_label_executor", "gma3_store_cue_part",
   "gma3_input_interaction", "gma3_hardkey", "gma3_keyboard", "gma3_type", "gma3_input_sequence", "gma3_hardkeys_status", "gma3_hardkeys_release_all", "gma3_feedback",
@@ -52,7 +54,7 @@ test("the server sends the task map on every start, with gma3_lua as the fallbac
   assert.match(text, /gma3_observe_tempo \(how fast running sequences \(chases\) advance\)/);
   assert.match(text, /never write a Lua waiting or polling loop/);
   assert.match(text, /Fallbacks, only for what no structured tool covers: gma3_command .* and gma3_lua/);
-  assert.ok(text.length < 4000, `instructions stay short (${text.length} characters)`);
+  assert.ok(text.length < 5000, `instructions stay short (${text.length} characters)`);
 });
 
 test("gma3_lua and gma3_command start by pointing at the structured tools; the observing tools say they watch over time", () => {

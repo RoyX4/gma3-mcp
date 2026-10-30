@@ -48,8 +48,8 @@ test("commands create every step first, then step timing, then phaser layers wit
   assert.deepEqual(effectCommands(e), [
     "Step 1", 'Attribute "Pan" At Relative Physical 20',
     "Step 2", "At Preset 4.4", 'Attribute "Pan" At Absolute Physical -45',
-    "Step 1", "At Acceleration -100", "Step 2", "At Transition 0",
-    'Set Selection MAtricks "XGroup" 2', "At Speed 30", "At Phase 0 Thru 180", "At Measure 4", "At SpeedMaster 2", "Reset Selection MAtricks", "Step 1",
+    "Step 1", "At Acceleration Percent -100", "Step 2", "At Transition Percent 0",
+    'Set Selection MAtricks "XGroup" 2', "At Speed BPM 30", "At Phase 0 Thru 180", "At Measure 4", "At SpeedMaster 2", "Reset Selection MAtricks", "Step 1",
   ]);
 });
 
@@ -60,6 +60,7 @@ test("the expected phase follows the grid position and the repetition", () => {
   assert.deepEqual([0, 1].map((k) => expectedPhase({ from: 0, to: 180 }, k, 2, { kind: "wings", count: 2 })), [180, 180], "a one-fixture wing gets the centre end (live)");
   assert.deepEqual(at(4, { kind: "groups", count: 2 }), [0, 270, 0, 270]);
   assert.deepEqual(at(8, { kind: "wings", count: 2 }), [0, 90, 180, 270, 270, 180, 90, 0]);
+  assert.deepEqual(at(9, { kind: "wings", count: 2 }), [0, 67.5, 135, 202.5, 270, 202.5, 135, 67.5, 0], "odd two-wing spread mirrors around one actual centre fixture");
   assert.deepEqual(at(8, { kind: "blocks", count: 2 }), [0, 0, 90, 90, 180, 180, 270, 270]);
   assert.deepEqual(at(1), [0]);
 });
@@ -211,16 +212,16 @@ class Console {
 
       if ((m = c.match(/^Fixture (\S+)$/))) { this.selection.push(this.fixtures[m[1]].sf); return { feedback: "OK" }; }
       if ((m = c.match(/^Step (\d+)$/))) { this.step = Number(m[1]); return { feedback: "OK" }; }
-      if ((m = c.match(/^Attribute "(\w+)" At Absolute (-?[\d.]+)$/))) {
+      if ((m = c.match(/^Attribute "(\w+)" At Absolute Percent (-?[\d.]+)$/))) {
         for (const sf of this.selection) { const r = this.row(sf, m[1]); r.steps![this.step - 1] = { ...(r.steps![this.step - 1] ?? {}), absolute: Number(m[2]) }; r.stepCount = r.steps!.length; }
         return { feedback: "OK" };
       }
-      if ((m = c.match(/^At (Transition|Width|Acceleration|Deceleration) (-?[\d.]+)$/))) {
+      if ((m = c.match(/^At (Transition|Width|Acceleration|Deceleration) Percent (-?[\d.]+)$/))) {
         const key = { Transition: "trans", Width: "width", Acceleration: "accel", Deceleration: "decel" }[m[1]] as "trans";
         if (!(this.dropFirstStepTransition && this.step === 1 && key === "trans")) for (const r of this.prog()) if (r.steps![this.step - 1]) r.steps![this.step - 1][key] = Number(m[2]);
         return { feedback: "OK" };
       }
-      if ((m = c.match(/^At Speed ([\d.]+)$/))) { for (const r of this.prog()) r.phaser!.speed = Number(m[1]) / 60; return { feedback: "OK" }; }
+      if ((m = c.match(/^At Speed BPM ([\d.]+)$/))) { for (const r of this.prog()) r.phaser!.speed = Number(m[1]) / 60; return { feedback: "OK" }; }
       if ((m = c.match(/^At Phase (-?[\d.]+) Thru (-?[\d.]+)$/))) {
         const [from, to] = [Number(m[1]), Number(m[2])];
         const n = this.selection.length;
@@ -265,6 +266,20 @@ test("a dimmer chase is built in Preview, checked, stored, Preview left, and the
   assert.equal(con.programmers.Preview.length, 0);
   assert.equal(result.plan.distribution.direction, "forward");
   assert.deepEqual(result.plan.playbackSpeed, { speedBpm: 120, measure: null, speedMaster: null });
+});
+
+test("environment-only phaser guards avoid whole programmer rescans while preservation and build checks stay complete", async () => {
+  h.fake.on("feedback.read", () => ({ items: [{ name: "previewMode", available: true, value: con.env }] }));
+  const { result, isError } = await build({ preset: "23.1", fixtures: [401, 402], template: { type: "dimmer_chase" }, variants: ["sync", "follow"], detail: true });
+  assert.equal(isError, false, JSON.stringify(result));
+  const steps = result.steps as Array<{ name: string; op?: string }>;
+  assert.ok(steps.some(s => /confirm_preview$/.test(s.name) && s.op === "feedback.read"));
+  assert.ok(steps.some(s => s.name === "read_normal_programmer" && s.op === "programmer"));
+  assert.ok(steps.some(s => s.name === "check_normal_programmer" && s.op === "programmer"));
+  const scans = h.fake.requests.filter(r => r.op === "programmer" && r.args.scope === "all");
+  assert.ok(scans.length >= 5, "Normal before/after, empty Preview, and each full build check remain");
+  assert.ok(scans.every(r => r.args.attributes === undefined), "unexpected programmer values remain visible to the verifier");
+  assert.equal(h.fake.requests.filter(r => r.op === "feedback.read").length, 2, "between-job and cleanup guards are cheap fresh observations");
 });
 
 test("a build that does not match is not stored, and Preview is left", async () => {
@@ -437,8 +452,8 @@ test("SU-13 commands: overrides after every step exists, on the fixtures they be
   const planned = planEffect(e, 4);
   const cmds = effectCommands(planned.effect, planned.overrides, { all: ["ClearSelection", "Fixture 1 Thru 4"], some: (ms) => ["ClearSelection", ...ms.map((m) => `Fixture ${m + 1}`)] });
   assert.deepEqual(cmds, [
-    "Step 1", 'Attribute "Dimmer" At Absolute 100', "Step 2", 'Attribute "Dimmer" At Absolute 0',
-    "ClearSelection", "Fixture 3", "Fixture 4", "Step 1", 'Attribute "Dimmer" At Absolute 0', "Step 2", 'Attribute "Dimmer" At Absolute 100',
+    "Step 1", 'Attribute "Dimmer" At Absolute Percent 100', "Step 2", 'Attribute "Dimmer" At Absolute Percent 0',
+    "ClearSelection", "Fixture 3", "Fixture 4", "Step 1", 'Attribute "Dimmer" At Absolute Percent 0', "Step 2", 'Attribute "Dimmer" At Absolute Percent 100',
     "ClearSelection", "Fixture 1 Thru 4",
     'Set Selection MAtricks "XShuffle" 5', "At Phase 0 Thru 270", "Reset Selection MAtricks", "Step 1",
   ]);

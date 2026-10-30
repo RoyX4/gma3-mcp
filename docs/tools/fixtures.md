@@ -182,11 +182,11 @@ Commands: target steps as in `gma3_set_attribute` (2–4), then
 7. `Attribute "ColorRGB_B" At Absolute Percent <blue>`
 
 A rejected component stops the sequence: e.g. red accepted, green rejected → `partial`, blue `skipped`.
-Selection / programmer impact as for `gma3_set_attribute`. Verification `unavailable`. Only the
-documented `ColorRGB_*` attributes are supported (no colour wheels, no CMY, no `ColorAdd_*`). Fixtures
-without RGB mixing are **not** pre-checked: if the console rejects the command the result is `failed`
-or `partial` with the feedback in the step; if it silently accepts it, the result is `succeeded` with
-`verification: unavailable` — never a verified success.
+Selection / programmer impact as for `gma3_set_attribute`. Small explicit targets are checked against
+their fixture attributes before dispatch. Programmer readback compares each requested RGB value per
+fixture/cell; unsupported, mismatched or incomplete reads are reported explicitly. Only the documented
+`ColorRGB_*` attributes are supported by this tool. For mixed fixture types and explicit CMY, wheel or
+temperature calibration, use [gma3_set_fixture_color](colour.md).
 
 ## gma3_set_position
 

@@ -73,6 +73,19 @@
 -- and keep one instance each; the module table is read-only and nothing here uses globals or
 -- package.loaded.
 
+-- Fingerprint of the bytecode actually imported into this Lua VM, computed once per component load.
+-- This is a non-cryptographic runtime identity, not a source-file SHA or a version-label claim.
+local COMPONENT_FINGERPRINT
+do
+  local chunk = debug.getinfo(1, "f").func
+  local ok, bytes = pcall(string.dump, chunk, true)
+  if ok then
+    local a, b = 1, 0
+    for i = 1, #bytes do a = (a + bytes:byte(i)) % 65521; b = (b + a) % 65521 end
+    COMPONENT_FINGERPRINT = string.format("lua-bytecode-adler32:%08x:%d", b * 65536 + a, #bytes)
+  end
+end
+
 local NAME        = "gma3_mcp_feedback"
 local VERSION     = "0.8.0"
 local API_VERSION = 1
@@ -1627,7 +1640,7 @@ local function new(opts)
                         _epoch = 1, _cache = {}, _watch = {}, _cursor = 0, _generations = {}, _generationOrder = {} }, Instance)
 end
 
-local M = { NAME = NAME, VERSION = VERSION, API_VERSION = API_VERSION, READERS = readerNames(), new = new, consoleDeps = consoleDeps,
+local M = { RUNTIME_FINGERPRINT = COMPONENT_FINGERPRINT, NAME = NAME, VERSION = VERSION, API_VERSION = API_VERSION, READERS = readerNames(), new = new, consoleDeps = consoleDeps,
             itemsFor = itemsFor, describe = describeReaders, toBool = toBool, keyOf = keyOf,
             contextItems = contextItems, parseRef = parseRef, bindingDigest = bindingDigest }
 

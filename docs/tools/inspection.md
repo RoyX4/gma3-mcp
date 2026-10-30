@@ -218,13 +218,9 @@ and `topLevelKeys` is there to check it live.
 Readable without playback: cue properties, part timing/command/MIB, `OwnDataPresent`, recipes (Group/Selection x
 Preset with timing), preset references, and preset content via `GetPresetData`.
 
-Not readable: **hard (non-recipe) fixture values stored in a cue part**. There is no `GetCueData` in 2.5.1; the
-cooked value storage is binary (`MemoryType Compressed`) and not exposed as children or properties. The tool
-reports `storedValues: null` and, when a part has `OwnDataPresent = Yes`, the limitation
-`"hard (non-recipe) fixture values stored in a cue part are not exposed by the 2.5.1 Lua API (no GetCueData); only
-recipe and preset references are readable"`. Tracked values are not reconstructed either: a part lists only what is
-stored in it (`trackedValues: "not_reconstructed"`). The alternatives (`Fixture X At Cue N`, `Cue N` SelFix, the
-DMX sheet during playback) all mutate state and are excluded.
+The current bridge reads **hard fixture channels from CuePart handles using GetPresetData**. A separate GetCueData function is not required. `gma3_cue_contents` adds normalized `storedValues` when complete native coverage is available; older imported plugins retain the explicit unavailable fallback.
+
+Use `gma3_native_cue_data` for a whole sequence's absolute/relative layers, phaser steps, preset references, native raw fingerprints and tracked source cue/part. Numeric part Tracking Distance endpoints and cue Release are reconstructed. Unknown distance formats, incomplete mappings and duplicate layer precedence prevent a complete claim. Break/Shield protect later edits through actual stored data; Assert and priorities affect playback arbitration, outside this sequence-owned layer model. Final DMX, fades and physical light remain separate observations. See [native-cues.md](native-cues.md).
 
 ---
 
@@ -262,7 +258,7 @@ selectionCount?, scannedFixtures: [{subfixtureIndex, fid?, name?, rootFid?, attr
 total, offset, count, rows: [row], limitations: [string] }`
 
 `scannedFixtures` (since plugin 0.3.2) lists every (sub)fixture index the scan covered, so a client can tell
-"no programmer value" from "not scanned" per fixture; it is cut at 1000 entries (`fixturesTruncated`). Since
+"no programmer value" from "not scanned" per fixture; it is cut at 5000 entries (`fixturesTruncated`). Since
 0.3.4 each entry also lists the `attributes` that (sub)fixture has (from its UI channels), so "no row" can be
 told apart from "no such attribute here" per cell. `rows` are paginated by `limit`/`offset` independently of
 `coverage`: `coverage.complete` describes the scan, `total` versus `count` whether every row was returned. For
@@ -382,7 +378,7 @@ look at its diagnostics, or run the tools by hand:
   0..255 and a 16-bit attribute combined as `raw16`.
 * `gma3_cue_contents` on a recipe cue: recipes with `presetResolved: true` and `presetRef.addrNative`; with
   `expand_presets: true` inspect `presets[*].topLevelKeys` and `rows` to confirm the `GetPresetData` flattening.
-  On a part with hard values: `ownDataPresent: true`, `storedValues: null` and the hard-values limitation.
+  On a part with hard values, inspect normalized `storedValues` and coverage. An older plugin reports null with a capability limitation.
 * In every case the selection count and the programmer must be unchanged (the live test asserts the selection count).
 
 ## Live test

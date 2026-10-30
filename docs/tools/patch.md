@@ -75,7 +75,7 @@ open on a display (someone is patching there), close it there with **Save and Ex
 | `unknown` | A step after `enter` got no reply, the copy never opened, or the commit was not confirmed; `committed` / `copyLeftOpen` say what is known |
 
 **Bridge-side safety net.** Each mutating op re-checks in the console:
-- `patch.add`: the copy, the destination, a free FID range, a free DMX range inside one universe, a single-break
+- `patch.add`: the copy, the destination, a free FID range, a free DMX range inside one universe, a validated per-break
   mode. It calls `AddFixtures` once per fixture (amount 1, the fixture's own FID and address; bridge 0.25.2), stops
   at the first call that fails, checks that exactly the requested fixtures exist where requested, and deletes them
   again on any problem. A single call for a whole block crashed onPC 2.5.1 for a mode with cells (see
@@ -86,7 +86,7 @@ open on a display (someone is patching there), close it there with **Save and Ex
   range check report it as `occupancyUnknown`, and an add or readdress is refused, both in the pre-flight and in the
   copy. Such a fixture has an unreadable break, a break that is not an address, a DMX mode that cannot be read, or a
   break the mode does not have. A rename or an unpatch adds no range and is not affected.
-- `patch.remove`: refuses fixtures with sub-fixtures.
+- `patch.remove`: grouping fixtures require explicit includeChildren plus a checked complete subtree.
 - All five mutating ops are on the bridge's input-ownership guard (refused with `[busy]` while someone owns console
   input) and need `exclusive = true`.
 
@@ -150,7 +150,7 @@ i × footprint), name (when given) and mode.
 
 Pre-flight (`patch.check` `edits`), nothing sent on failure:
 - every FID exists;
-- readdressed fixtures use single-break modes;
+- readdressed multi-break fixtures use explicit break addresses;
 - the new ranges overlap no other patched fixture. The moving fixtures' own current ranges are ignored, so swaps and
   moves across a fixture's own range pass.
 
@@ -159,7 +159,7 @@ The change is `patch.set`. Read-back compares each fixture's patch address and/o
 ## gma3_patch_remove
 
 `fids`: up to 256 FIDs, each once. Removing a fixture deletes it from the show; the console handles what referred to
-it. Pre-flight (`patch.check` `fids`): every FID exists and has no sub-fixtures. The change is `patch.remove`.
+it. Pre-flight (`patch.check` `fids`): every FID exists; a grouping fixture requires include_children and a complete descendant inventory. The change is `patch.remove`.
 Read-back checks the FIDs are gone. The result's `removed` lists the fixtures as they were.
 
 ## gma3_patch_move
@@ -438,3 +438,29 @@ named "MCP live import" and only the types the run imported, by GUID. 1/1 on mac
 ```bash
 GMA3_LIVE=1 GMA3_LIVE_EXCLUSIVE=1 node --import tsx --test test/live/patch-import.live.ts
 ```
+
+
+## Multiple DMX breaks and grouping-fixture removal
+
+`gma3_patch_add` accepts `breaks:[{break:1,address:"2.001"},{break:2,address:"3.001"}]` instead of `address`
+or `findFreeFrom`. Each fixture advances each supplied break by that break's native footprint; omitted breaks
+stay unpatched. All proposed ranges, universe boundaries and other fixtures' complete occupancy are checked.
+The bridge passes the documented up-to-eight-address `AddFixtures.patch` table and verifies every created break.
+Legacy `address` remains available for single-break modes; it does not guess packing for a multi-break mode.
+
+`gma3_patch_set` accepts the same `breaks` per edit. Only specified breaks change; all omitted addresses remain.
+An empty address unpatches that break; `unpatch:true` clears all breaks. Preflight snapshots include fixture
+identity and all break addresses; native editing rejects changed identities before writing. Swaps clear the edited
+fixtures' addresses together, then apply complete plans. A failed write restores every original break and name,
+and verifies restoration; incomplete restoration is explicitly reported and prevents a commit.
+
+`gma3_patch_remove {fids:[4],include_children:true}` removes the grouping fixture and its whole descendant tree.
+The preflight reports the full inventory, including descendant DMX breaks in a flat list to avoid the bridge's
+JSON depth cap. The native mutator checks every descendant against that inventory before deleting. Requests
+that include both a parent and its child delete the parent once. Native and committed readback check descendant
+numeric FIDs are absent and the isolation comparison covers untouched fixtures.
+
+All three tools support `preview:true`, which performs read-only checks and returns the intended edit and scope
+without opening or committing a patch copy. Existing exclusive-use, isolation and uncertain-delivery behavior
+remains in effect. AddFixtures' multiple-break argument is documented in the bundled MA Lua API manual;
+recursive deletion and BreakN writes still require separate native qualification before a physical-show claim.

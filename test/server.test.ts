@@ -116,6 +116,13 @@ test("gma3_command returns bridge feedback when the bridge replies", async () =>
   assert.equal(bridgeRequests.at(-1)?.op, "cmd");
 });
 
+test("starting the bridge over OSC uses the configured bridge port", async () => {
+  bridgeMode = "reply";
+  oscMessages.length = 0;
+  await client.callTool({ name: "gma3_start_bridge", arguments: {} });
+  assert.deepEqual(oscMessages.at(-1)?.args, [`Plugin "gma3_mcp_bridge" "${bridgePort}"`]);
+});
+
 test("a command the bridge accepted but never answered is NOT resent over OSC", async () => {
   bridgeMode = "silent";
   oscMessages.length = 0;

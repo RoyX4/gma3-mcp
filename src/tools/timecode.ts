@@ -6,6 +6,8 @@
  *                            optionally the 16 timecode slots
  *   gma3_build_timecode      create a show, replace its tracks or append tracks: sequence tracks of cue events at
  *                            explicit times; never plays or records
+ *   gma3_timecode_record     capture/start/stop actual native recording; native fields are preserved for non-command events
+ *   gma3_record_fader_curve record planned piecewise native Master-fader fades with endpoint readback
  *   gma3_timecode_transport  play (Go), stop (Off), rewind (Top) or seek (Cursor), then observe the cursor and the target
  *                            sequences and check the events crossed against what they should have done
  *
@@ -22,6 +24,9 @@
  *   - Deleting a track's target removes the track's command subtrack with its events; the track stays, without a target.
  */
 import { z } from "zod";
+import { registerTimecodeCurveTool } from "./timecodecurves.js";
+import { registerTimecodeFaderTool } from "./timecodefader.js";
+import { registerTimecodeRecordTool } from "./timecoderecord.js";
 import { BridgeError, type Gma3Bridge } from "../bridge.js";
 import { exists } from "./common.js";
 import { json, operation, type RegisterTools, type ToolContext } from "./context.js";
@@ -220,6 +225,11 @@ export function pairProblems(events: EventSpec[]): string[] {
 // ---------------------------------------------------------------------------
 
 interface RawEvent {
+  class?: string;
+  faderValue?: number;
+  fadeOverrideSeconds?: number;
+  fields?: Record<string, unknown>;
+  fieldsComplete?: boolean;
   group: number;
   track: number;
   range: number;
@@ -239,10 +249,11 @@ export interface TimecodeRead {
   addr?: string;
   settings: Record<string, unknown>;
   playing?: boolean;
+  recording?: boolean;
   groups: Array<{ group: number; name?: string; markers?: number }>;
   tracks: Array<{ group: number; track: number; name?: string; target?: { class?: string; addr?: string; name?: string; no?: number; invalid?: boolean } | null; play?: string; rec?: string }>;
   ranges: Array<{ group: number; track: number; range: number; rawStart?: number | null; duration?: string }>;
-  subtracks: Array<{ group: number; track: number; range: number; subtrack: number; class?: string; count?: number }>;
+  subtracks: Array<{ group: number; track: number; range: number; subtrack: number; class?: string; count?: number; faderToken?: string }>;
   events: RawEvent[];
   eventCount: number;
   truncated: boolean;
@@ -253,9 +264,9 @@ const notFound = (err: unknown) => err instanceof BridgeError && /not-found|no o
 const unknownOp = (err: unknown) => err instanceof BridgeError && /unknown op|not supported|no such op/i.test(err.message);
 
 /** One show through `timecode.read`; null when it does not exist. */
-export async function readTimecode(bridge: Gma3Bridge, n: number, t: number): Promise<TimecodeRead | null> {
+export async function readTimecode(bridge: Gma3Bridge, n: number, t: number, options: { eventFields?: boolean } = {}): Promise<TimecodeRead | null> {
   try {
-    return (await bridge.request("timecode.read", { timecode: n }, t)) as TimecodeRead;
+    return (await bridge.request("timecode.read", { timecode: n, ...options }, t)) as TimecodeRead;
   } catch (err) {
     if (unknownOp(err)) throw new Error(NEEDS_BRIDGE);
     if (notFound(err)) return null;
@@ -283,7 +294,9 @@ export function presentShow(r: TimecodeRead, fps?: Fps) {
     const events = evs
       .map((e) => {
         const action = actionOf(e.token ?? e.name, e.status);
-        if (!action) problems.push(`group ${tr.group} track ${tr.track} event ${e.index}: token ${JSON.stringify(e.token ?? e.name)} is not modelled`);
+        const faderValue = e.faderValue ?? (typeof e.fields?.FADERVALUE === "number" ? e.fields.FADERVALUE : undefined);
+        const fader = e.class === "FaderEvent" && typeof faderValue === "number" ? { token: e.token ?? "FaderMaster", value: faderValue, unit: "percent", fadeSeconds: e.fadeOverrideSeconds ?? (typeof e.fields?.FADEOVERRIDE === "number" ? e.fields.FADEOVERRIDE : null) } : null;
+        if (!action && !fader) problems.push(`group ${tr.group} track ${tr.track} event ${e.index}: token ${JSON.stringify(e.token ?? e.name)} is not modelled`);
         if (action === "goto" && (!e.cue || e.cue.invalid)) problems.push(`group ${tr.group} track ${tr.track} event ${e.index}: Goto without a ${e.cue?.invalid ? "valid " : ""}cue`);
         return {
           range: e.range,
@@ -292,7 +305,10 @@ export function presentShow(r: TimecodeRead, fps?: Fps) {
           seconds: e.raw === null ? null : fromRaw(e.raw),
           time: e.raw === null ? null : formatTime(e.raw, fps),
           raw: e.raw,
+          ...(e.class ? { class: e.class } : {}),
+          ...(e.fields ? { nativeFields: e.fields, nativeFieldsComplete: e.fieldsComplete } : {}),
           action,
+          ...(fader ? { fader } : {}),
           token: e.token ?? e.name,
           ...(e.status ? { status: e.status } : {}),
           ...(e.cue ? { cue: e.cue.invalid ? { invalid: true } : { sequence: e.cue.sequence, cue: typeof e.cue.no === "number" ? e.cue.no / 1000 : null, name: e.cue.name } } : {}),
@@ -312,7 +328,7 @@ export function presentShow(r: TimecodeRead, fps?: Fps) {
     durationSeconds: typeof s.RawDuration === "number" ? fromRaw(s.RawDuration) : displaySeconds(s.Duration),
     source: { tcSlot: tcSlotOf(s.TCSlot), offsetTcSlot: s.OffsetTCSlot ?? null, autoStart: s.AutoStart ?? null, autoStop: s.AutoStop ?? null },
     playback: { loopMode: s.LoopMode ?? null, loopCount: s.LoopCount ?? null, switchOff: s.SwitchOff ?? null, assertPreviousEvents: s.AssertPrevEvents ?? null, restartOption: s.RestartOption ?? null },
-    recording: { playbackAndRecord: s.PlaybackAndRecord ?? null, armed: "unavailable: the recording state is a console method the bridge does not call; these tools never record" },
+    recording: { playbackAndRecord: s.PlaybackAndRecord ?? null, armed: typeof r.recording === "boolean" ? r.recording : "unavailable: update the bridge for native IsRecording" },
     frameReadout: s.FrameReadout ?? null,
     locked: s.Lock === undefined ? null : String(s.Lock ?? "").trim() !== "" && !/^no$/i.test(String(s.Lock)),
     groups: r.groups,
@@ -654,7 +670,7 @@ export async function timecodeTransport(ctx: ToolContext, raw: TransportArgs): P
   const v = new Validator();
   const n = v.check(() => finiteNumber("timecode", raw.timecode, { integer: true, min: 1, max: 99999 }));
   const action = (["play", "stop", "rewind", "seek"] as const).find((a) => a === raw.action);
-  if (!action) v.fail("action must be play (Go), stop (Off), rewind (Top) or seek (to a time); recording is not offered");
+  if (!action) v.fail("action must be play (Go), stop (Off), rewind (Top) or seek (to a time); use gma3_timecode_record for recording");
   const fps = v.check(() => fpsOf("fps", raw.fps));
   const to = action === "seek" ? v.check(() => parseTime("to", raw.to, fps)) : undefined;
   if (action !== "seek" && raw.to !== undefined) v.fail("to is for seek only");
@@ -882,12 +898,15 @@ async function readOnly(fn: () => Promise<unknown>) {
 const timeSchema = z.union([z.number(), z.string(), z.object({ frames: z.number(), fps: z.number() })]);
 
 export const registerTimecodeTools: RegisterTools = (server, ctx) => {
+  registerTimecodeRecordTool(server, ctx);
+  registerTimecodeFaderTool(server, ctx);
+  registerTimecodeCurveTool(server, ctx);
   server.registerTool(
     "gma3_timecodes",
     {
       title: "Read the timecode pool or one timecode show",
       description:
-        "Read-only. Without timecode: the timecode pool. With timecode: name, playing, cursor and duration (seconds), the source (tc_slot internal / slot N, offset, auto start/stop), playback settings (loop mode and count, switch off, assert previous events), recording settings (the armed state is not readable; these tools never record), and every track group, track (its target) and event: time in seconds and as H:MM:SS.sss (or H:MM:SS:FF with fps 24/25/30/60), exact raw time, action (go, goto, off, flash_press, ...), cue. problems names tracks without a target, Goto events without a cue and unmodelled tokens. slots: true lists the 16 timecode slots (their time only: external reception is not readable). Needs bridge 0.25.0.",
+        "Read-only. Without timecode: the timecode pool. With timecode: name, playing, cursor and duration (seconds), the source (tc_slot internal / slot N, offset, auto start/stop), playback settings (loop mode and count, switch off, assert previous events), recording settings and native armed state (gma3_timecode_record captures operator actions), and every track group, track (its target) and event: time in seconds and as H:MM:SS.sss (or H:MM:SS:FF with fps 24/25/30/60), exact raw time, action (go, goto, off, flash_press, ...), cue. problems names tracks without a target, Goto events without a cue and unmodelled tokens. slots: true lists the 16 timecode slots (their time only: external reception is not readable). Needs bridge 0.25.0.",
       inputSchema: { timecode: z.number().optional(), fps: z.number().optional(), slots: z.boolean().optional() },
     },
     async (args) => readOnly(() => readTimecodes(ctx, args)),
@@ -920,7 +939,7 @@ export const registerTimecodeTools: RegisterTools = (server, ctx) => {
     {
       title: "Play, stop, rewind or seek a timecode show and observe it",
       description:
-        "PLAYS when asked and OBSERVES OVER TIME on the server side (no Lua loop needed): play sends Go Timecode N (from the cursor, internal time; with a timecode slot the time comes from the slot), stop sends Off (playbacks it started keep running unless switch_off is off), rewind sends Top, seek writes the cursor (to: a time as in gma3_build_timecode). Recording is not offered. " +
+        "PLAYS when asked and OBSERVES OVER TIME on the server side (no Lua loop needed): play sends Go Timecode N (from the cursor, internal time; with a timecode slot the time comes from the slot), stop sends Off (playbacks it started keep running unless switch_off is off), rewind sends Top, seek writes the cursor (to: a time as in gma3_build_timecode). Recording is provided by gma3_timecode_record. " +
         "Then samples the cursor and the target sequences for observe_seconds (play: default 5) and, for play, checks every event the cursor crossed against the sequences' observed cue changes in order (goto -> that cue, go -> the next cue, off -> off, presses -> running; others are listed as not predictable). The result separates dispatched from observed.",
       inputSchema: { timecode: z.number(), action: z.enum(["play", "stop", "rewind", "seek"]), to: timeSchema.optional(), fps: z.number().optional(), observe_seconds: z.number().optional(), interval_ms: z.number().optional() },
     },

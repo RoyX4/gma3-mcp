@@ -338,7 +338,18 @@ test("inspection tools never send commands or take the mutation lock", async () 
   assert.deepEqual(h.fake.commands, []);
   assert.deepEqual(
     h.fake.requests.map((r) => r.op),
-    ["fixtureAttributes", "programmer", "fixtureOutput", "dmx", "cueContents"],
+    ["fixtureAttributes", "programmer", "fixtureOutput", "dmx", "cueContents", "cue.content"],
   );
   assert.equal(h.ctx.mutations.busy, false);
+});
+
+
+test("cue inspection reads actual hard native values when the new bridge exposes them", async () => {
+  h.fake.on("cueContents", () => ({ ref: "Sequence 900 Cue 1", cue: {}, parts: [{ part: 0 }], limitations: ["hard (non-recipe) values are not exposed (no GetCueData)"] }));
+  h.fake.on("cue.content", () => ({ complete: true, cues: [{ parts: [{ no: 0, contentJson: JSON.stringify({ rows: [{ fixture: "1", attribute: "Dimmer", value: 0 }], byFixtures: true, truncated: false }) }] }] }));
+  const { result, isError } = await h.callJson("gma3_cue_contents", { sequence: 900, cue: 1 });
+  assert.equal(isError, false);
+  assert.equal(result.parts[0].storedValues.rows[0].value, 0);
+  assert.equal(result.nativeContentComplete, true);
+  assert.equal(result.limitations.some((s: string) => s.includes("no GetCueData")), false);
 });

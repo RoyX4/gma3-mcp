@@ -265,6 +265,22 @@ test("configure_executor clears a function with Empty and sets MA and encoder fu
   assert.equal(con.pages.get(1)!.execs.get(201)!.props.KeyUnpress, "");
 });
 
+test("configure_executor detects a setter changing another requested field that initially matched", async () => {
+  const originalSet = h.fake.handlerFor("set")!;
+  h.fake.on("set", async (args, req) => {
+    const reply = await originalSet(args, req);
+    if (args.ref === "Page 1.201" && args.property === "Encoder") {
+      con.pages.get(1)!.execs.get(201)!.props.Fader = String(args.value);
+    }
+    return reply;
+  });
+  const { result, isError } = await h.callJson("gma3_configure_executor", { page: 1, executor: 201, fader: "Master", encoder: "Rate" });
+  assert.equal(isError, true, "a changed encoder must not conceal the now-wrong fader");
+  assert.equal(result.verification.status, "mismatched");
+  assert.equal(con.pages.get(1)!.execs.get(201)!.props.Fader, "Rate");
+  assert.deepEqual(sets(), ["Page 1.201 Encoder=Rate"], "detect the side effect without blindly replaying setters");
+});
+
 test("configure_executor with every value already set sends nothing", async () => {
   const { result, isError } = await h.callJson("gma3_configure_executor", { page: 1, executor: 201, key_press: "Go+", fader: "master", fix: false, lock: false });
   assert.equal(isError, false, JSON.stringify(result));

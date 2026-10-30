@@ -390,6 +390,7 @@ AddFixtures = function(spec)
     -- "unpatched": AddFixtures leaves the fixture without an address (amount > 1 did that live for all but the first).
     if console.addMode == "unpatched" and #console.addCalls > 1 then addr = "" end
     stage.Fixtures.kids[#stage.Fixtures.kids + 1] = fixture(spec.name or ("Added " .. (fid + i)), fid + i, spec.mode, addr)
+    if spec.patch then for b = 2, #spec.patch do stage.Fixtures.kids[#stage.Fixtures.kids]:Set("Break" .. b, spec.patch[b]) end end
   end
   return true
 end
@@ -513,8 +514,14 @@ console.dest = "ShowData.Patch"
 r = request("patch.add", with({ stage = "Stage 1", type = 6, mode = 3, fid = 901, count = 2, address = "2.001" }))
 check("patch.add at the wrong destination is refused", r.ok == false and r.code == "wrong-destination", J(r))
 console.dest = "Stage 1.Fixtures"
-r = request("patch.add", with({ stage = "Stage 1", type = 8, mode = 1, fid = 901 }))
-check("patch.add refuses a multi-break mode", r.ok == false and r.code == "multi-break", J(r))
+r = request("patch.add", with({ stage = "Stage 1", type = 8, mode = 1, fid = 901, address = "2.001" }))
+check("patch.add requires explicit addresses for a multi-break mode", r.ok == false and r.code == "multi-break", J(r))
+r = request("patch.add", with({ stage = "Stage 1", type = 8, mode = 1, fid = 991, breaks = { { ["break"] = 1, address = "10.001" }, { ["break"] = 2, address = "11.001" } } }))
+check("patch.add accepts and verifies explicit multiple breaks", r.ok and #r.result.created[1].breaks == 2 and r.result.created[1].breaks[2].address == "11.001", J(r))
+r = request("patch.set", with({ edits = { { fid = 991, breaks = { { ["break"] = 2, address = "12.001" } } } } }))
+check("patch.set changes one DMX break while preserving the other", r.ok and r.result.edits[1].after.breaks[1].address == "10.001" and r.result.edits[1].after.breaks[2].address == "12.001", J(r))
+r = request("patch.remove", with({ fids = { 991 } }))
+check("multi-break test fixture is removed from the copy", r.ok, J(r))
 r = request("patch.add", with({ stage = "Stage 1", type = 6, mode = 3, fid = 403 }))
 check("patch.add refuses a taken FID", r.ok == false and r.code == "fid-taken", J(r))
 r = request("patch.add", with({ stage = "Stage 1", type = 6, mode = 3, fid = 901, address = "1.020" }))
@@ -1084,6 +1091,25 @@ grpC.pv.SELECTIONDATA = { { sf_index = 5 } }
 r = request("patch.groupsOf", { fids = { 401, 501 } })
 check("patch.groupsOf: a selected cell whose Parent cannot be read makes the group unreadable (PR #89 review)", r.ok and J(r.result.unreadable) == '["1.11"]', J(r))
 ShowData = liveShowData
+
+-- Compound removal: exact native tree inventory, stale descendant rejection, and one parent deletion.
+console.modal = false
+r = request("patch.enter", with({})); frame()
+check("compound removal test enters a separate patch copy", r.ok and console.copyOpen, J(r))
+r = request("patch.check", { fids = { 4 } })
+local compound = r.ok and r.result.fixtures[1]
+if compound then compound.descendants = r.result.descendants end
+check("compound preflight includes every descendant and full DMX breaks", compound and #compound.descendants > 0 and type(compound.descendants[1].breaks) == "table" and type(compound.descendants[1].breaks[1]) == "table", J(r))
+local oldName, child
+for _, f in ipairs(allFixtures(console.copy)) do if f.FID == compound.descendants[1].fid then child = f; oldName = f.name end end
+child:Set("Name", "Changed since preflight")
+r = request("patch.remove", with({ fids = { 4 }, includeChildren = true, expected = { ["4"] = { current = compound.current, descendants = compound.descendants } } }))
+check("compound removal refuses a stale descendant before Delete", not r.ok and r.code == "stale-fixture" and #allFixtures(console.copy) > 1, J(r))
+child:Set("Name", oldName)
+r = request("patch.remove", with({ fids = { 4, compound.descendants[1].fid }, includeChildren = true, expected = { ["4"] = { current = compound.current, descendants = compound.descendants } } }))
+local remains, outside = false, false
+for _, f in ipairs(allFixtures(console.copy)) do if f.FID == 4 or f.FID == compound.descendants[1].fid then remains = true elseif f.FID == 501 then outside = true end end
+check("compound removal deletes parent plus children once and preserves outside fixture", r.ok and #r.result.removed == 1 and not remains and outside, J(r))
 
 print(string.format("%d passed, %d failed", passes, failures))
 if failures > 0 then print("FAILED"); os.exit(1) end

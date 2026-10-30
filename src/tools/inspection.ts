@@ -254,6 +254,7 @@ export const registerInspectionTools: RegisterTools = (server, ctx: ToolContext)
         scope: z.enum(["all", "selection", "fixtures"]).describe("all = every patched (sub)fixture; selection = current selection; fixtures = the `fixtures` range."),
         fixtures: z.string().optional().describe('Required for scope "fixtures": fixture IDs/ranges such as "1 Thru 5", "101 + 103", "Fixture 501.3". Groups are not expanded.'),
         max_channels: z.number().int().min(1).max(50000).optional().describe("Scan budget in UI channels per request (default 5000). The scan stops when reached and coverage.complete is false."),
+        attributes: z.array(z.string().min(1).max(128).regex(/^[^\x00-\x1f\x7f]+$/)).min(1).max(128).optional().describe("Read only these attribute names (case-insensitive); unrelated GetProgPhaser calls are skipped. coverage then covers only these attributes; an empty result does not prove the whole programmer empty."),
         fields: z.array(z.enum(PROGRAMMER_ROW_KEYS)).optional().describe("Compact form: keep only these row keys (fid, subfixtureIndex and attribute are always kept)."),
         by_fixture: z.boolean().optional().describe("Compact form: perFixture, one entry per (sub)fixture with attribute -> value (or -> the chosen fields), instead of rows (one per channel). Folds the rows of this page."),
         ...pageShape(200, 5000),
@@ -276,7 +277,7 @@ export const registerInspectionTools: RegisterTools = (server, ctx: ToolContext)
         // The fixture summary folds one page: by default a whole scan's worth, so a fixture is not split across pages.
         const { limit, offset } = pageArgs(v, { ...args, limit: args.limit ?? (byFixture ? 5000 : undefined) }, 200, 5000);
         if (!v.ok || !scope) return validationError("gma3_programmer", v.errors);
-        const res = await op(bridge, "programmer", { scope, fixtures, limit, offset, maxChannels }, timeoutMs);
+        const res = await op(bridge, "programmer", { scope, fixtures, limit, offset, maxChannels, ...(args.attributes ? { attributes: args.attributes } : {}) }, timeoutMs);
         const coverage = (res.coverage && typeof res.coverage === "object" ? res.coverage : { complete: false }) as Row;
         const limitations = stringList(res.limitations);
         if (coverage.complete !== true && !limitations.some((l) => /coverage|budget|enumerat|failed/i.test(l))) {
@@ -410,7 +411,7 @@ export const registerInspectionTools: RegisterTools = (server, ctx: ToolContext)
         "Read what a cue stores without playing it back or loading it: cue properties (No, Name, TrigType, TrigTime, TrigSound, Release, Assert, Note), per part the timing (CueFade, CueDelay, CueInFade, CueInDelay, CueOutFade, CueOutDelay, SnapDelay), command, MIB settings, " +
         "OwnDataPresent, and the recipes (selection, preset text plus the resolved preset reference or an explicit unresolved marker, values, FadeX/DelayX/SpeedX/PhaseX, enabled). `expand_presets: true` adds the referenced presets' data (GetPresetData) keyed by preset address. " +
         WORKS_WITHOUT_LUA +
-        "SUPPORTED MODE (onPC 2.5.1): recipe- and preset-based content only. NOT AVAILABLE: hard (non-recipe) fixture values stored in a part (`storedValues` is always null; a limitation is added when OwnDataPresent is Yes) and tracked/effective values (`trackedValues: \"not_reconstructed\"`; a part lists only what it stores). " +
+        "The new cue.content bridge reader adds actual hard (non-recipe) fixture values through GetPresetData(CuePart). Older plugins retain explicit unavailable storedValues. This single-cue read does not reconstruct tracked values; use gma3_native_cue_data for sequence-owned inheritance and its completeness limits. " +
         "The `fixtures` filter applies to expanded preset data only (stated in limitations). Never sends Goto, Load or any playback command.",
       inputSchema: {
         sequence: z.union([z.number(), z.string()]).describe("Sequence number (or exact name)."),
@@ -433,6 +434,13 @@ export const registerInspectionTools: RegisterTools = (server, ctx: ToolContext)
         if (!v.ok || sequence === undefined || cue === undefined) return validationError("gma3_cue_contents", v.errors);
         const expandPresets = args.expand_presets === true;
         const res = await op(bridge, "cueContents", { sequence, cue, part, fixtures, expandPresets }, timeoutMs);
+        let native: Row | null = null, nativeError: string | null = null;
+        const nativeRef = typeof res.ref === "string" ? res.ref : typeof sequence === "number" ? `Sequence ${sequence} Cue ${cue}` : null;
+        if (nativeRef) {
+          try { native = await op(bridge, "cue.content", { ref: nativeRef }, timeoutMs); }
+          catch (err) { nativeError = err instanceof Error ? err.message : String(err); }
+        }
+        const nativeParts = asArray(asArray(native?.cues)[0] && (asArray(native?.cues)[0] as Row).parts) as Row[];
         const parts = asArray(res.parts).map((p) => {
           const row = withNulls(p, PART_KEYS);
           row.timing = withNulls(row.timing, PART_TIMING_KEYS);
@@ -441,21 +449,30 @@ export const registerInspectionTools: RegisterTools = (server, ctx: ToolContext)
           row.recipes = asArray(row.recipes).map((r) => withNulls(r, RECIPE_KEYS));
           row.otherChildren = asArray(row.otherChildren);
           row.storedValues = null;
+          const actual = nativeParts.find(item => Number(item.no) === Number(row.part));
+          if (actual && typeof actual.contentJson === "string") {
+            try {
+              const parsed = JSON.parse(actual.contentJson) as Row;
+              if (parsed.byFixtures === true && parsed.truncated === false && Array.isArray(parsed.rows)) row.storedValues = { ...parsed, complete: native?.complete === true };
+            } catch { nativeError = "Malformed encoded native cue-part content"; }
+          }
           return row;
         });
         return {
           tool: "gma3_cue_contents",
           target: { sequence, cue, part: part ?? null, fixtures: fixtures ?? null },
-          supportedMode: "recipes and preset references (onPC 2.5.1); hard stored values and tracked values are not readable",
+          supportedMode: native?.complete === true ? "recipes and preset references plus actual hard cue-part channels (GetPresetData); sequence tracking uses gma3_native_cue_data" : "recipes and preset references; native hard-channel coverage is unavailable or incomplete",
+          nativeContentComplete: native?.complete === true,
+          nativeContentError: nativeError,
           ...res,
           source: res.source ?? "cue object tree",
           cue: withNulls(res.cue, CUE_KEYS),
           parts,
           presets: expandPresets ? (res.presets && typeof res.presets === "object" ? res.presets : {}) : null,
           trackedValues: "not_reconstructed",
-          limitations: stringList(res.limitations),
+          limitations: native?.complete === true ? stringList(res.limitations).filter(item => !/hard \(non-recipe\)|no GetCueData/i.test(item)) : stringList(res.limitations),
           notes: [
-            "storedValues is always null: hard (non-recipe) values in a cue part are not exposed by the 2.5.1 Lua API",
+            "storedValues contains actual native channels when available; null means unreadable. complete:false is partial coverage, never a complete cue.",
             "trackedValues is not_reconstructed: a part lists only what it stores; tracked values from earlier cues are absent",
             NULL_NOTE,
             "no Goto, Load or playback command was sent; selection and programmer were not changed",
