@@ -7,6 +7,7 @@
 ```bash
 npm run dev        # run from source with tsx
 npm run build      # compile to dist/
+npm run test:package # build, unpack the consumer tarball and check its offline runtime
 npm test           # run the automated suite (no console needed)
 npm run coverage   # tests plus a line/branch/function coverage table for src/
 npm run test:live  # live console tests; see test/live/README.md (opt-in, modifies a disposable show)
@@ -15,6 +16,12 @@ npm run test:live  # live console tests; see test/live/README.md (opt-in, modifi
 `npm test` is the one command that runs every automated check without a live console; `.github/workflows/ci.yml`
 runs the build and the same suite on every push and pull request (Node 24, with Lua 5.4 installed so
 the plugin harness is not skipped).
+
+CI also checks the actual consumer tarball on `main`, `feat/**` and `fix/**` pushes. Packing runs
+the build first. `test:package` requires Python 3 and `tar`; it unpacks an archive into a temporary
+directory, reuses installed dependencies, checks qualification files and runs compiled tool discovery
+and synthetic MVR inspection. Its bridge endpoint is a local test listener; it never contacts a console.
+This verifies archive contents and runtime loading, not a fresh dependency download or native MA behavior.
 
 The suite in `test/` has no extra dependencies:
 

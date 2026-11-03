@@ -214,7 +214,9 @@ export class JobEngine {
         const startedAt = iso(), index = job.receipts.length;
         job.inFlight = { index, cues: cues.map((c) => c.cue), payloadFingerprint: fingerprint(payload) };
         await this.save(job); // Durable intent BEFORE the executor may mutate the console.
-        if (job.cancelRequested) { delete job.inFlight; job.status = "cancelled"; return; }
+        if (job.cancelRequested || await this.journal.cancellation(job.id)) {
+          job.cancelRequested = true; delete job.inFlight; job.status = "cancelled"; return;
+        }
         const { result, timing } = await this.executor.execute(payload, job.contextKey, (progress) => { if (job.inFlight) job.inFlight.progress = progress; });
         this.addTiming(job, timing);
         const verified = result.outcome === "succeeded" && result.verification.status === "matched" && result.normalProgrammer === "untouched" && cues.every((c) => receiptVerified(result, c));

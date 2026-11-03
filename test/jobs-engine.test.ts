@@ -117,6 +117,55 @@ test("two server processes cannot run the same prepared job and external cancell
   } finally { await h.close(); }
 });
 
+for (const phase of ["observation", "intent write"] as const) {
+  test(`external cancellation during ${phase} stops before the next batch is dispatched`, async () => {
+    let writes = 0, unblock!: () => void, entered!: () => void;
+    const gate = new Promise<void>((resolve) => { unblock = resolve; });
+    const reached = new Promise<void>((resolve) => { entered = resolve; });
+    const executor: JobExecutor = {
+      observe: async () => {
+        if (phase === "observation") { entered(); await gate; }
+        return observed();
+      },
+      execute: async (payload) => {
+        writes++;
+        return { result: receipt(payload.cues), timing: { toolMs: 1, requests: [] } };
+      },
+    };
+    const h = await setup(executor);
+    const journal = (h.engine as any).journal;
+    if (phase === "intent write") {
+      const write = journal.write.bind(journal);
+      journal.write = async (id: string, value: any) => {
+        if (value.inFlight) { entered(); await gate; }
+        await write(id, value);
+      };
+    }
+    let id: string | undefined;
+    try {
+      const job = await h.engine.create(compiled(), { batchSize: 3 });
+      id = job.id;
+      await h.engine.start(id, true);
+      await reached;
+      const other = new JobEngine(h.directory, executor);
+      assert.equal((await other.cancel(id)).cancelRequested, true);
+      unblock();
+      await h.engine.wait(id);
+      const cancelled = await other.status(id);
+      assert.equal(writes, 0, "a cancellation observed at the mutation-free boundary must prevent dispatch");
+      assert.equal(cancelled.status, "cancelled");
+      assert.equal(cancelled.cancelRequested, true);
+      assert.equal(cancelled.progress.verifiedCues, 0);
+      assert.equal(cancelled.receipts.length, 0);
+      assert.equal(cancelled.inFlight, undefined);
+    } finally {
+      unblock();
+      if (id) await h.engine.wait(id);
+      await h.close();
+    }
+  });
+}
+
 test("a newly prepared chain refuses an already populated native sequence", async () => {
   let writes = 0;
   const h = await setup({ observe: async () => observed({ detail: { existingCueCount: 3 } }), execute: async (p) => { writes++; return { result: receipt(p.cues), timing: { toolMs: 1, requests: [] } }; } });

@@ -6,6 +6,9 @@ installed with onPC. Arbitrary Lua execution is available as a separate, opt-in 
 
 This fork carries the verified programming extension on branch `feat/verified-programming-20261030`, based on upstream commit `0bade8e`. The upstream project and its original author retain their attribution and license. See the [qualification summary](docs/qualification/2026-10-30.md) for measured scope and remaining limits.
 
+The [4 November follow-up](docs/qualification/2026-11-04.md) covers offline job and distribution fixes.
+Its Node changes have separate automated verification; the earlier native qualification remains pinned to its original build.
+
 ## Programming and recovery extensions
 
 [How the MCP connects and programs a show](docs/how-it-connects-and-programs.md) explains connection layers,

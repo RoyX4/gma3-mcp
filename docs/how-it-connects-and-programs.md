@@ -1,6 +1,6 @@
 # How the grandMA3 MCP connects and programs a show
 
-Current delivery state: this chat's disposable lab and its services were stopped at the user's request. Local integration is prepared, not yet claimed applied here; no further console test or plugin reload is part of that preparation. The latest general-PSR reproduction stopped before Finish. See the [portable qualification summary](qualification/2026-10-30.md).
+The 30 October upgrade was installed locally and published in [RoyX4/gma3-mcp](https://github.com/RoyX4/gma3-mcp). This chat's disposable lab remains stopped. The latest general-PSR reproduction stopped before Finish. See the [original native qualification](qualification/2026-10-30.md) and [subsequent offline fixes](qualification/2026-11-04.md).
 
 The MCP gives an agent a set of checked console operations. The agent decides which lighting changes to request; the server translates those requests; grandMA3 still owns the programmer, stored show data and playback. Better programming therefore needs both dependable communication and a clear structure for the show.
 

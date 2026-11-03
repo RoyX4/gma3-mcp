@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, 'feat/**', 'fix/**']
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review, edited]
 
@@ -23,5 +23,7 @@ jobs:
       - run: npm ci
       - run: npm run build
       - run: npm test
+      - name: Verify consumer tarball without a console
+        run: node scripts/check-package.mjs
       - name: Lua harness ran (not skipped)
         run: lua5.4 test/lua/bridge_plugin_test.lua | tail -2

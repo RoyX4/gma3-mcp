@@ -80,6 +80,10 @@ real requirement, not a claim of an atomic console transaction.
 
 An exclusive per-job filesystem claim prevents two server processes from executing the same journal. A second live process may read status and write a separate cancellation marker. A crash claim is not stolen automatically. Inspect uncertain work and prepare a fresh reviewed plan for the remaining objects; deleting a claim does not make replay safe.
 
+Cancellation markers are checked again after the native preflight read and durable intent write,
+immediately before dispatch. A cancellation received during either step stops that pending batch
+without an executor call. Cancellation remains cooperative: it cannot retract an already dispatched batch.
+
 ## Native fingerprint format and older journals
 
 New native checkpoints and rebind receipts declare `contentFingerprintVersion:"native-json-v2"`. Every covered sequence/cue/part field and raw channel value still contributes to the hash. The encoded `contentJson` and `rawChannelsJson` fields are validated and compared structurally: JSON object key order and the order of actual typed native value-map entries do not change meaning. Ordinary arrays remain ordered. Key types, unknown fields, large integer digits and all values are retained. Duplicate/ambiguous keys, invalid JSON or exceeded bounds refuse a complete checkpoint.

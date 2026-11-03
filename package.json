@@ -10,10 +10,14 @@
     "dist",
     "plugin",
     "docs",
-    "scripts"
+    "scripts",
+    "deployment.json",
+    "examples"
   ],
   "scripts": {
     "build": "tsc && node scripts/stamp-build.mjs",
+    "prepack": "npm run build",
+    "test:package": "npm run build && node scripts/check-package.mjs",
     "start": "node dist/index.js",
     "dev": "tsx src/index.ts",
     "test": "node --import tsx --test test/*.test.ts",

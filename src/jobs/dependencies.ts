@@ -12,7 +12,8 @@ export async function dependencySnapshot(ctx: ToolContext, compilation: Compilat
   while (pending.length) {
     const { ref, depth } = pending.shift()!;
     if (seen.has(ref)) continue;
-    if (seen.size >= 64 || depth > 4) { limitations.push("preset dependency graph exceeds 64 presets or four embedded levels"); break; }
+    // seen includes both requested refs and native address aliases for each definition.
+    if (presets.length >= 64 || depth > 4) { limitations.push("preset dependency graph exceeds 64 presets or four embedded levels"); break; }
     seen.add(ref);
     const result = await ctx.bridge.request<Record<string, unknown>>("preset.read", { ref }, ctx.requestTimeoutMs);
     if (typeof result.addr === "string") seen.add(result.addr);

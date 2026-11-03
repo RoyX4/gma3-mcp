@@ -21,6 +21,7 @@ RUN npm run build
 
 FROM node:24-alpine
 WORKDIR /app
+RUN apk add --no-cache python3
 ENV NODE_ENV=production \
     GMA3_BRIDGE_HOST=host.docker.internal \
     GMA3_OSC_HOST=host.docker.internal \
@@ -31,6 +32,8 @@ COPY --from=build /app/dist ./dist
 COPY plugin ./plugin
 COPY scripts ./scripts
 COPY docs ./docs
+COPY examples ./examples
+COPY deployment.json ./
 COPY LICENSE README.md ./
 USER node
 ENTRYPOINT ["node", "dist/index.js"]
