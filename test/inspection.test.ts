@@ -353,3 +353,33 @@ test("cue inspection reads actual hard native values when the new bridge exposes
   assert.equal(result.nativeContentComplete, true);
   assert.equal(result.limitations.some((s: string) => s.includes("no GetCueData")), false);
 });
+
+test("unreadable native part numbers never masquerade as Part 0", async () => {
+  h.fake.on("cueContents", () => ({ ref: "Sequence 900 Cue 1", cue: {}, parts: [{ part: 0 }] }));
+  for (const no of [null, "", false, []]) {
+    h.fake.on("cue.content", () => ({ complete: true, cues: [{ parts: [{ no,
+      contentJson: JSON.stringify({ rows: [{ fixture: "1", attribute: "Dimmer", value: 90 }], byFixtures: true, truncated: false }),
+    }] }] }));
+    const { result } = await h.callJson("gma3_cue_contents", { sequence: 900, cue: 1 });
+    assert.equal(result.parts[0].storedValues, null, `unreadable native part ${JSON.stringify(no)} was adopted as Part 0`);
+    assert.equal(result.nativeContentComplete, false);
+  }
+});
+
+test("malformed native part content cannot retain a complete inspection claim", async () => {
+  h.fake.on("cueContents", () => ({ ref: "Sequence 900 Cue 1", cue: {}, parts: [{ part: 0 }] }));
+  h.fake.on("cue.content", () => ({ complete: true, cues: [{ parts: [{ no: 0, contentJson: "invalid" }] }] }));
+  const { result } = await h.callJson("gma3_cue_contents", { sequence: 900, cue: 1 });
+  assert.equal(result.parts[0].storedValues, null);
+  assert.equal(result.nativeContentComplete, false);
+  assert.match(result.nativeContentError, /malformed/i);
+});
+
+test("an empty legacy part inventory is not proof of mapped native channel coverage", async () => {
+  h.fake.on("cueContents", () => ({ ref: "Sequence 900 Cue 1", cue: {}, parts: [] }));
+  h.fake.on("cue.content", () => ({ complete: true, cues: [{ parts: [{ no: 0,
+    contentJson: JSON.stringify({ rows: [], byFixtures: true, truncated: false }),
+  }] }] }));
+  const { result } = await h.callJson("gma3_cue_contents", { sequence: 900, cue: 1 });
+  assert.equal(result.nativeContentComplete, false);
+});

@@ -333,6 +333,89 @@ const normalUntouched = (c: Console) => {
 // gma3_store_cues
 // ---------------------------------------------------------------------------
 
+test("store_cues: all CueOnly options reach explicit-look create/merge/overwrite commands", async () => {
+  const { h, c } = await setup();
+  try {
+    h.fake.onCommand((cmd) => c.apply(cmd.replace(/ \/CueOnly "\w+"/g, "")));
+    const modes = { off: "Off", on: "On", on_default_new: "OnDefaultNew", dimmer_only: "DimmerOnly", dimmer_only_default_new: "DimmerOnlyDefaultNew" };
+    for (const [cue_only, native] of Object.entries(modes)) for (const mode of ["create", "merge", "overwrite"]) {
+      const sequence = 920 + Object.keys(modes).indexOf(cue_only);
+      if (mode !== "create") c.addCue(sequence, 1);
+      const { result, isError } = await h.callJson("gma3_store_cues", { sequence, mode, cue_only, exclusive: true, cues: [{ cue: 1, fixtures: "101", intensity: 50 }] });
+      assert.equal(isError, false, JSON.stringify(result));
+      const modeOption = mode === "create" ? "" : mode === "merge" ? " /Merge" : " /Overwrite";
+      assert.equal(h.fake.commands.findLast((cmd) => cmd.startsWith("Store ")), `Store Sequence ${sequence} Cue 1${modeOption} /CueOnly "${native}" /NoConfirmation`);
+      assert.match(result.notVerified, /restoration.*not verified/i);
+      assert.equal(c.env, "Normal");
+    }
+  } finally { await h.close(); }
+});
+
+test("store_cues: TrackingShield options combine with CueOnly and remain metadata-only verification", async () => {
+  const { h, c } = await setup();
+  try {
+    h.fake.onCommand((cmd) => c.apply(cmd.replace(/ \/CueOnly "\w+"/g, "").replace(/ \/TrackingShield "\w+"/g, "")));
+    c.addCue(925, 1);
+    for (const [tracking_shield, native] of Object.entries({ dimmer_rising_from_zero: "DRZ", dimmer_above_zero: "DAZ" })) {
+      const { result, isError } = await h.callJson("gma3_store_cues", { sequence: 925, mode: "merge", cue_only: "on", tracking_shield, exclusive: true, cues: [{ cue: 1, fixtures: "101", intensity: 50 }] });
+      assert.equal(isError, false);
+      assert.equal(h.fake.commands.findLast((cmd) => cmd.startsWith("Store ")), `Store Sequence 925 Cue 1 /Merge /CueOnly "On" /TrackingShield "${native}" /NoConfirmation`);
+      assert.match(result.notVerified, /following.cue.*not verified/i);
+      assert.match(result.summary, /restoration.*not verified/i);
+    }
+  } finally { await h.close(); }
+});
+
+test("store_cues: sequence batches inherit and override typed Store options", async () => {
+  const { h, c } = await setup();
+  try {
+    h.fake.onCommand((cmd) => c.apply(cmd.replace(/ \/CueOnly "\w+"/g, "").replace(/ \/TrackingShield "\w+"/g, "")));
+    const { isError, result } = await h.callJson("gma3_store_cues", { mode: "create", cue_only: "on", tracking_shield: "dimmer_rising_from_zero", exclusive: true, sequences: [
+      { sequence: 926, cues: [{ cue: 1, fixtures: "101", intensity: 30 }] },
+      { sequence: 927, cue_only: "off", tracking_shield: "dimmer_above_zero", cues: [{ cue: 1, fixtures: "101", intensity: 40 }] },
+    ] });
+    assert.equal(isError, false, JSON.stringify(result));
+    assert.deepEqual(h.fake.commands.filter((cmd) => cmd.startsWith("Store ")), [
+      'Store Sequence 926 Cue 1 /CueOnly "On" /TrackingShield "DRZ" /NoConfirmation',
+      'Store Sequence 927 Cue 1 /CueOnly "Off" /TrackingShield "DAZ" /NoConfirmation',
+    ]);
+    assert.match(result.notVerified, /restoration.*not verified/i, "compact sequence-batch results must retain the unverified following-cue boundary");
+  } finally { await h.close(); }
+});
+
+test("store_cues: invalid direct Store options, including later batch items, refuse before bridge work", async () => {
+  const { h } = await setup();
+  try {
+    const handler = h.tools.get("gma3_store_cues")!.handler;
+    for (const options of [{ cue_only: "yes" }, { cue_only: null }, { tracking_shield: "off" }, { tracking_shield: false }]) {
+      const before = h.fake.requests.length;
+      const one = await handler({ sequence: 928, mode: "create", exclusive: true, cues: [{ cue: 1, fixtures: "101", intensity: 30 }], ...options });
+      assert.equal(one.isError, true, JSON.stringify(options));
+      assert.equal(h.fake.requests.length, before);
+      const batch = await handler({ mode: "create", exclusive: true, sequences: [
+        { sequence: 928, cues: [{ cue: 1, fixtures: "101", intensity: 30 }] },
+        { sequence: 929, cues: [{ cue: 1, fixtures: "101", intensity: 40 }], ...options },
+      ] });
+      assert.equal(batch.isError, true, JSON.stringify(options));
+      assert.equal(h.fake.requests.length, before, "an invalid later item's option must not partially build an earlier sequence");
+    }
+  } finally { await h.close(); }
+});
+
+test("build_chase does not expose or apply the new Store tracking options", async () => {
+  const { h } = await setup();
+  try {
+    const schema = h.tools.get("gma3_build_chase")!.inputSchema!;
+    assert.equal("cue_only" in schema, false); assert.equal("tracking_shield" in schema, false);
+    const { isError, result } = await h.callJson("gma3_build_chase", { sequence: 930, fixtures: "101", exclusive: true, steps: [{ intensity: 20 }, { intensity: 40 }], step_seconds: 1, observe: false });
+    assert.equal(isError, false, JSON.stringify(result));
+    assert.deepEqual(h.fake.commands.filter((cmd) => cmd.startsWith("Store ")), [
+      "Store Sequence 930 Cue 1 /NoConfirmation", "Store Sequence 930 Cue 2 /NoConfirmation",
+    ]);
+    assert.doesNotMatch(result.notVerified, /CueOnly|TrackingShield/);
+  } finally { await h.close(); }
+});
+
 test("store_cues: three cues built in Preview, each from its looks, named, timed and triggered; Normal untouched", async () => {
   const { h, c } = await setup();
   try {
@@ -472,6 +555,61 @@ test("edit_cues: trigger, timing and names on a range, read back per cue; refusa
 // ---------------------------------------------------------------------------
 // gma3_build_chase
 // ---------------------------------------------------------------------------
+
+for (const verification of ["mismatched", "unavailable"] as const) {
+  test(`edit_cues stops before cue 2 when cue 1 read-back is ${verification}`, async () => {
+    const { h, c } = await setup();
+    try {
+      c.addCue(961, 1); c.addCue(961, 2);
+      if (verification === "mismatched") c.ignoreSet = /^Sequence 961 Cue 1 Part 0 Name$/;
+      else h.fake.on("objects", (args) => {
+        if (args.ref === "Sequence 961 Cue 1") throw new Error("read-back unavailable");
+        return c.objects(String(args.ref), args.fields as string[]);
+      });
+      const { result, isError } = await h.callJson("gma3_edit_cues", { sequence: 961, cues: [1, 2], names: ["One", "Two"] });
+      assert.equal(c.cue(961, 2)?.name, "", "an unverified first cue must prevent later cue edits");
+      assert.equal(h.fake.requests.some((r) => r.op === "set" && r.args.ref === "Sequence 961 Cue 2 Part 0"), false);
+      assert.equal(result.cues[0].verification.status, verification);
+      assert.equal(result.cues[0].status, "failed");
+      assert.equal(result.cues[1].status, "not_attempted");
+      assert.equal(result.outcome, "partial");
+      assert.equal(isError, true);
+    } finally { await h.close(); }
+  });
+}
+
+test("edit_cues verify false keeps editing with explicit not_requested receipts", async () => {
+  const { h, c } = await setup();
+  try {
+    c.addCue(962, 1); c.addCue(962, 2);
+    c.ignoreSet = /^Sequence 962 Cue 1 Part 0 Name$/;
+    const { result, isError } = await h.callJson("gma3_edit_cues", { sequence: 962, cues: [1, 2], names: ["One", "Two"], verify: false });
+    assert.equal(isError, false);
+    assert.equal(c.cue(962, 2)?.name, "Two");
+    assert.deepEqual(result.cues.map((cue: any) => cue.verification.status), ["not_requested", "not_requested"]);
+    assert.equal(result.verification.status, "not_requested");
+  } finally { await h.close(); }
+});
+
+for (const field of ["Name", "Command"] as const) {
+  test(`edit_cues rejects a case-only ${field} mismatch before editing the next cue`, async () => {
+    const { h, c } = await setup();
+    try {
+      c.addCue(963, 1); c.addCue(963, 2);
+      c.cue(963, 1)!.name = "Opening";
+      c.cue(963, 1)!.part0.Command = 'Echo "Warm"';
+      c.ignoreSet = new RegExp(`^Sequence 963 Cue 1 Part 0 ${field}$`);
+      const edit = field === "Name" ? { names: ["OPENING", "Second"] }
+        : { commands: ['Echo "warm"', 'Echo "second"'] };
+      const { result, isError } = await h.callJson("gma3_edit_cues", { sequence: 963, cues: [1, 2], ...edit });
+      assert.equal(isError, true, "case-sensitive text that did not change must not verify");
+      assert.equal(result.cues[0].verification.status, "mismatched");
+      assert.equal(result.cues[0].status, "failed");
+      assert.equal(result.cues[1].status, "not_attempted");
+      assert.equal(h.fake.requests.some(r => r.op === "set" && r.args.ref === "Sequence 963 Cue 2 Part 0"), false);
+    } finally { await h.close(); }
+  });
+}
 
 test("build_chase: one cue per preset, every cue Time-triggered, Wrap Around on, one cycle observed through the wrap, then off", async () => {
   const { h, c } = await setup();

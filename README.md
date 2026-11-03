@@ -8,6 +8,13 @@ This fork carries the verified programming extension on branch `feat/verified-pr
 
 The [4 November follow-up](docs/qualification/2026-11-04.md) covers offline job and distribution fixes.
 Its Node changes have separate automated verification; the earlier native qualification remains pinned to its original build.
+The subsequent [tracking coverage and remaining gaps](docs/tracking-status.md) explain the owned-chain
+workflow, its review fixes, existing-show boundaries and unfinished large-chain pagination.
+For actual native switches and existing-cue edits, use [cue/part settings](docs/tools/cue-settings.md)
+and [sequence settings](docs/tools/playback.md). Tracking on/off is a sequence property;
+Cue Only and Tracking Shield are explicit options on the existing cue Store tools.
+The [native settings follow-up](docs/qualification/cue-settings-2026-11-04.md) records representative
+setting changes and actual following-cue restoration tests separately from the historical full baseline.
 
 ## Programming and recovery extensions
 

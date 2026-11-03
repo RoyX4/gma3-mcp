@@ -19,6 +19,8 @@ import { nativeContentFingerprint } from "../native-cues.js";
 import { NATIVE_CONTENT_FINGERPRINT_VERSION } from "../native-fingerprint.js";
 
 const engines = new WeakMap<ToolContext, JobEngine>();
+// cue.content in the maintained Lua bridge is bounded to 500 objects, including internal cues.
+const NATIVE_CHECKPOINT_CUE_OBJECT_LIMIT = 500;
 function routeIdentity():RouteIdentity {
   const route:RouteIdentity={};
   if(process.platform==="linux") {
@@ -37,6 +39,9 @@ export function engineFor(ctx: ToolContext): JobEngine {
 
 /** Exact native sequence data is mandatory. Metadata-only hashes never stand in for hard cue values. */
 export async function observeSequence(ctx: ToolContext, compilation: Compilation, expectedCues = 0): Promise<Observation> {
+  if (compilation.cues.length >= NATIVE_CHECKPOINT_CUE_OBJECT_LIMIT) {
+    throw new Error(`Plans with ${NATIVE_CHECKPOINT_CUE_OBJECT_LIMIT} or more authored cues require a paginated native checkpoint reader; internal cues also use the current scan bound. No batch was sent.`);
+  }
   const requests: RequestTiming[] = [], timed = timedBridge(ctx.bridge, requests, ctx.requestTimeoutMs);
   const route=routeIdentity();
   const before = await readFastContext(timed, ctx.requestTimeoutMs);

@@ -7,6 +7,23 @@ const plan = () => compileTracking({ version: 1, sequence: 500, data_pool: 2, cu
 const context = { identity: { generation: "1", showfile: "Private.show", hostname: "lab", user: "user", profile: "profile" }, contextKey: "same", environment: "Normal", identityUncertain: [], observedAt: 0, atomic: false };
 const patch = (h: Awaited<ReturnType<typeof startHarness>>) => h.fake.on("patch.collections", () => ({ live: ["Stages", "FixtureTypes", "AttributeDefinitions"] })).on("patch.fingerprint", (a) => ({ collection: a.collection, hash: "stable", objects: 10, complete: true, ms: Math.random() * 100 }));
 
+test("oversized tracking chains refuse before native work rather than outgrowing checkpoint coverage", async () => {
+  const h = await startHarness(() => {});
+  try {
+    h.fake.on("fast.context", () => context).on("objects", () => ({ items: [] }));
+    patch(h);
+    for (const count of [500, 501]) {
+      const compilation = compileTracking({ version: 1, sequence: 500, data_pool: 2,
+        cues: Array.from({ length: count }, (_, i) => ({ cue: i + 1, hold: true })),
+      });
+      assert.equal(compilation.executable, true, "large plans remain available for offline analysis");
+      await assert.rejects(() => observeSequence(h.ctx, compilation), /500.*cue.*paginated/i);
+    }
+    assert.deepEqual(h.fake.requests, []);
+    assert.deepEqual(h.fake.commands, []);
+  } finally { await h.close(); }
+});
+
 test("native checkpoints bind an explicitly absent sequence and guard both ends of the read", async () => {
   const h = await startHarness(() => {});
   try {

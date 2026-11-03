@@ -50,14 +50,17 @@ function compareCell(cell: Cell, actual: EffectiveNativeCell): { mismatch?: stri
   if (state.kind === "preset") {
     const link = record(actual.stored[cell.layer === "absolute" ? "absPreset" : "relPreset"]);
     if (link.valid === false) return { mismatch: "stored preset source is invalid." };
-    return Number(link.pool) === state.pool && Number(link.no) === state.preset ? {} : { mismatch: `stored preset reference differs from Preset ${state.pool}.${state.preset}.` };
+    return link.pool === state.pool && link.no === state.preset ? {} : { mismatch: `stored preset reference differs from Preset ${state.pool}.${state.preset} or is unreadable.` };
   }
   const definition = state.phaser, steps = Array.isArray(definition.steps) ? definition.steps : [];
   if ((definition.unit ?? "percent") !== "percent") return { unavailable: "physical phaser steps require native channel-function calibration." };
   const nativeSteps = Array.isArray(actual.stored.steps) ? actual.stored.steps.map(record) : [];
   if (nativeSteps.length !== steps.length) return { mismatch: `${nativeSteps.length} steps stored, expected ${steps.length}.` };
   for (const [i, value] of steps.entries()) {
-    const step = record(value), attributes = record(step.values), source = attributes[cell.attribute];
+    const step = record(value), attributes = record(step.values);
+    const sources = Object.entries(attributes).filter(([attribute]) => attribute.trim().toLowerCase() === cell.attribute.toLowerCase());
+    if (sources.length > 1) return { unavailable: `step ${i + 1} has ambiguous case-equivalent attribute names.` };
+    const source = sources[0]?.[1];
     const expected = typeof source === "number" ? cell.layer === "absolute" ? source : undefined : record(source)[cell.layer];
     if (typeof expected === "number" && !close(nativeSteps[i][cell.layer], expected)) return { mismatch: `step ${i + 1} ${cell.layer} is ${JSON.stringify(nativeSteps[i][cell.layer])}, expected ${expected}.` };
     for (const [input, native, fallback] of [["width", "width", 100], ["transition", "trans", 100], ["accel", "accel", 0], ["decel", "decel", 0]] as const) {
@@ -66,9 +69,9 @@ function compareCell(cell: Cell, actual: EffectiveNativeCell): { mismatch?: stri
     }
   }
   const layers = record(definition.phaser);
-  if (typeof layers.speed_bpm === "number" && !close(Number(actual.stored.speed) * 60, layers.speed_bpm)) return { mismatch: "stored phaser speed differs from requested BPM." };
-  if (typeof layers.measure === "number" && !close(Number(actual.stored.measure) / 100, layers.measure)) return { mismatch: "stored phaser measure differs." };
-  if (typeof layers.speed_master === "number" && Number(actual.stored.speedMaster) + 1 !== layers.speed_master) return { mismatch: "stored phaser speed master differs." };
+  if (typeof layers.speed_bpm === "number" && (typeof actual.stored.speed !== "number" || !close(actual.stored.speed * 60, layers.speed_bpm))) return { mismatch: "stored phaser speed differs from requested BPM or is unreadable." };
+  if (typeof layers.measure === "number" && (typeof actual.stored.measure !== "number" || !close(actual.stored.measure / 100, layers.measure))) return { mismatch: "stored phaser measure differs or is unreadable." };
+  if (typeof layers.speed_master === "number" && (typeof actual.stored.speedMaster !== "number" || actual.stored.speedMaster + 1 !== layers.speed_master)) return { mismatch: "stored phaser speed master differs or is unreadable." };
   if (layers.phase !== undefined || layers.repeat !== undefined) return { unavailable: "distributed native phase/repetition requires selection-grid qualification; step values and timing were compared." };
   return {};
 }

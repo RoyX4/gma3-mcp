@@ -114,6 +114,11 @@ export const SEQUENCE_SETTINGS: Record<string, SettingDef> = {
   auto_fix: { property: "AutoFix", kind: "bool" },
   auto_stomp: { property: "AutoStomp", kind: "bool" },
   tracking: { property: "Tracking", kind: "bool" },
+  cue_command: { property: "CUECOMMAND", kind: "enum", values: { enabled: "Enabled", force_no: "Force No", force_yes: "Force Yes" } },
+  mib_policy: { property: "SEQUMIB", kind: "enum", values: { enabled: "Enabled", never: "Never", force_early: "Force Early", force_upon_go: "Force UponGo", force_late: "Force Late" } },
+  mib_default_mode: { property: "SEQUMIBMODE", kind: "enum", values: { none: "None", early: "Early", upon_go: "UponGo", late: "Late" } },
+  prefer_cue_appearance: { property: "PREFERCUEAPPEARANCE", kind: "bool" },
+  cue_zero_mode: { property: "CUEZEROMODE", kind: "enum", values: { off: "Off", all_used_attributes: "All Used Attributes", only_used_dimmers: "Only Used Dimmers" } },
   soft_ltp: { property: "SoftLTP", kind: "bool" },
   off_when_overridden: { property: "OffWhenOverridden", kind: "bool" },
   kill_protect: { property: "KillProtect", kind: "bool" },
@@ -991,6 +996,7 @@ export const registerPlaybackTools: RegisterTools = (server, ctx) => {
       description:
         "Set a sequence's playback settings by writing its properties: wrap_around (a chase loops only with Wrap Around on and a trigger on its first cue), priority, restart_mode, release_first_cue, auto_start, auto_stop, master_go_mode, auto_fix, auto_stomp, tracking, soft_ltp, " +
         "off_when_overridden, kill_protect, swap_protect (protection from the Kill/Swap playback actions, not from editing), use_executor_time, include_link_last_go, xfade_mode, xfade_reload. lock: true/false sets the sequence's own Lock. " +
+        "cue_command follows or overrides per-cue command enable settings; mib_policy enables, disables or forces sequence-wide MIB, while mib_default_mode supplies the default cue-part MIB mode. prefer_cue_appearance chooses cue appearance, and cue_zero_mode controls which used attributes are populated in Cue Zero. " +
         "Tempo links (SB-06): rate_master (a speed master 1-16 or \"none\": the cue timing (fades, delays, trigger times) runs at its effective BPM / 60, so 60 BPM is 1:1), speed_master (the phasers in the cues follow it), rate_scale and speed_scale (One, Mul2..Mul256, Div2..Div256), speed_from_rate. Masters are linked by name; a master without a unique name is refused. While a rate master is linked, moving the sequence's rate fader moves the shared master. " +
         "Settings belong to the sequence, so they apply to EVERY executor that references it: the tool scans all pages and lists them (references) and warns when other executors share the sequence. Cue triggers and timing are set with gma3_set_cue_trigger / gma3_set_cue_timing. " +
         COMMON +

@@ -221,6 +221,46 @@ test("store_cue: fractional cue numbers are passed through canonically; ranges a
   assert.equal(h.fake.commands.length, 3);
 });
 
+for (const tool of ["gma3_store_cue", "gma3_store_cue_part"]) {
+  test(`${tool}: documented CueOnly modes generate explicit Store options`, async () => {
+    h.fake.onCommand((command) => show.exec(command.replace(/ \/CueOnly "\w+"/g, "")));
+    const modes = { off: "Off", on: "On", on_default_new: "OnDefaultNew", dimmer_only: "DimmerOnly", dimmer_only_default_new: "DimmerOnlyDefaultNew" };
+    for (const [cue_only, native] of Object.entries(modes)) {
+      const cue = Object.keys(modes).indexOf(cue_only) + 20;
+      const part = tool === "gma3_store_cue_part" ? { part: 1 } : {};
+      const { result, isError } = await h.callJson(tool, { sequence: 900, cue, mode: "create", cue_only, ...part });
+      assert.equal(isError, false);
+      assert.equal(h.fake.commands.at(-1), `Store Sequence 900 Cue ${cue}${"part" in part ? " Part 1" : ""} /CueOnly "${native}" /NoConfirmation`);
+      assert.equal(result.verification.status, "matched", "only the existing metadata/existence check matched");
+      assert.match(result.notVerified, /restoration.*not verified/i);
+      assert.match(result.summary, /restoration.*not verified/i);
+    }
+  });
+
+  test(`${tool}: documented TrackingShield modes combine with existing Store mode`, async () => {
+    h.fake.onCommand((command) => show.exec(command.replace(/ \/CueOnly "\w+"/g, "").replace(/ \/TrackingShield "\w+"/g, "")));
+    show.addCue(900, "1"); show.addPart(900, "1", 1);
+    for (const [tracking_shield, native] of Object.entries({ dimmer_rising_from_zero: "DRZ", dimmer_above_zero: "DAZ" })) {
+      const part = tool === "gma3_store_cue_part" ? { part: 1 } : {};
+      const { result, isError } = await h.callJson(tool, { sequence: 900, cue: 1, mode: "merge", cue_only: "on", tracking_shield, ...part });
+      assert.equal(isError, false);
+      assert.equal(h.fake.commands.at(-1), `Store Sequence 900 Cue 1${"part" in part ? " Part 1" : ""} /Merge /CueOnly "On" /TrackingShield "${native}" /NoConfirmation`);
+      assert.match(result.notVerified, /following.cue.*not verified/i);
+    }
+  });
+
+  test(`${tool}: invalid direct tracking options refuse before bridge requests`, async () => {
+    const handler = h.tools.get(tool)!.handler;
+    const part = tool === "gma3_store_cue_part" ? { part: 1 } : {};
+    for (const options of [{ cue_only: "yes" }, { cue_only: true }, { cue_only: null }, { tracking_shield: "off" }, { tracking_shield: "DAZ" }, { tracking_shield: null }]) {
+      const before = h.fake.requests.length;
+      const result = await handler({ sequence: 900, cue: 1, mode: "merge", ...part, ...options });
+      assert.equal(result.isError, true, JSON.stringify(options));
+      assert.equal(h.fake.requests.length, before, "validation must precede any bridge request");
+    }
+  });
+}
+
 test("store_cue: split timing goes to part 0 one Set per field, zero is a value, negatives are refused", async () => {
   const { result, isError } = await h.callJson("gma3_store_cue", { sequence: 900, cue: 1, mode: "create", fade: 3, out_fade: 0, out_delay: 1.5 });
   assert.equal(isError, false, result.summary);

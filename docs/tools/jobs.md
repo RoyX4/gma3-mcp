@@ -47,6 +47,12 @@ Cancellation is cooperative. An already-dispatched batch completes its guarded w
 
 New jobs default to 12 cues per batch, selected from the [matched native benchmark](../programming-performance.md#matched-native-intel-lab-matrix-2026-10-30). Explicit `batch_size:3` or `6` remains available when quicker cancellation checkpoints matter. Existing journals keep their stored batch size when read, resumed or rebound; this default does not rewrite them. Every batch retains the same complete fresh before/after native content and dependency checks, durable intent and no-replay rules.
 
+The maintained native reader is bounded to 500 cue objects, including internal cues. Plans with 500
+or more authored cues refuse at the checkpoint preflight before native work, instead of starting a
+chain that will exceed complete-read coverage. Offline compilation remains available for larger
+plans. A consistent paged reader is still required for larger single-sequence jobs; the bound does
+not guarantee every smaller plan fits other native response/data limits.
+
 Only a fully successful batch with matched verification, untouched Normal programmer and matched per-cue receipts advances `verifiedCues`. A failed batch remains available for inspection. A dispatched unknown mutation is `uncertain` and is never replayed. A crash with an in-flight marker is also uncertain, even if some cues may have stored successfully.
 
 Paused/cancelled jobs resume from the first uncheckpointed cue only after exact context and native content comparison. Console generation, host, showfile, user or profile drift blocks continuation. Manual cue changes block it too. Explicit invalidation cannot be bypassed by resume. Incomplete observations never count as an empty sequence or a matching checkpoint.

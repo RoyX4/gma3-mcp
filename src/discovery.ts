@@ -27,7 +27,7 @@ export const TASK_TOOLS: ReadonlyArray<{ task: string; tools: readonly string[] 
   { task: "presets", tools: ["gma3_apply_preset", "gma3_store_preset", "gma3_preset", "gma3_release_attributes"] },
   { task: "groups/MAtricks", tools: ["gma3_store_group", "gma3_selection_grid", "gma3_configure_matricks", "gma3_matricks"] },
   { task: "phasers", tools: ["gma3_build_phaser", "gma3_phaser_release"] },
-  { task: "cues", tools: ["gma3_store_cues", "gma3_edit_cues", "gma3_store_cue", "gma3_set_cue_timing", "gma3_set_cue_trigger", "gma3_cue_contents", "gma3_delete_cue"] },
+  { task: "cues", tools: ["gma3_cue_settings", "gma3_configure_cue", "gma3_store_cues", "gma3_edit_cues", "gma3_store_cue", "gma3_set_cue_timing", "gma3_set_cue_trigger", "gma3_cue_contents", "gma3_delete_cue"] },
   { task: "chases", tools: ["gma3_build_chase"] },
   { task: "executors/playback", tools: ["gma3_assign_to_executor", "gma3_configure_executor", "gma3_configure_sequence", "gma3_playback", "gma3_goto_cue", "gma3_set_fader"] },
   { task: "speed masters", tools: ["gma3_configure_speed_master", "gma3_speed_master_action", "gma3_speed_masters"] },

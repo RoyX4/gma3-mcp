@@ -5,6 +5,9 @@ bridge ops `cmd`, `set`, `object` and `objects`; no Lua is generated. Every tool
 `OperationResult` (`outcome`, `verification`, one `StepResult` per bridge request) and surfaces anything but a
 verified success as an MCP tool error.
 
+For persistent properties on an existing Cue or Part, use [cue settings](cue-settings.md).
+Sequence Tracking on/off uses `gma3_configure_sequence`; CueOnly and Tracking Shield below are Store options.
+
 ## Common behaviour
 
 **Target.** Every tool needs exactly one of `sequence` (number) or `use_selected_sequence: true`, plus `cue` (a
@@ -71,6 +74,8 @@ Store the programmer content as a cue.
 | `mode` | `"create"` \| `"merge"` \| `"overwrite"` | required, exactly one value; `merge` and `overwrite` are distinct modes and cannot be combined |
 | `name` | string | optional; trimmed; refused if it contains `\ " $ & * ? , . ; ^ { } \| ~` or control characters |
 | `fade`, `delay`, `out_fade`, `out_delay` | seconds | optional; 0 is a value |
+| `cue_only` | accepted string | optional native CueOnly Store option; see [Store tracking options](#store-tracking-options) |
+| `tracking_shield` | accepted string | optional native TrackingShield Store option; see [Store tracking options](#store-tracking-options) |
 | `verify` | boolean | default true |
 
 Commands, in order:
@@ -78,9 +83,10 @@ Commands, in order:
 1. `resolve_sequence` (`object` op, only with `use_selected_sequence`).
 2. `check_existing` (`objects` op, **create mode only**): refuses with `outcome: failed` and sends nothing if
    `Sequence n Cue c` exists. Not a transaction lock (see above).
-3. `store` (`cmd`): `Store Sequence <n> Cue <c> /NoConfirmation`, with ` /Merge` or ` /Overwrite` inserted before
-   `/NoConfirmation` for those modes. A mode option plus `/NoConfirmation` is always sent so the console never
-   opens the "choose store mode" pop-up, which would block its Lua task.
+3. `store` (`cmd`): `Store Sequence <n> Cue <c> /NoConfirmation`, with ` /Merge` or ` /Overwrite` for those modes,
+   followed by any explicit CueOnly/TrackingShield options before `/NoConfirmation`. Omitting the new options
+   keeps the previous command unchanged. `/NoConfirmation` prevents the "choose store mode" pop-up from
+   blocking the Lua task.
 4. `set_name` (`set` op, only when `name` is given): property `Name` on `Sequence n Cue c Part 0` (the cue's
    displayed Name follows part 0; setting Name on the Cue object itself is ignored by the console).
 5. `set_fade`, `set_delay`, `set_out_fade`, `set_out_delay` (`set` op, one per given field): properties
@@ -98,7 +104,8 @@ Programmer: not cleared. Selection: unchanged.
 ## gma3_store_cue_part
 
 Same as `gma3_store_cue` plus a required `part` (integer 0..999). Command: `Store Sequence <n> Cue <c> Part <p>
-[/Merge|/Overwrite] /NoConfirmation`. `name` is set on the part (`Sequence n Cue c Part p`, property `Name`) and
+[/Merge|/Overwrite] [explicit Store options] /NoConfirmation`. The same `cue_only` and `tracking_shield`
+choices are accepted. `name` is set on the part (`Sequence n Cue c Part p`, property `Name`) and
 timing on the same part.
 
 **Part 0** is the main part that every cue has, created together with the cue. Storing to part 0 is the same as
@@ -106,6 +113,44 @@ storing the cue itself, so `mode: "create"` refuses part 0 of an existing cue (u
 result carries `partZeroNote`. Parts 1..999 hold their own values and timing.
 
 Verification reads `Part`, `Name` and the given timing fields from the part. Fixture values are not verified.
+
+## Store tracking options
+
+These optional fields are accepted by both `gma3_store_cue` and `gma3_store_cue_part`, in create, merge and
+overwrite modes. Omitted fields leave the console's existing Store defaults in control.
+
+| Field | Accepted value | Native command option |
+| --- | --- | --- |
+| `cue_only` | `"off"` | `/CueOnly "Off"` |
+| `cue_only` | `"on"` | `/CueOnly "On"` |
+| `cue_only` | `"on_default_new"` | `/CueOnly "OnDefaultNew"` |
+| `cue_only` | `"dimmer_only"` | `/CueOnly "DimmerOnly"` |
+| `cue_only` | `"dimmer_only_default_new"` | `/CueOnly "DimmerOnlyDefaultNew"` |
+| `tracking_shield` | `"dimmer_rising_from_zero"` | `/TrackingShield "DRZ"` |
+| `tracking_shield` | `"dimmer_above_zero"` | `/TrackingShield "DAZ"` |
+
+CueOnly preserves a following look using restoration data. Its DefaultNew variants restore newly introduced
+attributes to defaults. Tracking Shield chooses a dimmer-dependent restoration point. These are native Store
+actions, separate from the persistent Sequence Tracking switch and the owned-plan compiler's `cue_only` mode.
+Tracking Shield exposes the two documented active modes; this API has no explicit Shield-off value.
+
+For example, `gma3_store_cue` accepts:
+
+```json
+{"sequence":401,"cue":3,"mode":"merge","cue_only":"on","tracking_shield":"dimmer_above_zero"}
+```
+
+It sends `Store Sequence 401 Cue 3 /Merge /CueOnly "On" /TrackingShield "DAZ" /NoConfirmation`.
+With `part:1` through `gma3_store_cue_part`, the target becomes `Sequence 401 Cue 3 Part 1`.
+
+**Verification boundary:** the usual `matched` result checks existence and requested name/timing fields.
+It does not verify the inserted restoration data, following-cue state or playback effects. The result's
+`notVerified` and summary retain that boundary when an option was supplied. Inspect actual stored channels
+and inherited state separately with [native cue data](native-cues.md).
+
+The [4 November qualification](../qualification/cue-settings-2026-11-04.md) records representative
+explicit-look lab observations for CueOnly On and Tracking Shield DAZ. Those observations do not qualify
+every mode, the single-programmer Store variants, or all multipart interactions.
 
 ## gma3_set_cue_timing
 

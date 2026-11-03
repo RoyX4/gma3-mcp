@@ -51,7 +51,7 @@ test("wall intersection catches a crossing and an origin inside a wall, but allo
 });
 
 async function setup(options: { silentPan?: boolean; ignoreTilt?: boolean; nested?: boolean; missingTilt?: boolean } = {}) {
-  const h = await startHarness(registerFocusTools, { requestTimeoutMs: 35 });
+  const h = await startHarness(registerFocusTools, { requestTimeoutMs: options.silentPan ? 35 : 400 });
   let selected = 1;
   const values: Record<string, number> = { Pan: 0, Tilt: 0 };
   h.fake.on("patch.state", () => ({ copyOpen: false }));

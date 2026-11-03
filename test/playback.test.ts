@@ -53,7 +53,7 @@ class Console {
     (pool === 1 ? this.seqs : this.pools.get(pool)!).set(n, {
       name,
       active: false,
-      props: { WrapAround: "Yes", Priority: "LTP", RestartMode: "First Cue", ReleaseFirstCue: "Yes", AutoStart: "Yes", AutoStop: "Yes", MasterGoMode: "None", AutoFix: "No", AutoStomp: "No", Tracking: "Yes", SoftLTP: "Yes", OffWhenOverridden: "Yes", KillProtect: "No", SwapProtect: "No", UseExecutorTime: "Yes", IncludeLinkLastGo: "Yes", XFadeMode: "AB", XFadeReload: "No", Lock: "", StructureLocked: "No", SystemLocked: "No", ...props },
+      props: { WrapAround: "Yes", Priority: "LTP", RestartMode: "First Cue", ReleaseFirstCue: "Yes", AutoStart: "Yes", AutoStop: "Yes", MasterGoMode: "None", AutoFix: "No", AutoStomp: "No", Tracking: "Yes", CUECOMMAND: "Enabled", SEQUMIB: "Enabled", SEQUMIBMODE: "None", PREFERCUEAPPEARANCE: "No", CUEZEROMODE: "Off", SoftLTP: "Yes", OffWhenOverridden: "Yes", KillProtect: "No", SwapProtect: "No", UseExecutorTime: "Yes", IncludeLinkLastGo: "Yes", XFadeMode: "AB", XFadeReload: "No", Lock: "", StructureLocked: "No", SystemLocked: "No", ...props },
     });
     return this;
   }
@@ -426,6 +426,75 @@ test("configure_sequence writes settings, reads them back and lists every execut
   assert.ok(result.warnings.some((w: string) => /also apply to .*Page 1\.201.*Page 2\.305|also apply to .*Page 2\.305.*Page 1\.201/.test(w)), JSON.stringify(result.warnings));
   assert.deepEqual(result.playback, { activeBefore: false, activeAfter: false });
   assert.equal(con.seqs.get(5)!.props.WrapAround, "No");
+});
+
+test("configure_sequence writes confirmed cue-command, MIB, appearance and cue-zero settings", async () => {
+  const { result, isError } = await h.callJson("gma3_configure_sequence", {
+    sequence: 5, cue_command: "force_yes", mib_policy: "force_upon_go", mib_default_mode: "late",
+    prefer_cue_appearance: true, cue_zero_mode: "only_used_dimmers",
+  });
+  assert.equal(isError, false, JSON.stringify(result));
+  assert.equal(result.verification.status, "matched");
+  assert.deepEqual(sets(), ["Sequence 5 CUECOMMAND=Force Yes", "Sequence 5 SEQUMIB=Force UponGo",
+    "Sequence 5 SEQUMIBMODE=Late", "Sequence 5 PREFERCUEAPPEARANCE=Yes", "Sequence 5 CUEZEROMODE=Only Used Dimmers"]);
+  assert.deepEqual(result.playback, { activeBefore: false, activeAfter: false });
+  assert.equal(h.fake.commands.length, 0);
+});
+
+test("configure_sequence verifies unchanged new settings without sending a setter", async () => {
+  const { result, isError } = await h.callJson("gma3_configure_sequence", {
+    sequence: 5, tracking: true, cue_command: "enabled", mib_policy: "enabled", mib_default_mode: "none",
+    prefer_cue_appearance: false, cue_zero_mode: "off",
+  });
+  assert.equal(isError, false, JSON.stringify(result));
+  assert.equal(result.noop, true);
+  assert.equal(result.verification.status, "matched");
+  assert.deepEqual(sets(), []);
+  assert.deepEqual(new Set(result.intended.unchanged), new Set([
+    "tracking", "cue_command", "mib_policy", "mib_default_mode", "prefer_cue_appearance", "cue_zero_mode",
+  ]));
+});
+
+test("configure_sequence detects a refused new setting and stops following writes", async () => {
+  con.refuse.SEQUMIB = ["Force Late"];
+  const { result, isError } = await h.callJson("gma3_configure_sequence", {
+    sequence: 5, mib_policy: "force_late", mib_default_mode: "early",
+  });
+  assert.equal(isError, true);
+  assert.equal(result.verification.status, "mismatched");
+  assert.deepEqual(sets(), ["Sequence 5 SEQUMIB=Force Late"]);
+  assert.equal(con.seqs.get(5)!.props.SEQUMIBMODE, "None");
+});
+
+test("configure_sequence rechecks requested MIB defaults that initially matched", async () => {
+  const originalSet = h.fake.handlerFor("set")!;
+  h.fake.on("set", async (args, req) => {
+    const reply = await originalSet(args, req);
+    if (args.ref === "Sequence 5" && args.property === "SEQUMIB") con.seqs.get(5)!.props.SEQUMIBMODE = "Early";
+    return reply;
+  });
+  const { result, isError } = await h.callJson("gma3_configure_sequence", {
+    sequence: 5, mib_policy: "force_early", mib_default_mode: "none",
+  });
+  assert.equal(isError, true);
+  assert.equal(result.verification.status, "mismatched");
+  assert.deepEqual(sets(), ["Sequence 5 SEQUMIB=Force Early"], "coupled fields are detected without replaying setters");
+});
+
+test("new sequence choices are validated before bridge work and unreadable values are refused", async () => {
+  for (const [key, value] of [["cue_command", "Force Yes"], ["mib_policy", "early"], ["mib_default_mode", "defined"],
+    ["cue_zero_mode", "all"]]) {
+    const response = await h.callJson("gma3_configure_sequence", { sequence: 5, [key]: value });
+    assert.equal(response.isError, true);
+    assert.match((response.result.validationErrors ?? []).join("; "), new RegExp(key));
+  }
+  assert.equal((await h.callJson("gma3_configure_sequence", { sequence: 5, prefer_cue_appearance: "yes" })).isError, true);
+  assert.equal(h.fake.requests.length, 0);
+  con.unreadable.add("Sequence 5 SEQUMIB");
+  const response = await h.callJson("gma3_configure_sequence", { sequence: 5, mib_policy: "enabled" });
+  assert.equal(response.isError, true);
+  assert.match(response.result.summary, /SEQUMIB.*could not be read/);
+  assert.deepEqual(sets(), []);
 });
 
 test("configure_sequence batch (SU-12): the same settings on numbers and ranges, each read back; a missing sequence fails alone", async () => {

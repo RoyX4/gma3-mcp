@@ -12,6 +12,9 @@ the bridge's Lua execution disabled. Evidence: [the SB-01 probe record](../probe
 
 Cue triggers and timing (what makes a chase run) are set with `gma3_set_cue_trigger` / `gma3_set_cue_timing`
 ([cues](cues.md)); assigning a sequence is `gma3_assign_to_executor` ([executors](executors.md)).
+For existing Cue Release/Assert flags, Part Tracking Distance, commands, transitions and MIB, use
+[`gma3_cue_settings` and `gma3_configure_cue`](cue-settings.md). Their lock and verification rules are documented
+separately; the two configure tools below also support explicit unlock/relock and optional verification.
 
 ## The things to know first
 
@@ -49,7 +52,8 @@ Cue triggers and timing (what makes a chase run) are set with `gma3_set_cue_trig
 - **Plan, then send only what changes.** The tool reads the current values and builds
   `intended.changes` (`key`, `property`, `from`, `to`); requested values that are already set are listed in
   `intended.unchanged` and never sent. Every requested value overwrites the current one; there is no merge.
-  When nothing changes, the result is `succeeded` with `noop: true` and no request was sent.
+  When nothing changes, the result has `noop: true` and no mutation is sent; verification can still detect
+  drift after the planning read.
 - **`preview: true`** performs only the reads and returns the same plan, the lock state and (for sequences) the
   sharing executors. It does not take the mutation lock.
 - **Locks.** A locked target is refused before anything is sent, naming the owner (`page`, `executor`,
@@ -62,8 +66,10 @@ Cue triggers and timing (what makes a chase run) are set with `gma3_set_cue_trig
   `set` whose reply shows a different value is `failed` (the console kept the old value); a lost reply is
   `unknown` and is never resent. Outcome follows the shared result model: `failed` when nothing was changed,
   `partial` after at least one confirmed change.
-- **`verify`** (default true) reads every changed property and the final Lock back and compares them
-  (`verification`). Not verified: anything not requested, and the effect of a function at playback time.
+- **`verify`** (default true) reads every requested property and the final Lock back and compares them
+  (`verification`), including settings that matched before another setter ran. A sequence call needing no
+  writes also performs a fresh verification read. Not verified: anything not requested, and the effect of a
+  function at playback time.
 - **Serialisation caveat.** Mutations from this server run one at a time inside the mutation lock. The lock does not
   isolate anything from another operator, MCP server or macro: an object can change between the read and the write.
 
@@ -90,9 +96,10 @@ executor holding something other than a sequence is reported, but no function li
 **Sequences from another data pool.** An executor can hold a sequence from another data pool (see the manual's
 data pool topic), so the assigned sequence is always read by the address the executor reports, never rebuilt as
 `Sequence <n>` (which would read the current pool's sequence of the same number). `sequence.dataPool` is
-`current`, `other` or `unknown`; `sequence.ref` (`Sequence <n>`) is given only for the current pool, because
-`gma3_configure_sequence` addresses sequences by number in the current data pool and cannot configure another
-pool's sequence. The reference scan covers the current data pool's pages.
+`current`, `other` or `unknown`; `sequence.ref` (`Sequence <n>`) is given only for the current pool. The inspector
+does not infer the other pool's number from that handle. To configure a sequence in another pool, supply its
+known `data_pool` and `sequence` to `gma3_configure_sequence`. The executor inspector's reference scan covers
+the current data pool's pages; it is not a search of every data pool.
 
 ## gma3_configure_executor
 
@@ -120,6 +127,8 @@ the sequence (`sequence`, `sequenceAddr`).
 
 | Parameter | Property | Values |
 | --- | --- | --- |
+| `sequence` | target | existing Sequence number; use `sequences` for the batch form below |
+| `data_pool` | target | optional integer 1–9999; defaults to the current data pool |
 | `wrap_around` | WrapAround | true / false |
 | `priority` | Priority | super, swap, htp, highest, high, ltp, low, lowest |
 | `restart_mode` | RestartMode | first_cue, current_cue, next_cue |
@@ -127,6 +136,11 @@ the sequence (`sequence`, `sequenceAddr`).
 | `auto_start`, `auto_stop` | AutoStart, AutoStop | true / false |
 | `master_go_mode` | MasterGoMode | none, go, on, top (applies only with Auto Stop off) |
 | `auto_fix`, `auto_stomp`, `tracking`, `soft_ltp` | AutoFix, AutoStomp, Tracking, SoftLTP | true / false |
+| `cue_command` | CUECOMMAND | enabled, force_no, force_yes |
+| `mib_policy` | SEQUMIB | enabled, never, force_early, force_upon_go, force_late |
+| `mib_default_mode` | SEQUMIBMODE | none, early, upon_go, late |
+| `prefer_cue_appearance` | PREFERCUEAPPEARANCE | true / false |
+| `cue_zero_mode` | CUEZEROMODE | off, all_used_attributes, only_used_dimmers |
 | `off_when_overridden` | OffWhenOverridden | true / false |
 | `kill_protect`, `swap_protect` | KillProtect, SwapProtect | true / false (protect playback, not editing) |
 | `use_executor_time`, `include_link_last_go` | UseExecutorTime, IncludeLinkLastGo | true / false |
@@ -139,14 +153,51 @@ the sequence (`sequence`, `sequenceAddr`).
 
 Requests in order: `objects Sequence <n>` (settings, Lock), the reference scan, `object Sequence <n>` (playback
 before), the `set` requests (unlock, one per change, explicit lock, relock), `objects Sequence <n>` (read-back),
-`object Sequence <n>` (playback after). The result lists `references` (every executor of the current data pool
-assigned this sequence) and warns when more than one executor shares it, or when the scan was incomplete; an
+`object Sequence <n>` (playback after). With `data_pool`, those reads and writes address that explicit pool.
+The result lists `references` (executors in the addressed data pool assigned this sequence) and warns when
+more than one executor shares it, or when the scan was incomplete; an
 incomplete scan never blocks the change. Input/output filters are not part of the first release.
 
 Masters are written by name, which the console requires (a number is silently ignored): a `resolve_masters` read step
 (`children ShowData.Masters.Speed`) turns the number into the master's name first and refuses a master without a name
 or one that shares its name with another. While a rate master is linked, the sequence's own rate fader is the shared
 master. See [speed.md](speed.md) for the masters themselves.
+
+### Tracking and Sequence policy
+
+To turn **real Sequence Tracking** on, call `gma3_configure_sequence`. First inspect the proposed change:
+
+```json
+{"data_pool":1,"sequence":401,"tracking":true,"preview":true}
+```
+
+Apply with the same target and `preview` omitted or `false`:
+
+```json
+{"data_pool":1,"sequence":401,"tracking":true}
+```
+
+This writes the existing Sequence's `Tracking` property; no cue re-creation or Store is needed. With Tracking
+on, omitted cue values inherit within the sequence. With it off, omitted values do not carry from the preceding
+cue. This policy belongs to the Sequence and affects every executor referencing it. The offline
+[tracking compiler](tracking.md) and a Part's [Tracking Distance](cue-settings.md#tracking-distance-and-policy-overrides)
+serve different purposes; neither substitutes for this switch.
+
+The additional settings are sequence-wide policies:
+
+- `cue_command: "enabled"` follows Part command-enable settings. `"force_no"` suppresses cue commands;
+  `"force_yes"` overrides Part disable settings. Native values are Enabled, Force No and Force Yes.
+- `mib_policy: "enabled"` permits the Cue/Part MIB settings, `"never"` disables MIB, and the three force modes
+  override the Part mode with Early, UponGo or Late. Native values are Enabled, Never, Force Early,
+  Force UponGo and Force Late. `mib_default_mode` supplies None, Early, UponGo or Late to Parts set to Default.
+- `prefer_cue_appearance` selects preference for the cue's appearance. `cue_zero_mode` controls Cue Zero's
+  population: Off, All Used Attributes or Only Used Dimmers.
+
+`release_first_cue` is also a Sequence policy. A first cue whose explicit Release flag is cleared can still
+inherit this setting; [cue settings](cue-settings.md#explicit-release-and-inherited-release) keeps those states
+separate. Reading back a command or MIB policy confirms the property, not execution of a stored command or
+physical fixture movement. Representative isolated native checks changed and restored each of the five
+additional settings; they do not qualify every combination or future build.
 
 ### Batch form (SU-12)
 
@@ -157,8 +208,8 @@ that appears twice after expansion refuses the whole call; a missing one fails a
 
 ## Not in the first release
 
-Custom key commands, executor width/height, executor configurations (save/load/recast), MA-encoder functions,
-non-sequence executors and Cue Zero mode. Speed and rate masters: [speed.md](speed.md) (SB-06).
+Custom key commands, executor width/height, executor configurations (save/load/recast), MA-encoder functions
+and non-sequence executors. Speed and rate masters: [speed.md](speed.md) (SB-06).
 
 ## Live test procedure (`test/live/playback.live.ts`)
 

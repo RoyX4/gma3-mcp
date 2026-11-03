@@ -46,7 +46,7 @@ import { Validator, ValidationError, attributeName, cueNumber, finiteNumber, fix
 import { cueRef, exists } from "./common.js";
 import { operation, type RegisterTools, type ToolContext } from "./context.js";
 import { BATCH_NOTE, batchOptionShape, compactResult, duplicates, runBatchCall } from "../batch.js";
-import { TIME_NORMALIZERS, TIMING_PROPS, TRIGGERS, TRIGGER_KEYS, type TimingKey, type TriggerKey } from "./cues.js";
+import { TIME_NORMALIZERS, TIMING_PROPS, TRIGGERS, TRIGGER_KEYS, STORE_TRACKING_LIMITATION, storeTrackingFlags, storeTrackingShape, validateStoreTrackingOptions, type StoreTrackingOptions, type TimingKey, type TriggerKey } from "./cues.js";
 import {
   ATTRIBUTE_UNITS,
   ATTRIBUTE_UNIT_NAMES,
@@ -359,7 +359,7 @@ const failedRead = (name: string, error: string, detail?: unknown): StepResult =
 
 type StoreMode = "create" | "merge" | "overwrite";
 
-interface Batch {
+interface Batch extends StoreTrackingOptions {
   sequence: number;
   sequenceName?: string;
   mode: StoreMode;
@@ -395,8 +395,8 @@ interface BatchResult {
   verification: Verification;
 }
 
-function storeCommand(sequence: number, cue: string, mode: StoreMode): string {
-  return `Store ${cueRef(sequence, cue)}${mode === "merge" ? " /Merge" : mode === "overwrite" ? " /Overwrite" : ""} /NoConfirmation`;
+function storeCommand(sequence: number, cue: string, mode: StoreMode, tracking: StoreTrackingOptions): string {
+  return `Store ${cueRef(sequence, cue)}${mode === "merge" ? " /Merge" : mode === "overwrite" ? " /Overwrite" : ""}${storeTrackingFlags(tracking)} /NoConfirmation`;
 }
 
 function setStep(bridge: Gma3Bridge, name: string, ref: string, property: string, value: string | number, t: number): { name: string; run: StepFn } {
@@ -828,7 +828,7 @@ export async function buildCueBatch(ctx: ToolContext, b: Batch): Promise<BatchRe
     const pre = `cue ${c.cue}: `;
     const part0 = cueRef(b.sequence, c.cue, 0);
     const cueObj = cueRef(b.sequence, c.cue);
-    const store: Array<{ name: string; run: StepFn }> = [{ name: `${pre}store`, run: () => commandStep(bridge, `${pre}store`, storeCommand(b.sequence, c.cue, b.mode), t) }];
+    const store: Array<{ name: string; run: StepFn }> = [{ name: `${pre}store`, run: () => commandStep(bridge, `${pre}store`, storeCommand(b.sequence, c.cue, b.mode, b), t) }];
     if (c.name !== undefined) store.push(setStep(bridge, `${pre}name`, part0, "Name", c.name, t));
     for (const [k, val] of Object.entries(c.timing) as Array<[keyof CueSpec["timing"], number]>) store.push(setStep(bridge, `${pre}${k}`, part0, TIMING_PROPS[k], val, t));
     if (c.trigger) store.push(setStep(bridge, `${pre}trigger`, cueObj, "TrigType", TRIGGERS[c.trigger], t));
@@ -1286,6 +1286,7 @@ export async function storeCues(ctx: ToolContext, raw: Record<string, unknown>):
   const sequence = v.check(() => objectNumber("sequence", raw.sequence));
   const replace = raw.replace === true;
   const mode = replace && raw.mode === undefined ? "create" : v.check(() => oneOf("mode", raw.mode, ["create", "merge", "overwrite"] as const));
+  const tracking = validateStoreTrackingOptions(v, raw);
   if (replace && mode !== "create") v.fail("replace rebuilds the sequence from its cues: mode is create (or leave it out)");
   const sequenceName = v.check(() => objectName("sequence_name", raw.sequence_name, { optional: true }));
   const defaultFixtures = raw.fixtures === undefined ? undefined : v.check(() => fixtureSelection("fixtures", raw.fixtures));
@@ -1328,10 +1329,12 @@ export async function storeCues(ctx: ToolContext, raw: Record<string, unknown>):
       if (chk.status !== "succeeded") return buildResult({ operation: op, target, steps: pre, verification: unavailable("nothing was sent") });
     }
     const before = replace ? await assignmentsOf(bridge, sequence, t) : null;
-    const r = await buildCueBatch(ctx, { sequence, sequenceName, mode, cues, verify: raw.verify !== false, replace });
+    const r = await buildCueBatch(ctx, { sequence, sequenceName, mode, cues, verify: raw.verify !== false, replace, ...tracking });
     r.steps.unshift(...pre);
     r.warnings.push(...warnings);
-    const extra: Record<string, unknown> = { sequenceExisted: r.sequenceExisted };
+    const trackingRequested = Object.keys(tracking).length > 0;
+    const extra: Record<string, unknown> = { sequenceExisted: r.sequenceExisted,
+      ...(trackingRequested ? { storeOptions: tracking, notVerified: `${NOT_READABLE} ${STORE_TRACKING_LIMITATION}` } : {}) };
     let verification = r.verification;
     if (replace && r.sent) {
       const after = await assignmentsOf(bridge, sequence, t);
@@ -1351,7 +1354,9 @@ export async function storeCues(ctx: ToolContext, raw: Record<string, unknown>):
       r.steps.push({ name: "sequence_settings", status: "skipped", error: `not attempted: ${reason}` });
       extra.sequenceSettings = { outcome: "not_attempted", reason };
     }
-    return batchResult(op, { sequence, cues: cues.map((c) => c.cue), mode, ...(replace ? { replace } : {}) }, r, extra, verification);
+    const result = batchResult(op, { sequence, cues: cues.map((c) => c.cue), mode, ...(replace ? { replace } : {}) }, r, extra, verification);
+    if (trackingRequested) result.summary += ` ${STORE_TRACKING_LIMITATION}`;
+    return result;
   });
 }
 
@@ -1569,12 +1574,26 @@ export async function editCues(ctx: ToolContext, raw: Record<string, unknown>): 
             actual = { ...actual, ...(p.items?.[0]?.fields ?? {}) };
           }
           report.name = actual && typeof actual.Name === "string" ? actual.Name : null;
-          report.verification = actual ? compareFields(checked, { ...expected, ...timingExpected }, actual, { normalize: TIME_NORMALIZERS }) : { status: "mismatched", checked, detail: `cue ${no} no longer exists` };
+          const wanted = { ...expected, ...timingExpected };
+          report.verification = actual ? compareFields(checked, wanted, actual, { normalize: TIME_NORMALIZERS }) : { status: "mismatched", checked, detail: `cue ${no} no longer exists` };
+          if (actual) {
+            // Names and command literals are case-sensitive text, unlike enum display values.
+            const mismatches = ["Name", "Command"].filter(property => wanted[property] !== undefined
+              && (typeof actual[property] !== "string" || actual[property].trim() !== wanted[property]));
+            if (mismatches.length) report.verification = { ...report.verification, status: "mismatched",
+              detail: [report.verification.detail, ...mismatches.map(property => `${property}: expected exact text ${JSON.stringify(wanted[property])}, read ${JSON.stringify(actual[property] ?? null)}`)].filter(Boolean).join("; ") };
+          }
           readBack.push(asRead({ name: `${pre}read_back`, status: "succeeded", op: "objects", detail: { verification: report.verification.status } }));
         } catch (err) {
           const message = err instanceof Error ? err.message : String(err);
           readBack.push(asRead({ name: `${pre}read_back`, status: "failed", op: "objects", error: message }));
           report.verification = unavailable(`read-back failed: ${message}`, checked);
+        }
+        if (report.verification.status !== "matched") {
+          stopped = true;
+          if (report.status === "stored") report.status = "failed";
+          report.error ??= `${pre}read-back ${report.verification.status}: ${report.verification.detail ?? "the requested edit was not verified"}; later cues were not edited`;
+          steps.push(asRead({ name: `${pre}check_edit_verified`, status: "failed", op: "objects", error: report.error }));
         }
       }
     }
@@ -1847,6 +1866,7 @@ export const registerCueListTools: RegisterTools = (server, ctx) => {
       description:
         "Store several cues of one sequence in one call, each from explicit content: a look (fixtures with presets, intensity, attribute values and/or a phaser) or several looks, with an optional name, timing, trigger and command per cue; a cue with a command needs no look (stored empty). mode create refuses (nothing sent) when any of the cues exists; merge and overwrite store into existing cues. The store creates the sequence when it does not exist; sequence_name names it. " +
         "presets {pool, from, to} (instead of cues): one cue per existing preset of the range on fixtures, named after it, with the call's timing and trigger. replace: true deletes the existing cues first (the sequence object, its settings and executor assignments stay, checked). sequence_settings (as gma3_configure_sequence) are applied after the build in the same call; a priority above ltp lists the running sequences it would switch off (Off When Overridden on), and protect_running: true turns that off on them. " +
+        `Optional cue_only and tracking_shield add native Store options to each cue in this sequence; omitted options retain console defaults. ${STORE_TRACKING_LIMITATION} ` +
         BUILD_NOTE +
         " " +
         COMPACT_NOTE +
@@ -1857,6 +1877,7 @@ export const registerCueListTools: RegisterTools = (server, ctx) => {
         sequence: z.number().optional().describe("Sequence number. Required unless sequences is given."),
         sequence_name: z.string().optional(),
         mode: z.enum(["create", "merge", "overwrite"]).optional().describe("Required (per sequence or for the whole batch)."),
+        ...storeTrackingShape,
         fixtures: z.string().optional().describe("Default target for looks that do not name their own fixtures."),
         cues: z.array(cueSchema).optional().describe(`1 to ${MAX_CUES} cues, stored in the order given. Required unless sequences or presets is given.`),
         presets: presetRangeSchema.optional().describe("One cue per existing preset of the range on fixtures, numbered from first_cue, named after the preset (instead of cues)."),
@@ -1868,17 +1889,23 @@ export const registerCueListTools: RegisterTools = (server, ctx) => {
         exclusive: z.boolean().optional().describe("Required (true)."),
         verify: z.boolean().optional(),
         sequences: z
-          .array(z.object({ sequence: z.number(), sequence_name: z.string().optional(), mode: z.enum(["create", "merge", "overwrite"]).optional(), fixtures: z.string().optional(), cues: z.array(cueSchema) }))
+          .array(z.object({ sequence: z.number(), sequence_name: z.string().optional(), mode: z.enum(["create", "merge", "overwrite"]).optional(), fixtures: z.string().optional(), cues: z.array(cueSchema), ...storeTrackingShape }))
           .optional()
           .describe("Batch form: several sequences, each {sequence, sequence_name, mode, fixtures, cues}."),
         ...batchOptionShape,
       },
     },
     (args) =>
-      operation(() => {
+      operation(async () => {
         const a = args as Record<string, unknown>;
         const scoped = inDataPool(ctx, a);
         if (a.sequences === undefined) return storeCues(scoped, a).then((r) => compactCueResult(r, a.detail === true));
+        const optionsValidation = new Validator();
+        validateStoreTrackingOptions(optionsValidation, a);
+        if (!optionsValidation.ok) return validationFailure("store_cues", { sequences: "refused" }, optionsValidation.errors);
+        const hasTracking = (item: unknown) => !!item && typeof item === "object"
+          && (("cue_only" in item && item.cue_only !== undefined) || ("tracking_shield" in item && item.tracking_shield !== undefined));
+        const trackingRequested = hasTracking(a) || (Array.isArray(a.sequences) && a.sequences.some(hasTracking));
         return runBatchCall(a, {
           ctx: scoped,
           operation: "store_cues",
@@ -1886,8 +1913,18 @@ export const registerCueListTools: RegisterTools = (server, ctx) => {
           identityKeys: ["sequence", "sequence_name", "cues"],
           label: (it) => `Sequence ${String(it.sequence)}`,
           key: (it) => `Sequence ${String(it.sequence)}`,
-          check: (items) => duplicates(items.map((it) => String(it.sequence))).map((n) => `Sequence ${n} appears more than once in sequences`),
+          check: (items) => {
+            const errors = duplicates(items.map((it) => String(it.sequence))).map((n) => `Sequence ${n} appears more than once in sequences`);
+            for (const [index, item] of items.entries()) {
+              const v = new Validator(); validateStoreTrackingOptions(v, item);
+              errors.push(...v.errors.map((error) => `sequences[${index}].${error}`));
+            }
+            return errors;
+          },
           run: (it, c) => storeCues(c, it),
+        }).then((result) => {
+          if (trackingRequested) { result.notVerified = STORE_TRACKING_LIMITATION; result.summary += ` ${STORE_TRACKING_LIMITATION}`; }
+          return result;
         });
       }),
   );

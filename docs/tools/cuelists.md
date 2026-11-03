@@ -5,6 +5,9 @@ the SU-05 commands and programmer read-back (preset links need bridge 0.27.0), a
 FR-05 `set` writes. Evidence: [SETUP.md](../../SETUP.md) SU-06 and the
 [SU-06 record](../probes/su-06-cuelists-macos-2.5.1.md).
 
+For persistent native Cue/Part properties, see [cue settings](cue-settings.md). Native Store options
+are described below; Sequence Tracking on/off remains a `gma3_configure_sequence` setting.
+
 ## Content: looks
 
 A cue's content is one look or several. A look is a target and what to give it:
@@ -36,7 +39,7 @@ activates the fixture's whole colour group (KB-17), so a cue can hold more value
      a store);
    - for each look: `ClearSelection`, the select, each preset followed by its check, then the intensity and the
      values followed by theirs (below);
-   - `Store Sequence N Cue C [/Merge|/Overwrite] /NoConfirmation`;
+   - `Store Sequence N Cue C [/Merge|/Overwrite] [explicit Store options] /NoConfirmation`;
    - `Name` and the timing on Part 0, `TrigType` / `TrigTime` on the cue.
 4. **Leaving Preview.** The console is confirmed in Preview, then `ClearAll` and `Preview Off`, whatever happened.
    The Normal programmer is read again and must equal the snapshot from step 1.
@@ -49,12 +52,16 @@ activates the fixture's whole colour group (KB-17), so a cue can hold more value
   recall: a later preset of the same look may take over its channels, which is the order asked for;
 - the intensity and values are compared per fixture and cell, as `gma3_set_attributes` compares them.
 
-A look that did not apply is a mismatch, and **the batch stops before that cue is stored**. Cues already stored
-stay; nothing is undone or retried. A check that cannot be completed is `unavailable`; the cue is stored and its
-verification says so.
+With verification enabled, a mismatched or unavailable required look check **stops the batch before that cue is
+stored**. Cues already stored stay; nothing is undone or retried. `verify:false` skips the look checks and does
+not establish that the programmer held the requested values.
 
-**Not verified:** the values stored in a cue. 2.5.1 has no GetCueData, so the values cannot be read back from the
-cue. The look check is the evidence that the programmer held the right values at the store.
+**Stored-value verification is separate.** This standalone batch checks the Preview look before Store and cue
+metadata afterwards; it does not independently compare the stored hard values. The maintained bridge can read
+actual hard channels using `GetPresetData` on CuePart handles. [Native cue data](native-cues.md) exposes those
+channels and reconstructs supported sequence-owned tracking; incomplete or unsupported reads remain explicit.
+[Durable programming jobs](jobs.md) also compare compiler-owned stored/tracked state after each batch. These
+checks do not establish final stage output across competing playbacks, programmer values, priorities and masters.
 
 **Results.** `cues` lists every cue with:
 - `status`: `stored`, `failed`, `unknown` or `not_attempted`;
@@ -74,6 +81,8 @@ cue. The look check is the evidence that the programmer held the right values at
 | `sequence` | sequence number; the store creates it when it does not exist |
 | `sequence_name` | optional |
 | `mode` | `create` (refuse existing cues), `merge`, `overwrite` |
+| `cue_only` | optional: `off`, `on`, `on_default_new`, `dimmer_only`, `dimmer_only_default_new` |
+| `tracking_shield` | optional: `dimmer_rising_from_zero`, `dimmer_above_zero` |
 | `fixtures` | default target for looks without their own |
 | `cues` | 1–100 cues: `cue` (number), `name`, content, `fade`, `delay`, `out_fade`, `out_delay`, `trigger` (`go`, `time` with `time`, `follow` with optional `time`, `sound`, `bpm`) |
 | `exclusive`, `verify` | `exclusive` required; `verify` default true (look checks and read-back) |
@@ -81,11 +90,58 @@ cue. The look check is the evidence that the programmer held the right values at
 Tracking is the sequence's own setting: with Tracking on, a cue's stored values track into later cues that do not
 store those attributes.
 
+### Native CueOnly and Tracking Shield options
+
+`cue_only` and `tracking_shield` use the same [accepted values and quoted native commands](cues.md#store-tracking-options)
+as the single cue and cue-part Store tools. They apply to every Store in this sequence's build, including
+merge and overwrite into existing cues. These are call/sequence options, not fields inside each `cues` item.
+If omitted, the previous commands and console Store defaults remain unchanged. `gma3_build_chase` does not
+expose these new options.
+
+For example, merge an explicit look into an existing cue with `gma3_store_cues`:
+
+```json
+{
+  "sequence":401,"mode":"merge","exclusive":true,"cue_only":"on",
+  "cues":[{"cue":3,"fixtures":"101 Thru 112","intensity":70}]
+}
+```
+
+Its Store command is `Store Sequence 401 Cue 3 /Merge /CueOnly "On" /NoConfirmation`.
+`tracking_shield:"dimmer_above_zero"` adds `/TrackingShield "DAZ"`; `dimmer_rising_from_zero` adds
+`/TrackingShield "DRZ"`. The complete CueOnly values map to `"Off"`, `"On"`, `"OnDefaultNew"`,
+`"DimmerOnly"` and `"DimmerOnlyDefaultNew"` respectively.
+
+The standalone tool checks the explicit Preview look and requested cue metadata. Normal metadata
+verification does **not** prove restoration data, following-cue inherited state or playback effects.
+`notVerified` and the summary retain that qualification, including in compact multi-sequence results.
+Representative native tests separately observed CueOnly On restoring Dimmer 40 in Cue2 after a Cue1
+edit to 70, and Tracking Shield DAZ restoring Pan 10 in Cue2 after a Cue1 edit to 50. See the
+[4 November qualification](../qualification/cue-settings-2026-11-04.md) for exact scope and source identities;
+other modes and multipart interactions remain separately unqualified.
+
 ### Batch form and compact results (SU-12)
 
 `sequences: [{sequence, sequence_name, mode, fixtures, cues}]` stores cues in several sequences; each sequence is its
 own Preview build with the steps above, and `mode`, `fixtures` and `exclusive` may be given once for all. A sequence
 listed twice is refused. See [Batch forms](README.md#batch-forms-su-12).
+
+CueOnly and Tracking Shield can also be defaults for the whole call. An explicit value on a sequence item
+overrides that default:
+
+```json
+{
+  "mode":"merge","exclusive":true,"fixtures":"101","cue_only":"on",
+  "sequences":[
+    {"sequence":401,"cues":[{"cue":3,"intensity":70}]},
+    {"sequence":402,"cue_only":"dimmer_only","tracking_shield":"dimmer_above_zero",
+     "cues":[{"cue":3,"intensity":70}]}
+  ]
+}
+```
+
+Sequence401 uses `/CueOnly "On"`; Sequence402 uses `/CueOnly "DimmerOnly" /TrackingShield "DAZ"`.
+Invalid options are rejected before bridge work, including invalid options on a later sequence item.
 
 The results of `gma3_store_cues` and `gma3_build_chase` are compact by default:
 - one line per cue: `{cue, status, verification, name}`, with `error`, `detail` and `looks` only for a cue that did
@@ -115,8 +171,9 @@ The results of `gma3_store_cues` and `gma3_build_chase` are compact by default:
   the phaser. Templates are built with `gma3_build_phaser` into a preset, which a look can recall.
 - **`sequence_settings`** (as `gma3_configure_sequence` takes them) are applied after the build in the same lock span.
   With a priority above LTP, the result's `override` lists the running sequences of lower priority with Off When
-  Overridden on. They are switched off where the override plays on the same fixtures; cue contents cannot be read, so
-  every playing candidate is listed. `protect_running: true` turns Off When Overridden off on them. The scan must be complete (every sequence's number, priority, Off When
+  Overridden on. They are switched off where the override plays on the same fixtures; this protection scan does not
+  establish per-fixture overlap from native cue contents, so every playing candidate is listed.
+  `protect_running: true` turns Off When Overridden off on them. The scan must be complete (every sequence's number, priority, Off When
   Overridden and, for a candidate, its playback state readable) and every protection must succeed and read back; otherwise the override's settings are not applied and a chase is not played. Settings are
   only applied after a complete build with no step that went unanswered.
 
@@ -125,13 +182,19 @@ The results of `gma3_store_cues` and `gma3_build_chase` are compact by default:
 Edits existing cues of one sequence in one call:
 - the same trigger (`trigger`, `time`);
 - the same timing (`fade`, `delay`, `out_fade`, `out_delay`, `snap_delay`, on Part 0);
-- one name per cue (`names`, in cue order).
+- one name per cue (`names`, in cue order);
+- the same stored command (`command`) or one per cue (`commands`); an empty string clears it.
 
 The cues are chosen with exactly one of `cues` (a list), `from` / `to` (a range, either end optional) or
 `all: true`. The tool refuses before sending anything when the sequence or a listed cue does not exist, when the
 range is empty, or when the number of names differs from the number of cues. It sends one `set` per property, cue by
 cue, stops at the first failure, and reads the written properties back per cue. Stored values and the programmer are
 not touched.
+
+With verification enabled, a mismatched or unavailable per-cue readback stops before the next cue is
+edited. Requested names and command text are compared with case preserved. `verify:false` skips these
+checks and reports `not_requested`; it does not promote acknowledged writes to a verified result.
+For additional Cue flags and Part settings, use [cue settings](cue-settings.md).
 
 ### Trigger times when switching triggers (SU-14)
 

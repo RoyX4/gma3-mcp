@@ -80,6 +80,32 @@ export const TIMING_PROPS = {
 } as const;
 export type TimingKey = keyof typeof TIMING_PROPS;
 
+/** MA 2.5 Store-option vocabulary; these are operation options, not persistent cue settings. */
+export const CUE_ONLY_OPTIONS = { off: "Off", on: "On", on_default_new: "OnDefaultNew", dimmer_only: "DimmerOnly", dimmer_only_default_new: "DimmerOnlyDefaultNew" } as const;
+export const TRACKING_SHIELD_OPTIONS = { dimmer_rising_from_zero: "DRZ", dimmer_above_zero: "DAZ" } as const;
+const cueOnlyKeys = Object.keys(CUE_ONLY_OPTIONS) as Array<keyof typeof CUE_ONLY_OPTIONS>;
+const trackingShieldKeys = Object.keys(TRACKING_SHIELD_OPTIONS) as Array<keyof typeof TRACKING_SHIELD_OPTIONS>;
+export interface StoreTrackingOptions {
+  cue_only?: keyof typeof CUE_ONLY_OPTIONS;
+  tracking_shield?: keyof typeof TRACKING_SHIELD_OPTIONS;
+}
+export const STORE_TRACKING_LIMITATION = "CueOnly/TrackingShield restoration behavior and following-cue state are not verified by metadata/existence read-back.";
+export const storeTrackingShape = {
+  cue_only: z.enum(cueOnlyKeys).optional().describe("Explicit native /CueOnly Store option: off, on, on_default_new, dimmer_only or dimmer_only_default_new. Omit to retain console defaults. Following-cue restoration is not verified by metadata read-back."),
+  tracking_shield: z.enum(trackingShieldKeys).optional().describe("Explicit /TrackingShield DRZ (dimmer_rising_from_zero) or DAZ (dimmer_above_zero). No undocumented Off token is sent. Following-cue restoration is not verified by metadata read-back."),
+};
+
+export function validateStoreTrackingOptions(v: Validator, raw: { cue_only?: unknown; tracking_shield?: unknown }): StoreTrackingOptions {
+  const cue_only = raw.cue_only === undefined ? undefined : v.check(() => oneOf("cue_only", raw.cue_only, cueOnlyKeys));
+  const tracking_shield = raw.tracking_shield === undefined ? undefined : v.check(() => oneOf("tracking_shield", raw.tracking_shield, trackingShieldKeys));
+  return { ...(cue_only !== undefined ? { cue_only } : {}), ...(tracking_shield !== undefined ? { tracking_shield } : {}) };
+}
+
+export function storeTrackingFlags(options: StoreTrackingOptions): string {
+  return (options.cue_only !== undefined ? ` /CueOnly "${CUE_ONLY_OPTIONS[options.cue_only]}"` : "")
+    + (options.tracking_shield !== undefined ? ` /TrackingShield "${TRACKING_SHIELD_OPTIONS[options.tracking_shield]}"` : "");
+}
+
 const NOT_VERIFIED_VALUES = "Stored fixture values (attribute data) are NOT verified; that needs gma3_cue_contents (FR-10).";
 const LOCK_CAVEAT = "The mutation lock orders only this server's own mutations; it does not isolate the operation from another console operator or another client.";
 
@@ -295,7 +321,7 @@ const skippedVerification = (why: string): Verification => unavailable(`read-bac
 
 type StoreMode = "create" | "merge" | "overwrite";
 
-interface StoreArgs extends TargetArgs {
+interface StoreArgs extends TargetArgs, StoreTrackingOptions {
   mode: StoreMode;
   name?: string;
   fade?: number;
@@ -305,11 +331,11 @@ interface StoreArgs extends TargetArgs {
   verify?: boolean;
 }
 
-function buildStoreCommand(t: Target, mode: StoreMode): string {
+function buildStoreCommand(t: Target, mode: StoreMode, tracking: StoreTrackingOptions): string {
   let c = `Store ${refOf(t, t.part)}`;
   if (mode === "merge") c += " /Merge";
   else if (mode === "overwrite") c += " /Overwrite";
-  return c + " /NoConfirmation";
+  return c + storeTrackingFlags(tracking) + " /NoConfirmation";
 }
 
 async function storeCue(ctx: ToolContext, args: StoreArgs, kind: "cue" | "part"): Promise<OperationResult> {
@@ -317,6 +343,7 @@ async function storeCue(ctx: ToolContext, args: StoreArgs, kind: "cue" | "part")
   const v = new Validator();
   const target = validateTarget(v, args, { part: kind === "part" ? "required" : undefined });
   const mode = v.check(() => oneOf("mode", args.mode, ["create", "merge", "overwrite"] as const)) ?? "create";
+  const tracking = validateStoreTrackingOptions(v, args);
   const name = v.check(() => objectName("name", args.name, { optional: true }));
   const fade = v.check(() => timeSeconds("fade", args.fade, { optional: true }));
   const delay = v.check(() => timeSeconds("delay", args.delay, { optional: true }));
@@ -337,7 +364,7 @@ async function storeCue(ctx: ToolContext, args: StoreArgs, kind: "cue" | "part")
       existenceStep(ctx, "check_existing", () => refOf(target, target.part), "absent", 'Use mode "merge" or "overwrite" to store into an existing target. This check is a point-in-time read, not a transaction lock.'),
     );
   }
-  plan.push({ name: "store", run: () => commandStep(ctx.bridge, "store", buildStoreCommand(target, mode), ctx.requestTimeoutMs) });
+  plan.push({ name: "store", run: () => commandStep(ctx.bridge, "store", buildStoreCommand(target, mode, tracking), ctx.requestTimeoutMs) });
   // Name and timing are applied as part properties, one step each, so every piece is individually verifiable
   // and no label text ever goes through the command line.
   if (name !== undefined) plan.push(setStep(ctx, "set_name", namedRef, "Name", name));
@@ -383,9 +410,11 @@ async function storeCue(ctx: ToolContext, args: StoreArgs, kind: "cue" | "part")
   });
 
   const outcome = outcomeOf(steps);
+  const trackingRequested = Object.keys(tracking).length > 0;
+  const notVerified = NOT_VERIFIED_VALUES + (trackingRequested ? ` ${STORE_TRACKING_LIMITATION}` : "");
   const summary =
     defaultSummary(op, outcome, verification, steps) +
-    ` Store step and read-back are reported separately. ${NOT_VERIFIED_VALUES}`;
+    ` Store step and read-back are reported separately. ${notVerified}`;
   return buildResult({
     operation: op,
     target: describeTarget(target),
@@ -394,7 +423,8 @@ async function storeCue(ctx: ToolContext, args: StoreArgs, kind: "cue" | "part")
     summary,
     extra: {
       mode,
-      notVerified: NOT_VERIFIED_VALUES,
+      notVerified,
+      ...(trackingRequested ? { storeOptions: tracking } : {}),
       ...(kind === "part" && target.part === 0 ? { partZeroNote: "Part 0 is the main part every cue has; storing to it is the same as storing the cue itself." } : {}),
       ...(name !== undefined ? { nameNote: "Names are set with the Name property of the part (part 0 for a cue) after the store, never inline on the command line." } : {}),
     },
@@ -634,6 +664,7 @@ export const registerCueTools: RegisterTools = (server, ctx) => {
     "Mode create first checks that the target does not exist and refuses (nothing sent) if it does; that check is a point-in-time read, not a transaction lock. " +
     "The current fixture selection is not changed; the programmer is not cleared (no Clear is sent). " +
     "Reads back existence, Name and the timing fields that were given; the store step and the read-back are reported separately. " +
+    `Optional cue_only and tracking_shield add explicit native Store options; omitted options retain console defaults. ${STORE_TRACKING_LIMITATION} ` +
     `${NOT_VERIFIED_VALUES} ${LOCK_CAVEAT}`;
 
   server.registerTool(
@@ -648,6 +679,7 @@ export const registerCueTools: RegisterTools = (server, ctx) => {
         mode: z.enum(["create", "merge", "overwrite"]).describe("create: refuse if the cue exists. merge: /Merge into an existing cue. overwrite: /Overwrite an existing cue. Exactly one mode."),
         name: z.string().optional().describe("Cue name. Names must not contain any of \\ \" $ & * ? , . ; ^ { } | ~ (the console strips them) and are trimmed; they are set via the Name property of the part after the store."),
         ...timingShape,
+        ...storeTrackingShape,
         ...verifyShape,
       },
     },
@@ -669,6 +701,7 @@ export const registerCueTools: RegisterTools = (server, ctx) => {
         mode: z.enum(["create", "merge", "overwrite"]).describe("create: refuse if the part exists. merge: /Merge. overwrite: /Overwrite. Exactly one mode."),
         name: z.string().optional().describe("Part name. Names must not contain any of \\ \" $ & * ? , . ; ^ { } | ~ (the console strips them) and are trimmed; they are set via the Name property of the part after the store."),
         ...timingShape,
+        ...storeTrackingShape,
         ...verifyShape,
       },
     },

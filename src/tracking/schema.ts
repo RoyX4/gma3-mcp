@@ -56,6 +56,7 @@ export function fixtureIds(expression: string): string[] {
 
 export function parsePlan(raw: unknown): TrackingPlan {
   const plan = trackingPlanSchema.parse(raw);
+  const phaserNames = new Map<string, string>();
   if (plan.sequence_name !== undefined) plan.sequence_name = objectName("sequence_name", plan.sequence_name);
   let previous = -1, cells = 0;
   for (const cue of plan.cues) {
@@ -82,6 +83,7 @@ export function parsePlan(raw: unknown): TrackingPlan {
         const v = new Validator();
         validateLooks(v, { fixtures: change.fixtures, phaser: change.phaser }, "phaser", undefined);
         if (!v.ok) throw new Error(v.errors.join("; "));
+        change.phaser = normalizePhaserAttributes(change.phaser, phaserNames);
       }
       if (change.kind === "preset" && new Set(change.attributes.map((a) => a.toLowerCase())).size !== change.attributes.length) throw new Error("preset coverage contains duplicate attributes");
       cells += fixtures.length * (change.kind === "preset" ? change.attributes.length : change.kind === "phaser" ? phaserAttributes(change.phaser).length : 1);
@@ -89,6 +91,22 @@ export function parsePlan(raw: unknown): TrackingPlan {
     }
   }
   return plan;
+}
+
+/** Keep one spelling across the plan so layer discovery, carried state and execution agree. */
+function normalizePhaserAttributes(phaser: Record<string, unknown>, names: Map<string, string>): Record<string, unknown> {
+  const steps = (phaser.steps as Array<{ values: Record<string, unknown> }>).map((step) => {
+    const seen = new Set<string>();
+    const values = Object.fromEntries(Object.entries(step.values).map(([name, value]) => {
+      const attribute = attributeName("phaser attribute", name), key = attribute.toLowerCase();
+      if (seen.has(key)) throw new Error(`duplicate phaser attribute ${attribute} within one step`);
+      seen.add(key);
+      if (!names.has(key)) names.set(key, attribute);
+      return [names.get(key)!, value];
+    }));
+    return { ...step, values };
+  });
+  return { ...phaser, steps };
 }
 
 export function phaserAttributes(phaser: Record<string, unknown>): string[] {

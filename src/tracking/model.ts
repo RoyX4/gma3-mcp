@@ -81,21 +81,43 @@ function closeActions(delta: Map<string, Cell>, desired: Map<string, Cell>, lint
   }
 }
 
+/** A recall must precede every other preset whose desired cell its coverage would overwrite. */
+export function presetRecallOrder(cells: Cell[]): Array<{ pool: number; preset: number }> | null {
+  const actions = new Map<string, Extract<CellState, { kind: "preset" }>>();
+  const absolute = new Map(cells.filter((cell) => cell.layer === "absolute").map((cell) => [cell.attribute.toLowerCase(), cell]));
+  for (const cell of cells) if (cell.state.kind === "preset") actions.set(fingerprint(cell.state), cell.state);
+  const outgoing = new Map([...actions.keys()].map((id) => [id, new Set<string>()]));
+  const incoming = new Map([...actions.keys()].map((id) => [id, 0]));
+  for (const [id, state] of actions) for (const attribute of state.attributes) {
+    const wanted = absolute.get(attribute.toLowerCase());
+    if (wanted?.state.kind !== "preset") continue;
+    const after = fingerprint(wanted.state);
+    if (after === id || outgoing.get(id)!.has(after)) continue;
+    outgoing.get(id)!.add(after);
+    incoming.set(after, incoming.get(after)! + 1);
+  }
+  const ready = [...actions.keys()].filter((id) => incoming.get(id) === 0), ordered: string[] = [];
+  for (let index = 0; index < ready.length; index++) {
+    const id = ready[index]; ordered.push(id);
+    for (const after of outgoing.get(id)!) {
+      incoming.set(after, incoming.get(after)! - 1);
+      if (incoming.get(after) === 0) ready.push(after);
+    }
+  }
+  if (ordered.length !== actions.size) return null;
+  return ordered.map((id) => { const { pool, preset } = actions.get(id)!; return { pool, preset }; });
+}
+
 function looksOf(delta: Cell[], lint: Lint[], cue: string): Array<Record<string, any>> {
   const perFixture = new Map<string, Record<string, any>>();
-  const seenActions = new Map<string, Set<string>>();
+  const fixtureCells = new Map<string, Cell[]>();
   for (const cell of delta) {
     const look = perFixture.get(cell.fixture) ?? { fixtures: cell.fixture, values: [], presets: [], releases: [] };
-    const actions = seenActions.get(cell.fixture) ?? new Set<string>();
+    const cells = fixtureCells.get(cell.fixture) ?? []; cells.push(cell); fixtureCells.set(cell.fixture, cells);
     const s = cell.state;
     if (s.kind === "value" || s.kind === "off") look.values.push({ attribute: cell.attribute, value: s.kind === "off" ? 0 : s.value, unit: s.kind === "off" ? "percent" : s.unit, layer: cell.layer });
     if (s.kind === "release") {
       look.releases.push({ attribute: cell.attribute, layer: cell.layer });
-    }
-    if (s.kind === "preset") {
-      const action = fingerprint(s);
-      if (!actions.has(action)) look.presets.push({ pool: s.pool, preset: s.preset });
-      actions.add(action);
     }
     if (s.kind === "phaser") {
       const attrs = phaserAttributes(s.phaser);
@@ -103,10 +125,13 @@ function looksOf(delta: Cell[], lint: Lint[], cue: string): Array<Record<string,
       if (look.phaser && fingerprint(look.phaser) !== fingerprint(s.phaser)) lint.push({ severity: "error", cue, code: "multiple_phasers", message: "Several phaser definitions for one fixture cannot fit one verified look; split their fixture coverage or author one combined definition." });
       look.phaser = s.phaser;
     }
-    perFixture.set(cell.fixture, look); seenActions.set(cell.fixture, actions);
+    perFixture.set(cell.fixture, look);
   }
   const groups = new Map<string, Record<string, any>>();
   for (const look of perFixture.values()) {
+    const presets = presetRecallOrder(fixtureCells.get(look.fixtures)!);
+    if (presets === null) lint.push({ severity: "error", cue, code: "conflicting_preset_order", message: `Overlapping preset coverage on Fixture ${look.fixtures} cannot realize the desired state in any recall order.` });
+    else look.presets = presets;
     if (!look.values.length) delete look.values;
     if (!look.presets.length) delete look.presets;
     if (!look.releases.length) delete look.releases;

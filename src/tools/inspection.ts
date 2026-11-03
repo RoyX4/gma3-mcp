@@ -32,6 +32,12 @@ const WORKS_WITHOUT_LUA = "Works with gma3_lua disabled (structured bridge op, p
 
 const NULL_NOTE = "fields that are null were not supplied by the console API (explicitly unavailable, not inferred)";
 
+function nativePartNumber(value: unknown): number | undefined {
+  if (typeof value !== "number" && !(typeof value === "string" && /^\d{1,3}$/.test(value.trim()))) return undefined;
+  const number = Number(value);
+  return Number.isInteger(number) && number >= 0 && number <= 999 ? number : undefined;
+}
+
 /** Keys every attribute row carries (null when the console did not supply them). */
 export const ATTRIBUTE_ROW_KEYS = [
   "uiChannel", "attribute", "attributeIndex", "pretty", "feature", "featureGroup", "activationGroup", "physicalUnit", "readout", "color",
@@ -449,7 +455,8 @@ export const registerInspectionTools: RegisterTools = (server, ctx: ToolContext)
           row.recipes = asArray(row.recipes).map((r) => withNulls(r, RECIPE_KEYS));
           row.otherChildren = asArray(row.otherChildren);
           row.storedValues = null;
-          const actual = nativeParts.find(item => Number(item.no) === Number(row.part));
+          const partNo = nativePartNumber(row.part);
+          const actual = partNo === undefined ? undefined : nativeParts.find(item => nativePartNumber(item.no) === partNo);
           if (actual && typeof actual.contentJson === "string") {
             try {
               const parsed = JSON.parse(actual.contentJson) as Row;
@@ -458,19 +465,22 @@ export const registerInspectionTools: RegisterTools = (server, ctx: ToolContext)
           }
           return row;
         });
+        const nativeContentComplete = native?.complete === true && parts.length > 0 && parts.every(row =>
+          row.storedValues !== null && typeof row.storedValues === "object"
+          && "complete" in row.storedValues && row.storedValues.complete === true);
         return {
+          ...res,
           tool: "gma3_cue_contents",
           target: { sequence, cue, part: part ?? null, fixtures: fixtures ?? null },
-          supportedMode: native?.complete === true ? "recipes and preset references plus actual hard cue-part channels (GetPresetData); sequence tracking uses gma3_native_cue_data" : "recipes and preset references; native hard-channel coverage is unavailable or incomplete",
-          nativeContentComplete: native?.complete === true,
+          supportedMode: nativeContentComplete ? "recipes and preset references plus actual hard cue-part channels (GetPresetData); sequence tracking uses gma3_native_cue_data" : "recipes and preset references; native hard-channel coverage is unavailable or incomplete",
+          nativeContentComplete,
           nativeContentError: nativeError,
-          ...res,
           source: res.source ?? "cue object tree",
           cue: withNulls(res.cue, CUE_KEYS),
           parts,
           presets: expandPresets ? (res.presets && typeof res.presets === "object" ? res.presets : {}) : null,
           trackedValues: "not_reconstructed",
-          limitations: native?.complete === true ? stringList(res.limitations).filter(item => !/hard \(non-recipe\)|no GetCueData/i.test(item)) : stringList(res.limitations),
+          limitations: nativeContentComplete ? stringList(res.limitations).filter(item => !/hard \(non-recipe\)|no GetCueData/i.test(item)) : stringList(res.limitations),
           notes: [
             "storedValues contains actual native channels when available; null means unreadable. complete:false is partial coverage, never a complete cue.",
             "trackedValues is not_reconstructed: a part lists only what it stores; tracked values from earlier cues are absent",

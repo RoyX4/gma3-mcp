@@ -76,6 +76,16 @@ Layer-specific stored releases were qualified on isolated native 2.5.1.1: `Attri
 
 Blocks are materialized only over owned state. They do not freeze unknown channels from other sequences or become a native all-channel Block command. This first compiler does not adopt or partially overwrite existing native cue chains. Recompiling an owned plan is supported; applying an arbitrary patch over a manually edited chain is not silently attempted.
 
+The [coverage status](../tracking-status.md) records the later preset-order/phaser-name corrections and
+remaining existing-show, native-feature and large-chain limits. Preset coverage determines recall
+ordering; impossible combinations refuse execution. Phaser attribute aliases are normalized across
+the plan and ambiguous duplicates are refused. Saved jobs whose normalized plan or compiled payload
+changes fail their integrity check; no journal or verified receipt is silently migrated.
+
+The 10,000-cue plan bound is for offline analysis. Current native jobs with 500 or more authored cues
+refuse before any console request because their complete checkpoint reader is bounded to 500 cue
+objects, including internal cues. Consistent native pagination remains unfinished.
+
 ## Checks and console qualification
 
 Run `node --import tsx --test test/tracking-*.test.ts` and `npm run build`. Tests cover inherited holds, zero versus release, signed layers, preset action closure, cue-only restoration, blocks, phaser carry/restart, serialization, scope errors and fail-closed verification.

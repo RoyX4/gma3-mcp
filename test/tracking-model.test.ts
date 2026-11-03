@@ -81,3 +81,34 @@ test("release plans preserve native-qualified layer-specific release without sub
   assert.equal(r.executable, true);
   assert.deepEqual(r.store.cues[0].looks[0].releases, [{ attribute: "Dimmer", layer: "absolute" }]);
 });
+
+test("phaser attribute whitespace and step casing retain one complete owned attribute", () => {
+  for (const second of [" Dimmer ", "dimmer"]) {
+    const phaser = { steps: [{ values: { " Dimmer ": 20 } }, { values: { [second]: 80 } }] };
+    const compiled = compileTracking(plan([{ cue: 1, changes: [{ kind: "phaser", fixtures: "1", phaser }] }]));
+    assert.equal(compiled.executable, true);
+    assert.equal(compiled.cues[0].state.length, 1);
+    assert.equal(compiled.store.cues[0].hold, undefined);
+    assert.deepEqual(compiled.store.cues[0].looks[0].phaser.steps, [
+      { values: { Dimmer: 20 } }, { values: { Dimmer: 80 } },
+    ]);
+  }
+});
+
+test("phaser source rejects duplicate case or whitespace aliases within one step", () => {
+  for (const alias of ["dimmer", " Dimmer "]) {
+    const phaser = { steps: [{ values: { Dimmer: 20, [alias]: 80 } }, { values: { Dimmer: 40 } }] };
+    assert.throws(() => compileTracking(plan([{ cue: 1, changes: [{ kind: "phaser", fixtures: "1", phaser }] }])), /duplicate.*phaser.*attribute/i);
+  }
+});
+
+test("case-only phaser attribute changes between cues carry without an unintended restart", () => {
+  const phaser = (attribute: string) => ({ steps: [{ values: { [attribute]: 20 } }, { values: { [attribute]: 80 } }] });
+  const compiled = compileTracking(plan([
+    { cue: 1, changes: [{ kind: "phaser", fixtures: "1", phaser: phaser("Dimmer") }] },
+    { cue: 2, changes: [{ kind: "phaser", fixtures: "1", phaser: phaser("dimmer") }] },
+  ]));
+  assert.equal(compiled.executable, true);
+  assert.equal(compiled.cues[1].delta.length, 0);
+  assert.equal(compiled.store.cues[1].hold, true);
+});
