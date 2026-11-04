@@ -128,3 +128,80 @@ test("inapplicable coupled command/MIB requests refuse before any console work",
     assert.equal(h.fake.requests.length, 0);
   }
 });
+
+test("relative Tracking Distance uses the native delta token and checks its mode on readback", async t => {
+  const h = await fixture(); t.after(() => h.close());
+  h.fake.on("fast.context", () => ({ contextKey: "same", environment: "Normal", identityUncertain: [] }));
+  h.fake.on("set", args => {
+    assert.equal(args.ref, "Sequence 1 Cue 3 Part 2");
+    assert.equal(args.property, "TrackingDistance"); assert.equal(args.value, "Δ+2.5");
+    h.part.TrackingDistance = "Δ +2.5";
+    return { value: "Δ +2.5", readOk: true };
+  });
+  const args = { sequence: 1, cue: 3, part: 2, part_settings: { tracking_distance: { delta: 2.5 } } };
+  const accepted = await h.callJson("gma3_configure_cue", args);
+  assert.equal(accepted.isError, false, accepted.text); assert.equal(accepted.result.verification.status, "matched");
+  h.part.TrackingDistance = "";
+  h.fake.on("set", () => { h.part.TrackingDistance = "2.5"; return { value: "2.5", readOk: true }; });
+  const absolute = await h.callJson("gma3_configure_cue", args);
+  assert.equal(absolute.isError, true); assert.equal(absolute.result.verification.status, "mismatched");
+});
+
+async function breakFixture() {
+  const h = await fixture();
+  const targets = { World: { class: "World", addr: "14.1.1", name: "All" }, Filter: { class: "Filter", addr: "14.2.1", name: "All" } };
+  let assigned: (typeof targets)[keyof typeof targets] | null = null;
+  let dynamic = "No";
+  const before = h.fake.handlerFor("objects")!;
+  h.fake.on("fast.context", () => ({ contextKey: "same", environment: "Normal", identityUncertain: [] }));
+  h.fake.on("objects", (a, req) => {
+    if (a.ref === "World 1" || a.ref === "Filter 1") {
+      const kind = String(a.ref).split(" ")[0] as keyof typeof targets;
+      return { total: 1, count: 1, items: [{ ...targets[kind], fields: { HasDynamicFilterRules: dynamic } }] };
+    }
+    if (a.asText === false && String(a.ref).includes(" Cue ") && (a.fields as string[]).includes("Break")) {
+      return { total: 1, count: 1, items: [{ fields: assigned ? { Break: assigned } : {} }] };
+    }
+    return before(a, req);
+  });
+  h.cue.Break = "#FFFFFFFFFFFFFFFF";
+  h.fake.onCommand(command => {
+    if (command.startsWith("Assign World")) assigned = targets.World;
+    else if (command.startsWith("Assign Filter")) assigned = targets.Filter;
+    else if (command === 'Set Sequence 1 Cue 3 Property "Break" ""') assigned = null;
+    else return "Illegal command";
+    h.cue.Break = assigned?.name ?? "#FFFFFFFFFFFFFFFF";
+    return "OK";
+  });
+  return { ...h, setDynamic: (value: string) => { dynamic = value; }, getAssigned: () => assigned };
+}
+
+test("Break uses the exact World/static Filter handle and can clear the native assignment", async t => {
+  const h = await breakFixture(); t.after(() => h.close());
+  for (const target of [{ kind: "world", number: 1 }, { kind: "filter", number: 1 }, null]) {
+    const r = await h.callJson("gma3_configure_cue", { sequence: 1, cue: 3, cue_settings: { break: target } });
+    assert.equal(r.isError, false, r.text);
+    assert.equal(h.getAssigned()?.class.toLowerCase() ?? null, target?.kind ?? null);
+  }
+  assert.deepEqual(h.fake.commands, ["Assign World 1 At Sequence 1 Cue 3", "Assign Filter 1 At Sequence 1 Cue 3", 'Set Sequence 1 Cue 3 Property "Break" ""']);
+});
+
+test("dynamic and unreadable Filter policies refuse all requested setters", async t => {
+  const h = await breakFixture(); t.after(() => h.close());
+  for (const policy of ["Yes", ""]) {
+    h.setDynamic(policy);
+    const r = await h.callJson("gma3_configure_cue", { sequence: 1, cue: 3, cue_settings: { release: "yes", break: { kind: "filter", number: 1 } } });
+    assert.equal(r.isError, true); assert.equal(h.cue.Release, "");
+    assert(!h.fake.requests.some(request => ["cmd", "set"].includes(request.op)));
+  }
+});
+
+test("an ignored Break with the same displayed name fails the exact handle check", async t => {
+  const h = await breakFixture(); t.after(() => h.close());
+  const args = { sequence: 1, cue: 3 };
+  assert.equal((await h.callJson("gma3_configure_cue", { ...args, cue_settings: { break: { kind: "world", number: 1 } } })).isError, false);
+  h.fake.onCommand(() => "OK");
+  const r = await h.callJson("gma3_configure_cue", { ...args, cue_settings: { break: { kind: "filter", number: 1 }, release: "yes" } });
+  assert.equal(r.isError, true); assert.equal(r.result.verification.status, "mismatched");
+  assert.equal(h.cue.Release, "");
+});

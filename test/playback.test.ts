@@ -242,17 +242,17 @@ test("invalid requests are refused before anything is sent", async () => {
 // ---------------------------------------------------------------------------
 
 test("configure_executor writes only the changed functions, reads them back and never starts playback", async () => {
-  const { result, isError } = await h.callJson("gma3_configure_executor", { page: 1, executor: 201, key_press: "temp", key_unpress: "Empty", fader: "Temp", encoder: "Master" });
+  const { result, isError } = await h.callJson("gma3_configure_executor", { page: 2, executor: 305, key_press: "temp", key_unpress: "Empty", fader: "Temp", encoder: "Master" });
   assert.equal(isError, false, JSON.stringify(result));
   assert.equal(result.outcome, "succeeded");
   assert.equal(result.verification.status, "matched");
-  assert.deepEqual(sets(), ["Page 1.201 KeyPress=Temp", "Page 1.201 Fader=Temp"]);
+  assert.deepEqual(sets(), ["Page 2.305 KeyPress=Temp", "Page 2.305 Fader=Temp"]);
   assert.deepEqual(result.intended.unchanged.sort(), ["encoder", "key_unpress"]);
   assert.deepEqual(result.intended.changes.map((c: { key: string; from: string; to: string }) => `${c.key}:${c.from}->${c.to}`), ["key_press:Go+->Temp", "fader:Master->Temp"]);
   assert.deepEqual(result.playback, { activeBefore: false, activeAfter: false });
   assert.equal(result.sequence, "Sequence 5 (14.14.1.7.5)");
   assert.equal(result.sequenceAddr, "14.14.1.7.5");
-  assert.equal(con.pages.get(1)!.execs.get(201)!.props.KeyPress, "Temp");
+  assert.equal(con.pages.get(2)!.execs.get(305)!.props.KeyPress, "Temp");
   assert.equal(h.fake.commands.length, 0);
 });
 
@@ -269,16 +269,16 @@ test("configure_executor detects a setter changing another requested field that 
   const originalSet = h.fake.handlerFor("set")!;
   h.fake.on("set", async (args, req) => {
     const reply = await originalSet(args, req);
-    if (args.ref === "Page 1.201" && args.property === "Encoder") {
-      con.pages.get(1)!.execs.get(201)!.props.Fader = String(args.value);
+    if (args.ref === "Page 2.305" && args.property === "Encoder") {
+      con.pages.get(2)!.execs.get(305)!.props.Fader = String(args.value);
     }
     return reply;
   });
-  const { result, isError } = await h.callJson("gma3_configure_executor", { page: 1, executor: 201, fader: "Master", encoder: "Rate" });
+  const { result, isError } = await h.callJson("gma3_configure_executor", { page: 2, executor: 305, fader: "Master", encoder: "Rate" });
   assert.equal(isError, true, "a changed encoder must not conceal the now-wrong fader");
   assert.equal(result.verification.status, "mismatched");
-  assert.equal(con.pages.get(1)!.execs.get(201)!.props.Fader, "Rate");
-  assert.deepEqual(sets(), ["Page 1.201 Encoder=Rate"], "detect the side effect without blindly replaying setters");
+  assert.equal(con.pages.get(2)!.execs.get(305)!.props.Fader, "Rate");
+  assert.deepEqual(sets(), ["Page 2.305 Encoder=Rate"], "detect the side effect without blindly replaying setters");
 });
 
 test("configure_executor with every value already set sends nothing", async () => {
@@ -366,7 +366,7 @@ test("a value the console silently keeps fails the step, stops the rest and is r
   con.refuse.KeyPress = ["Black"];
   con.refuse.MAKeyPress = ["Black"];
   // Changes are written in parameter order (key_press before fader): the refused first write fails the call.
-  const first = await h.callJson("gma3_configure_executor", { page: 1, executor: 201, fader: "Temp", key_press: "Black", encoder: "Rate" });
+  const first = await h.callJson("gma3_configure_executor", { page: 2, executor: 305, fader: "Temp", key_press: "Black", encoder: "Rate" });
   assert.equal(first.isError, true);
   assert.equal(first.result.outcome, "failed");
   const failed = first.result.steps.find((s: { name: string }) => s.name === "set_key_press");
@@ -376,9 +376,9 @@ test("a value the console silently keeps fails the step, stops the rest and is r
   assert.equal(first.result.verification.status, "mismatched");
   // A refusal after a confirmed write is partial.
   h.fake.requests.length = 0;
-  const { result, isError } = await h.callJson("gma3_configure_executor", { page: 1, executor: 201, key_press: "Toggle", fader: "Temp", encoder: "Rate", ma_key_press: "Black" });
+  const { result, isError } = await h.callJson("gma3_configure_executor", { page: 2, executor: 305, key_press: "Toggle", fader: "Temp", encoder: "Rate", ma_key_press: "Black" });
   assert.equal(isError, true);
-  assert.deepEqual(sets(), ["Page 1.201 KeyPress=Toggle", "Page 1.201 MAKeyPress=Black"]);
+  assert.deepEqual(sets(), ["Page 2.305 KeyPress=Toggle", "Page 2.305 MAKeyPress=Black"]);
   assert.equal(result.outcome, "partial");
   assert.equal(result.steps.find((s: { name: string }) => s.name === "set_fader").status, "skipped");
 });
@@ -772,4 +772,17 @@ test("configure_executor watches the playback of the sequence the executor actua
   assert.deepEqual(result.playback, { activeBefore: true, activeAfter: true });
   const playbackReads = h.fake.requests.filter((r) => r.op === "object").map((r) => r.args.ref);
   assert.deepEqual(playbackReads, ["14.14.2.7.5", "14.14.2.7.5"]);
+});
+
+test("configure_executor refuses conflicting fader-row aliases before any request, including preview and unverified calls", async () => {
+  for (const executor of [201, 204, 290]) {
+    for (const options of [{}, { preview: true }, { verify: false }]) {
+      h.fake.requests.length = 0;
+      const { result, isError } = await h.callJson("gma3_configure_executor", { page: 11, executor, fader: "master", encoder: "Rate", ...options });
+      assert.equal(isError, true, JSON.stringify(result));
+      assert.equal(result.outcome, "failed");
+      assert.match(result.validationErrors.join("; "), /fader.*encoder.*same.*function/i);
+      assert.deepEqual(h.fake.requests, []);
+    }
+  }
 });

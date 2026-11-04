@@ -1,6 +1,6 @@
 import { test, before, after, beforeEach } from "node:test";
 import assert from "node:assert/strict";
-import { registerFixtureTools, attributeCommand, formatValue } from "../src/tools/fixtures.ts";
+import { registerFixtureTools, attributeCommand, expectedPercent, formatValue } from "../src/tools/fixtures.ts";
 import { startHarness, type Harness } from "./helpers/tool-harness.ts";
 import { SILENT } from "./helpers/fake-bridge.ts";
 
@@ -605,6 +605,44 @@ test("read-back: degrees are converted through each fixture's physical range", a
   r = await h.callJson("gma3_set_position", { use_selection: true, pan: 10, unit: "degrees" });
   assert.equal(r.result.verification.status, "unavailable");
   assert.match(r.result.verification.detail, /physical range of Pan is not available/);
+});
+
+test("read-back: captured inverted Zoom ranges use ascending physical programmer percent", async () => {
+  // Native Ultra witness: implicit Physical 7.8 deg gave GetProgPhaser.absolute 2.7522921562195,
+  // while its DMX channel-function endpoints are 50.2 -> 6.6. Forte Physical 5 gave 0 with 55 -> 5.
+  for (const capture of [
+    { fid: "101", sf: 54, physical: 7.8, percent: 2.7522921562195, from: 50.2, to: 6.6 },
+    { fid: "2001", sf: 1791, physical: 5, percent: 0, from: 55, to: 5 },
+  ]) {
+    script({ selectionCount: 1, attributes: ["Zoom"], programmer: {
+      scanned: [{ subfixtureIndex: capture.sf, fid: capture.fid, name: `Fx ${capture.fid}` }],
+      rows: [row(capture.fid, capture.sf, "Zoom", capture.percent, { physicalFrom: capture.from, physicalTo: capture.to, physicalUnit: "Angle", readout: "Physical" })],
+    } });
+    const r = await h.callJson("gma3_set_attribute", { use_selection: true, attribute: "Zoom", value: capture.physical, unit: "physical" });
+    assert.equal(r.result.verification.status, "matched", r.result.verification.detail);
+  }
+});
+
+test("read-back: an inverted physical mismatch displays the ascending programmer value", async () => {
+  script({ selectionCount: 1, attributes: ["Zoom"], programmer: {
+    scanned: [{ subfixtureIndex: 1791, fid: "2001", name: "Fx 2001" }],
+    rows: [row("2001", 1791, "Zoom", 0, { physicalFrom: 55, physicalTo: 5, physicalUnit: "Angle", readout: "Physical" })],
+  } });
+  const r = await h.callJson("gma3_set_attribute", { use_selection: true, attribute: "Zoom", value: 6, unit: "physical" });
+  assert.equal(r.result.verification.status, "mismatched");
+  assert.match(r.result.verification.detail, /Zoom reads 0 % of range = 5 Angle, expected 2 % \(6 physical\)/);
+});
+
+test("physical programmer normalization preserves ascending, unity, explicit percent and empty ranges", () => {
+  const zoom = row("1", 1, "Zoom", 0, { physicalFrom: 5, physicalTo: 55, readout: "Physical" });
+  for (const metadata of [zoom, { ...zoom, physicalFrom: 55, physicalTo: 5 }]) {
+    assert.deepEqual(expectedPercent({ attribute: "Zoom", value: 20, unit: "physical" }, metadata), { percent: 30 });
+    assert.deepEqual(expectedPercent({ attribute: "Zoom", value: 20, unit: "natural" }, metadata), { percent: 30 });
+    assert.deepEqual(expectedPercent({ attribute: "Zoom", value: 20, unit: "percent" }, metadata), { percent: 20 });
+  }
+  assert.deepEqual(expectedPercent({ attribute: "Dimmer", value: 0.65, unit: "physical" }, row("1", 1, "Dimmer", 65)), { percent: 65 });
+  assert.deepEqual(expectedPercent({ attribute: "Zoom", value: 5, unit: "physical" }, { ...zoom, physicalFrom: 0, physicalTo: 0 }), { reason: "the physical range of Zoom is empty (0..0)" });
+  assert.deepEqual(expectedPercent({ attribute: "Zoom", value: 5, unit: "physical" }, { ...zoom, physicalFrom: null }), { reason: "the physical range of Zoom is not available for this fixture" });
 });
 
 test("read-back: decimal and readout units are interpreted; an unknown readout is unavailable", async () => {

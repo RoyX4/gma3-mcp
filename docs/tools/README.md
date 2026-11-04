@@ -23,6 +23,8 @@ the live test procedure on a disposable show.
 | Looks, presets and release (SU-05; preset read-back needs bridge 0.27.0) | `gma3_set_attributes`, `gma3_apply_preset`, `gma3_release_attributes` | [fixtures.md](fixtures.md) |
 | Cue storage and editing (FR-04, FR-05) | `gma3_store_cue`, `gma3_store_cue_part`, `gma3_set_cue_timing`, `gma3_set_cue_trigger`, `gma3_goto_cue`, `gma3_delete_cue` | [cues.md](cues.md) |
 | Native cue/part settings and tracking controls | `gma3_cue_settings`, `gma3_configure_cue`, `gma3_configure_sequence` | [cue-settings.md](cue-settings.md) |
+| Scoped edits across existing cues | `gma3_edit_cue_values` | [cue-range-edits.md](cue-range-edits.md) |
+| Scoped native Block and Unblock | `gma3_cue_tracking_action` | [cue-tracking-actions.md](cue-tracking-actions.md) |
 | Cue lists and chases in batches (SU-06; built in Preview, needs `exclusive: true`; preset read-back needs bridge 0.27.0) | `gma3_store_cues`, `gma3_edit_cues`, `gma3_build_chase` | [cuelists.md](cuelists.md) |
 | Executors (FR-06) | `gma3_assign_to_executor`, `gma3_label_executor` | [executors.md](executors.md) |
 | Structured inspection (FR-07 .. FR-10) | `gma3_fixture_attributes`, `gma3_programmer`, `gma3_fixture_output`, `gma3_dmx`, `gma3_cue_contents` | [inspection.md](inspection.md) |

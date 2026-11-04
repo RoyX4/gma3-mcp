@@ -34,6 +34,8 @@ import { registerWorkspaceUiTools } from "./tools/workspace-ui.js";
 import { COMMAND_FALLBACK_NOTE, LUA_FALLBACK_NOTE, serverInstructions } from "./discovery.js";
 import { registerCueTools } from "./tools/cues.js";
 import { registerCueSettingsTools } from "./tools/cue-settings.js";
+import { registerCueRangeEditTools } from "./tools/cue-range-edits.js";
+import { registerCueTrackingActionTools } from "./tools/cue-tracking-actions.js";
 import { registerExecutorTools } from "./tools/executors.js";
 import { registerInspectionTools } from "./tools/inspection.js";
 import { registerInputTools } from "./tools/input.js";
@@ -712,6 +714,8 @@ server.registerTool(
 registerFixtureTools(server, toolContext);
 registerCueTools(server, toolContext);
 registerCueSettingsTools(server, toolContext);
+registerCueRangeEditTools(server, toolContext);
+registerCueTrackingActionTools(server, toolContext);
 registerExecutorTools(server, toolContext);
 registerInspectionTools(server, toolContext);
 // KB-05: gated structured input (console keys, text, sequences). Everything dispatches in the Lua

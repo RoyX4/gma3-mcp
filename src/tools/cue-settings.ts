@@ -1,22 +1,26 @@
 /** Native metadata edits. These never store the programmer or trigger playback. */
 import { z } from "zod";
+import { parseNativeTrackingDistance } from "../native-cues.js";
 import { cueNumber, objectName } from "../validate.js";
-import { asRead, buildResult, compareFields, notRequested, requestStep, stepFromError, timeToSeconds, unavailable,
+import { asRead, buildResult, commandStep, compareFields, notRequested, requestStep, stepFromError, timeToSeconds, unavailable,
   validationFailure, type StepResult, type Verification } from "../results.js";
 import { readFields, cueRef, sequenceRef } from "./common.js";
 import { json, operation, type RegisterTools, type ToolContext } from "./context.js";
 import { dataPoolShape, inDataPool } from "./datapool.js";
 import { lockState } from "./playback.js";
 import { checkCommandVariables, cueCommand } from "./cuelists.js";
+import { cueBreakSchema, readCueBreak, resolveCueBreak, sameCueBreak, type BreakPlan } from "./cue-break.js";
+import { readCueContextKey } from "./cue-tracking-actions.js";
 
 const cueNo = z.union([z.number(), z.string()]).transform((v, ctx) => {
   try { return cueNumber("cue", v)!; } catch (err) { ctx.addIssue({ code: "custom", message: String(err) }); return z.NEVER; }
 });
-const endpoint = z.union([cueNo, z.literal("none")]);
+const endpoint = z.union([cueNo, z.object({ delta: cueNo }).strict(), z.literal("none")]);
 const seconds = z.number().finite().min(0).max(3600);
 const cueShape = {
   release: z.enum(["default", "yes"]).optional().describe("yes explicitly releases tracked values here; default clears the explicit flag. First-cue behavior can still inherit ReleaseFirstCue."),
   assert: z.enum(["none", "assert", "x_assert"]).optional(),
+  break: cueBreakSchema.optional().describe("A World or confirmed static Filter that protects this cue from subsequent tracking edits. null clears."),
   allow_duplicates: z.boolean().optional(),
   mib_preference: z.enum(["never", "worst", "bad", "normal", "good", "best"]).optional(),
   note: z.string().max(1024).transform(v => v.trim()).optional(),
@@ -24,7 +28,7 @@ const cueShape = {
 };
 const partShape = {
   name: z.string().optional(),
-  tracking_distance: endpoint.optional().describe("Inclusive ending cue number, NOT a cue count. none clears it. Delta syntax is not qualified."),
+  tracking_distance: endpoint.optional().describe("Inclusive ending cue number or {delta: number} measured from the starting cue number. none clears it."),
   command: z.string().optional().describe("Stored command text; setting it does not execute it. Empty string clears."),
   command_enabled: z.boolean().optional(),
   command_delay: seconds.optional(),
@@ -68,7 +72,7 @@ const cueFields = ["Lock", "No", "Break", "TrigType", "TrigTime", ...Object.valu
 const partFields = ["Lock", "Part", "CueInFade", "CueInDelay", "CueOutFade", "CueOutDelay", "SnapDelay", "Duration", ...Object.values(PART_DEFS).map(d => d.property)];
 const notes = ["Properties are read in the native Edit role. Empty Release is the explicit default; ReleaseFirstCue can still supply the first cue's effective release.",
   "Stored settings are separate from resulting playback. Sequence CueCommand/MIB policies can override part settings. No Store, Goto, Go, Load or programmer change is performed.",
-  "Break assignments, delta Tracking Distance and read-only Duration are not writable through this tool. Missing properties stay unavailable."];
+  "Break assignments protect future edits. Duration remains read-only. Missing properties stay unavailable."];
 const defined = (fields: string[], raw: Record<string, unknown>) => Object.fromEntries(fields.map(k => [k, raw[k] ?? null]));
 
 async function settings(ctx: ToolContext, target: z.infer<z.ZodObject<typeof targetShape>>) {
@@ -84,11 +88,21 @@ interface Change { ref: string; property: string; value: unknown; time?: boolean
 function changes(ref: string, values: Record<string, unknown> | undefined, defs: Record<string, Def>): Change[] {
   return Object.entries(values ?? {}).map(([key, input]) => {
     const d = defs[key];
+    if (key === "tracking_distance" && typeof input === "object" && input !== null) {
+      return { ref, property: d.property, value: `Δ+${(input as { delta: string }).delta}` };
+    }
     const value = d.values ? d.values[String(input)] : typeof input === "boolean" ? input ? "Yes" : "No" : d.clear && input === "none" ? "" : d.time && input === "default" ? "Default" : key === "name" ? objectName("name", input)! : key === "command" ? cueCommand("command", input)! : input;
     return { ref, property: d.property, value, time: d.time };
   });
 }
 function compare(change: Change, actual: unknown): Verification {
+  if (change.property === "TrackingDistance" && change.value !== "") {
+    const expected = parseNativeTrackingDistance(change.value);
+    const observed = parseNativeTrackingDistance(actual);
+    const matches = expected !== null && observed !== null && expected.relative === observed.relative && expected.milli === observed.milli;
+    return { status: matches ? "matched" : "mismatched", expected: change.value, actual,
+      ...(matches ? {} : { detail: "TrackingDistance mode or numeric value differs from the request" }) };
+  }
   if (["Name", "Note", "Command"].includes(change.property)) return {
     status: typeof actual === "string" && actual === change.value ? "matched" : "mismatched",
     checked: `${change.ref}.${change.property} (exact text)`, expected: change.value, actual,
@@ -106,28 +120,61 @@ export async function configureCue(ctx: ToolContext, raw: unknown) {
   if (!parsed.success) return validationFailure("configure_cue", {}, parsed.error.issues.map(i => i.message));
   const args = parsed.data, target = { sequence: args.sequence, cue: args.cue, part: args.part };
   ctx = inDataPool(ctx, args);
-  const plan = [...changes(cueRef(args.sequence, args.cue), args.cue_settings, CUE_DEFS), ...changes(cueRef(args.sequence, args.cue, args.part), args.part_settings, PART_DEFS)];
+  const cue = cueRef(args.sequence, args.cue);
+  const { break: breakRequest, ...cueSettings } = args.cue_settings ?? {};
+  const distance = args.part_settings?.tracking_distance;
+  const guarded = breakRequest !== undefined || typeof distance === "object";
+  const plan = [...changes(cue, cueSettings, CUE_DEFS), ...changes(cueRef(args.sequence, args.cue, args.part), args.part_settings, PART_DEFS)];
   return ctx.mutations.run(async () => {
     const steps: StepResult[] = [];
     let before: Awaited<ReturnType<typeof settings>>;
+    let identity: string | undefined;
+    let breakPlan: BreakPlan | undefined;
+    let breakBefore: Awaited<ReturnType<typeof readCueBreak>> = null;
+    const confirmContext = async () => {
+      if (identity !== undefined && await readCueContextKey(ctx) !== identity) throw new Error("Console context changed during the cue edit");
+    };
     try {
+      if (guarded) identity = await readCueContextKey(ctx);
       before = await settings(ctx, args);
       for (const [owner, values] of Object.entries(before)) {
         if (lockState(values.Lock) !== false) throw new Error(`${owner} is locked or its lock state is unavailable; no settings changed`);
       }
+      if (breakRequest !== undefined) {
+        breakPlan = await resolveCueBreak(ctx, cue, breakRequest);
+        breakBefore = await readCueBreak(ctx, cue, before.cueSettings.Break);
+      }
+      await confirmContext();
       steps.push(asRead({ name: "read_settings", status: "succeeded", op: "objects" }));
     } catch (err) {
       steps.push(asRead(stepFromError("read_settings", err)));
       return buildResult({ operation: "configure_cue", target, steps, verification: unavailable(String(err)), extra: { notes } });
     }
-    if (args.preview) return buildResult({ operation: "configure_cue", target, steps, verification: notRequested(), extra: { preview: true, before, plan, notes } });
+    if (args.preview) return buildResult({ operation: "configure_cue", target, steps, verification: notRequested(), extra: { preview: true, before, plan, ...(breakPlan ? { breakPlan, breakBefore } : {}), notes } });
     if (args.part_settings?.command !== undefined) {
       const check = await checkCommandVariables(ctx.bridge, [{ label: "part command", command: args.part_settings.command }], ctx.requestTimeoutMs);
       steps.push(check);
       if (check.status !== "succeeded") return buildResult({ operation: "configure_cue", target, steps });
     }
+    if (breakPlan && !sameCueBreak(breakBefore, breakPlan.expected)) {
+      try {
+        await confirmContext();
+        const step = await commandStep(ctx.bridge, "set_Break", breakPlan.command, ctx.requestTimeoutMs);
+        steps.push(step);
+        if (step.status === "succeeded") {
+          const actual = await readCueBreak(ctx, cue);
+          await confirmContext();
+          const matched = sameCueBreak(actual, breakPlan.expected);
+          steps.push(asRead({ name: "verify_Break", status: matched ? "succeeded" : "failed", op: "objects",
+            detail: { expected: breakPlan.expected, actual }, ...(matched ? {} : { error: "The exact native Break handle differs" }) }));
+        }
+      } catch (error) { steps.push(asRead(stepFromError("verify_Break", error))); }
+    }
     for (const change of plan) {
+      if (steps.some(step => step.status !== "succeeded")) break;
       if (compare(change, actualFrom(before, change)).status === "matched") continue;
+      try { await confirmContext(); }
+      catch (error) { steps.push(asRead(stepFromError("check_context", error))); break; }
       const step = await requestStep(ctx.bridge, `set_${change.property}`, "set", { ref: change.ref, property: change.property, value: change.value }, result => {
         const r = result as { value?: unknown; readOk?: boolean } | null;
         if (!r || r.readOk === false) return { name: `set_${change.property}`, op: "set", status: "unknown", detail: result,
@@ -141,13 +188,21 @@ export async function configureCue(ctx: ToolContext, raw: unknown) {
     }
     let verification: Verification;
     let after: Awaited<ReturnType<typeof settings>> | undefined;
+    let breakAfter: Awaited<ReturnType<typeof readCueBreak>> | undefined;
     try {
+      await confirmContext();
       after = await settings(ctx, args);
       const checks = plan.map(c => compare(c, actualFrom(after!, c)));
+      if (breakPlan) {
+        breakAfter = await readCueBreak(ctx, cue, after.cueSettings.Break);
+        const matched = sameCueBreak(breakAfter, breakPlan.expected);
+        checks.push({ status: matched ? "matched" : "mismatched", ...(matched ? {} : { detail: "The exact native Break handle differs" }) });
+      }
+      await confirmContext();
       verification = { status: checks.every(v => v.status === "matched") ? "matched" : "mismatched", checked: "All requested final cue and part settings, including initially unchanged fields", expected: plan,
         actual: after, ...(checks.some(v => v.status !== "matched") ? { detail: checks.filter(v => v.status !== "matched").map(v => v.detail).join("; ") } : {}) };
     } catch (err) { verification = unavailable(String(err), "Final requested settings"); }
-    return buildResult({ operation: "configure_cue", target, steps, verification, extra: { before, after, notes } });
+    return buildResult({ operation: "configure_cue", target, steps, verification, extra: { before, after, ...(breakPlan ? { breakBefore, breakExpected: breakPlan.expected, breakAfter } : {}), notes } });
   });
 }
 
@@ -159,5 +214,5 @@ export const registerCueSettingsTools: RegisterTools = (server, ctx) => {
     try { return json({ target: parsed.data, ...await settings(inDataPool(ctx, parsed.data), parsed.data), notes }); }
     catch (err) { return { isError: true, content: [{ type: "text", text: String(err) }] }; }
   });
-  server.registerTool("gma3_configure_cue", { title: "Configure an existing cue or part", description: "Change only requested native cue/part settings on an existing explicit sequence/cue/part. Includes Release/Assert, MIB preference, duplicates, notes, sound band, part name, tracking endpoint, command settings, transition and MIB. preview:true only reads. Refuses locked/unknown-lock sequences. Always checks setter replies and all requested final fields, stops after first failed/uncertain write, never retries. Does not Store programmer contents or play cues. Use existing timing/trigger tools for fade/delay/trigger; configure_sequence for Tracking on/off. No Break assignment or delta distance support.", inputSchema: configureShape }, args => operation(() => configureCue(ctx, args)));
+  server.registerTool("gma3_configure_cue", { title: "Configure an existing cue or part", description: "Change only requested native cue/part settings on an existing explicit sequence/cue/part. Includes Release/Assert, Break World/static Filter assignment, MIB preference, duplicates, notes, sound band, part name, absolute or delta tracking distance, command settings, transition and MIB. preview:true only reads. Refuses locked/unknown-lock sequences. Always checks setter replies and all requested final fields, stops after first failed/uncertain write, never retries. Use existing timing/trigger tools for fade/delay/trigger and configure_sequence for Tracking on/off.", inputSchema: configureShape }, args => operation(() => configureCue(ctx, args)));
 };

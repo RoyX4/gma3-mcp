@@ -1,18 +1,23 @@
 import { z } from "zod";
 import { nativeContentFingerprint, reconstructNativeCues } from "../native-cues.js";
+import { readNativeCueContent } from "../native-cue-reader.js";
 import { json, type RegisterTools } from "./context.js";
 
 export const registerNativeCueTools: RegisterTools = (server, ctx) => {
   server.registerTool("gma3_native_cue_data", {
     title: "Read actual stored cue channels",
-    description: "READ ONLY: read a sequence's actual hard cue-part channels through GetPresetData, including absolute/relative steps, preset links, native flags and raw content fingerprints. Conservatively reconstruct sequence-owned tracked layers with source cue/part. Numeric part tracking-distance endpoints and cue Release are reconstructed; unknown distance formats or incomplete data prevent a complete claim. Break/Shield future edit protection and Assert playback arbitration are outside this stored-layer scope. Final output arbitration, live fades and physical light are outside this read. Does not select, Go, load or change cues.",
+    description: "READ ONLY: read a sequence's actual hard cue-part channels through GetPresetData, including absolute/relative steps, preset links, native flags and raw content fingerprints. Uses bounded frozen cue pages on a supporting bridge, or a complete legacy read for a small sequence. Conservatively reconstructs sequence-owned tracked layers with source cue/part. Unknown distance formats or incomplete data prevent a complete claim. Break/Shield future edit protection and Assert playback arbitration are outside this stored-layer scope. Final output arbitration, live fades and physical light are outside this read. Does not select, Go, load or change cues.",
     inputSchema: { sequence: z.number().int().min(1).max(99999), data_pool: z.number().int().min(1).max(99999).optional(), include_raw: z.boolean().default(false) },
     annotations: { readOnlyHint: true, destructiveHint: false },
   }, async args => {
     try {
       const ref = `${args.data_pool === undefined ? "" : `DataPool ${args.data_pool} `}Sequence ${args.sequence}`;
       const before = await ctx.bridge.request<Record<string, unknown>>("fast.context", {}, ctx.requestTimeoutMs);
-      const native = await ctx.bridge.request<Record<string, unknown>>("cue.content", { ref }, ctx.requestTimeoutMs);
+      const context = typeof before.contextKey === "string" ? {
+        contextKey: before.contextKey,
+        environment: typeof before.environment === "string" ? before.environment : undefined,
+      } : undefined;
+      const native = await readNativeCueContent(ctx.bridge, ref, ctx.requestTimeoutMs, { context });
       const after = await ctx.bridge.request<Record<string, unknown>>("fast.context", {}, ctx.requestTimeoutMs);
       const certain = (value: Record<string, unknown>) => Array.isArray(value.identityUncertain) && value.identityUncertain.length === 0;
       const contextMatched = typeof before.contextKey === "string" && before.contextKey === after.contextKey && certain(before) && certain(after)

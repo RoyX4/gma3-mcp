@@ -47,11 +47,15 @@ Cancellation is cooperative. An already-dispatched batch completes its guarded w
 
 New jobs default to 12 cues per batch, selected from the [matched native benchmark](../programming-performance.md#matched-native-intel-lab-matrix-2026-10-30). Explicit `batch_size:3` or `6` remains available when quicker cancellation checkpoints matter. Existing journals keep their stored batch size when read, resumed or rebound; this default does not rewrite them. Every batch retains the same complete fresh before/after native content and dependency checks, durable intent and no-replay rules.
 
-The maintained native reader is bounded to 500 cue objects, including internal cues. Plans with 500
-or more authored cues refuse at the checkpoint preflight before native work, instead of starting a
-chain that will exceed complete-read coverage. Offline compilation remains available for larger
-plans. A consistent paged reader is still required for larger single-sequence jobs; the bound does
-not guarantee every smaller plan fits other native response/data limits.
+The maintained bridge captures complete native cue content in frozen pages. A job checks for
+paging support before programming if the authored cue count plus internal cues could exceed the
+legacy 500-object read. The compiler supports up to 10,000 authored cues, and the new reader allows
+10,002 native objects including the two internal cues. Capture time, memory, part and raw-data
+bounds still apply. A large or dense checkpoint with incomplete coverage stops the job.
+
+The updated bridge records actual part identities and Allow Duplicates. An older occupied
+checkpoint can fail exact comparison after a bridge upgrade if its recorded fields differ.
+Keep the existing journal and use a reviewed continuation when exact evidence is unavailable.
 
 Only a fully successful batch with matched verification, untouched Normal programmer and matched per-cue receipts advances `verifiedCues`. A failed batch remains available for inspection. A dispatched unknown mutation is `uncertain` and is never replayed. A crash with an in-flight marker is also uncertain, even if some cues may have stored successfully.
 

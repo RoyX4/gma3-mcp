@@ -573,6 +573,11 @@ export async function configureExecutor(ctx: ToolContext, raw: ConfigureExecutor
   const preview = raw.preview === true;
   const verify = raw.verify !== false;
   const target: Record<string, unknown> = { page: raw.page, executor: raw.executor };
+  // Fader and Encoder can be aliases on native fader-row executors.
+  if (executor !== undefined && executor >= 201 && executor <= 290
+      && wanted.fader !== undefined && wanted.encoder !== undefined && wanted.fader !== wanted.encoder) {
+    v.errors.push("fader and encoder must request the same function on fader-row executors 201–290");
+  }
   if (v.ok && Object.keys(wanted).length === 0 && fix === undefined && lock === undefined) v.errors.push("nothing to configure: give at least one function, fix or lock");
   if (!v.ok || page === undefined || executor === undefined) return validationFailure(op, target, v.errors);
   const ref = executorRef(page, executor);
@@ -954,6 +959,7 @@ export const registerPlaybackTools: RegisterTools = (server, ctx) => {
       title: "Configure a sequence executor's functions",
       description:
         "Set the key, MA-key, fader and encoder functions and Fix of the sequence executor at Page <p>.<e> by writing its properties (KeyPress, KeyUnpress, MAKeyPress, MAKeyUnpress, Fader, Encoder, EncoderLeft, EncoderRight, Fix; " +
+        "On fader-row executors 201–290, Fader and Encoder can alias. When both are supplied they must request the same function. " +
         "unlike 'Assign <function> At', this never clears the unpress function). The executor must hold a sequence; functions are validated against the sequence lists before anything is sent (keys: Flash, Temp, Swap, Black and Time are key-only). " +
         "Executor settings belong to this executor only; sequence settings (Wrap Around, priority, ...) are configured with gma3_configure_sequence. lock: true/false sets the executor's own Lock. A page lock also blocks executor changes. " +
         COMMON,

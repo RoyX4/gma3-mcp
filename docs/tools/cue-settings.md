@@ -56,6 +56,7 @@ setter replies and the requested final settings.
 | --- | --- | --- |
 | `release` | `"default"`, `"yes"` | `Release`; `default` clears the explicit flag. |
 | `assert` | `"none"`, `"assert"`, `"x_assert"` | `Assert`; `none` clears it, `x_assert` writes `X-Assert`. |
+| `break` | `{ "kind": "world" \| "filter", "number": 1 }` or `null` | `Break`; assign an existing World or a Filter confirmed static. `null` clears the assignment. |
 | `allow_duplicates` | boolean | `AllowDuplicates`; false clears the flag. |
 | `mib_preference` | `"never"`, `"worst"`, `"bad"`, `"normal"`, `"good"`, `"best"` | `MIBPreference` |
 | `note` | string, at most 1024 characters | `Note`; trimmed, and an empty string clears it. |
@@ -69,7 +70,7 @@ The exact inverted sound choices are `InvAll`, `InvBass`, `InvMid`, `InvHigh`, a
 | Field | Accepted value | Native property |
 | --- | --- | --- |
 | `name` | nonempty validated name, at most 200 characters | `Name`; Part 0 supplies the cue's main name. See [name restrictions](cues.md#common-behaviour). |
-| `tracking_distance` | positive cue number/string, or `"none"` | `TrackingDistance`; an inclusive ending cue number, not a cue count. |
+| `tracking_distance` | positive cue number/string, `{ "delta": 2.5 }`, or `"none"` | `TrackingDistance`; an inclusive absolute ending cue number or a numeric offset from the starting cue. |
 | `command` | one command line, at most 1024 characters | `Command`; trimmed, balanced quotes, no control characters; empty clears. |
 | `command_enabled` | boolean | `CommandEnabled` |
 | `command_delay` | finite seconds, 0–3600 | `CommandDelay` |
@@ -124,11 +125,16 @@ See [native cue data](native-cues.md) and [tracking changes](tracking.md#change-
 
 ## Tracking Distance and policy overrides
 
-`tracking_distance: 4` means that this Part's temporary values can track **through Cue 4**. It does not
-mean “four cues after this one.” The endpoint may be a fractional cue number and need not itself exist.
-After the endpoint, the preceding still-valid value can resume. `"none"` clears the endpoint. Delta syntax
-is not supported by this tool. Read back the stored endpoint and inspect [native cue data](native-cues.md)
-when checking resulting inherited fixture state.
+`tracking_distance: 4` sets the inclusive endpoint to **Cue 4**. For Cue 3, `tracking_distance: {"delta": 2.5}`
+sets the inclusive endpoint to **Cue 5.5**. A delta follows the starting cue if its number changes.
+The endpoint can fall between existing cues. After that endpoint, the preceding still-valid value can
+resume. `"none"` clears the setting. The tool verifies the distance mode and value from the native readback.
+[MA Tracking Distance](https://help.malighting.com/grandMA3/2.5/HTML/cue_tracking_distance.html)
+
+Break assigns a World or static Filter to protect this cue from later tracking edits. The tool checks
+the Filter's `HasDynamicFilterRules` property before assigning it. The readback checks the native
+object class and address, since a World and a Filter can share a display name. Use `break: null` to clear it.
+[MA Break](https://help.malighting.com/grandMA3/2.5/HTML/cue_tracking_break.html)
 
 MIB means Move In Black: preparing non-dimmer attributes while the fixture is dark. The stored Part mode
 and the Cue's MIB preference are inputs to that behavior. Sequence `mib_policy` can suppress or force MIB;
@@ -157,11 +163,8 @@ active, then disable it in a separate call. Contradictory combined requests refu
   MCP servers can still change the console; this is not an atomic console transaction.
 - No Store, programmer change, Goto, Go, Load, playback command or Save is sent. Existing fade/delay and
   trigger edits remain in the [cue tools](cues.md). Changing live show properties can affect later playback.
-- `Break` is readable, but assigning a Filter/World handle is not implemented here. `Duration` is read-only.
-  Delta Tracking Distance is also unsupported. None is accepted as a configure field.
-- Block, CueOnly and Tracking Shield are programming actions or Store options, not editable cue boolean
-  flags. This settings API does not implement those native actions. The owned tracking compiler's `block`
-  and `cue_only` modes have their separate, bounded [semantics](tracking.md#execution-and-current-limits).
+- `Duration` is read-only. For scoped native Block and Unblock, use `gma3_cue_tracking_action`.
+  [Cue tracking actions](cue-tracking-actions.md)
 
 Representative native checks on an isolated grandMA3 onPC 2.5.1.1 show confirmed Tracking off/on; Cue
 Release yes/default; X-Assert/none; duplicate flags on/off; MIB preference good/normal; note set/clear;

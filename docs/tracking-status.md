@@ -57,10 +57,10 @@ old receipts or replaying uncertain mutations.
 
 | Area | Current boundary |
 | --- | --- |
-| Existing-show editing | Existing cue metadata/settings and explicit-look merge/overwrite are supported, with native Cue Only/Shield Store options. Automatic adoption of arbitrary cue chains into compiler jobs is not implemented; new owned jobs require an absent or empty sequence. |
-| Large chains | Offline analysis accepts up to 10,000 planned cues, subject to its state limits. The maintained native checkpoint scan covers at most 500 cue objects, including internal cues. Jobs with 500 or more authored cues now refuse before native work. A paged, consistent reader is still needed; smaller jobs also require complete observed coverage. |
-| Native tracking controls | Sequence Tracking can be switched on/off. Cue Release/Assert and part Tracking Distance endpoints are configurable. Native Store Cue Only/Shield options are exposed separately. Break assignment, delta distance and ambiguous multipart reconstruction remain gaps; the compiler does not simulate every future-edit behavior. |
-| Blocks | Owned-state materialization is implemented. A native all-channel Block over unknown/unowned data is not equivalent and is not generated. |
+| Existing-show editing | [Scoped cue range edits](tools/cue-range-edits.md) apply values to explicit fixtures, attributes, cues and parts. Preview lists potential downstream impact. Apply checks native content after each Store and verifies protected stored and inherited layers. Owned compiler jobs still require an absent or empty sequence. |
+| Large chains | Maintained native checkpoints assemble frozen pages, up to 10,002 cue objects including internal cues. Dense cue data and time, part, byte and reconstruction limits still apply. Large jobs check paging support before writing. |
+| Native tracking controls | Sequence Tracking, Cue Release/Assert, Break World/static Filter and absolute/relative part Tracking Distance are configurable. Native Store Cue Only/Shield options are separate operations. Duplicate parts are evaluated per layer only with confirmed Allow Duplicates and supported distance semantics. |
+| Blocks | [Native Block/Unblock](tools/cue-tracking-actions.md) supports scoped static main-part data and compares effective and stored values. The console refused the tested explicit Part Block form. Complex unsupported cells remain outside this action's scope. |
 | Effects and units | Actual phase continuity, restart/distribution, richer repetition and physical-unit conversions need the stated native calibration/qualification. Unsupported comparisons remain unavailable. |
 | Stage output | The winning mix of sequences, priorities, masters, fades, programmer and hardware output is outside the sequence-owned tracking model. |
 

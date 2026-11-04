@@ -7,21 +7,60 @@ const plan = () => compileTracking({ version: 1, sequence: 500, data_pool: 2, cu
 const context = { identity: { generation: "1", showfile: "Private.show", hostname: "lab", user: "user", profile: "profile" }, contextKey: "same", environment: "Normal", identityUncertain: [], observedAt: 0, atomic: false };
 const patch = (h: Awaited<ReturnType<typeof startHarness>>) => h.fake.on("patch.collections", () => ({ live: ["Stages", "FixtureTypes", "AttributeDefinitions"] })).on("patch.fingerprint", (a) => ({ collection: a.collection, hash: "stable", objects: 10, complete: true, ms: Math.random() * 100 }));
 
-test("oversized tracking chains refuse before native work rather than outgrowing checkpoint coverage", async () => {
+test("old native bridges refuse a large tracking chain before programming", async () => {
   const h = await startHarness(() => {});
   try {
-    h.fake.on("fast.context", () => context).on("objects", () => ({ items: [] }));
-    patch(h);
+    h.fake.on("cue.content", () => { throw new Error("ref is required"); });
     for (const count of [500, 501]) {
       const compilation = compileTracking({ version: 1, sequence: 500, data_pool: 2,
         cues: Array.from({ length: count }, (_, i) => ({ cue: i + 1, hold: true })),
       });
       assert.equal(compilation.executable, true, "large plans remain available for offline analysis");
-      await assert.rejects(() => observeSequence(h.ctx, compilation), /500.*cue.*paginated/i);
+      await assert.rejects(() => observeSequence(h.ctx, compilation), /native cue paging.*required/i);
     }
-    assert.deepEqual(h.fake.requests, []);
+    assert.deepEqual(h.fake.requests.map(r => [r.op, r.args.action]), [["cue.content", "capabilities"], ["cue.content", "capabilities"]]);
     assert.deepEqual(h.fake.commands, []);
   } finally { await h.close(); }
+});
+
+test("large tracking checkpoints cover the last native page and compare its owned state", async t => {
+  const h = await startHarness(() => {});
+  t.after(() => h.close());
+  h.fake.on("fast.context", () => context).on("objects", () => ({ items: [{ name: "Sequence 500" }] }));
+  patch(h);
+  const compilation = compileTracking({ version: 1, sequence: 500, data_pool: 2,
+    cues: Array.from({ length: 501 }, (_, i) => i === 0 || i === 500
+      ? { cue: i + 1, changes: [{ kind: "value", fixtures: "1", attribute: "Dimmer", value: i === 0 ? 30 : 60 }] }
+      : { cue: i + 1, hold: true }),
+  });
+  assert.equal(compilation.executable, true);
+  let lastValue = 60;
+  const capture = () => Array.from({ length: 501 }, (_, i) => {
+    const rows = i === 0 || i === 500 ? [{ fixture: "1", attribute: "Dimmer", hasAbsolute: true, value: i === 0 ? 30 : lastValue }] : [];
+    return { addr: `Cue.${i + 1}`, no: (i + 1) * 1000, parts: [{ no: 0, contentJson: JSON.stringify({ byFixtures: true, truncated: false, rows }) }] };
+  });
+  let frozen = capture();
+  h.fake.on("cue.content", a => {
+    if (a.action === "capabilities") return { protocol: "gma3-cue-snapshot-v1", frozen: true, maxCueObjects: 10002, maxPageCues: 200 };
+    if (a.action === "release") return { released: true };
+    const offset = a.action === "create" ? 0 : Number(String(a.cursor).split("/").at(-1));
+    if (offset === 0) frozen = capture();
+    const cues = frozen.slice(offset, offset + 200);
+    return { ref: "DataPool 2 Sequence 500", source: "GetPresetData(CuePart,false,true)", complete: true, limitations: [],
+      sequence: { fields: { Tracking: "Yes" } }, cues, protocol: "gma3-cue-snapshot-v1", snapshotId: "large", contextKey: "same", environment: "Normal",
+      frozen: true, atomic: false, capturedAt: 1, expiresAt: 61, total: frozen.length, capturedCount: frozen.length, offset, count: cues.length,
+      ...(offset === 0 ? { cueOrder: frozen.map(c => c.addr) } : {}), nextCursor: offset + cues.length < frozen.length ? `large/${offset + cues.length}` : null };
+  });
+  const a = await observeSequence(h.ctx, compilation, 501);
+  assert.equal(a.complete, true);
+  assert.equal((a.detail as { existingCueCount: number }).existingCueCount, 501);
+  assert.equal(a.semanticVerification?.status, "matched");
+  lastValue = 61;
+  const b = await observeSequence(h.ctx, compilation, 501);
+  assert.equal(b.semanticVerification?.status, "mismatched");
+  assert.match(b.semanticVerification?.detail ?? "", /Cue 501/);
+  assert.notEqual(a.contentFingerprint, b.contentFingerprint);
+  assert.equal(h.fake.commands.length, 0);
 });
 
 test("native checkpoints bind an explicitly absent sequence and guard both ends of the read", async () => {

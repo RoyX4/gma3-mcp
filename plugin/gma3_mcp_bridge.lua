@@ -274,7 +274,7 @@ local function handleSummary(h)
 end
 
 local toJsonSafe
-toJsonSafe = function(v, depth, seen, loss)
+toJsonSafe = function(v, depth, seen, loss, maxDepth)
   depth = depth or 0
   seen = seen or {}
   local t = type(v)
@@ -288,7 +288,7 @@ toJsonSafe = function(v, depth, seen, loss)
   if t == "thread" then if loss then loss.unsupportedType=true end;return "<thread>" end
   if t == "table" then
     if seen[v] then if loss then loss.cycle=true end;return "<cycle>" end
-    if depth >= MAX_DEPTH then if loss then loss.depthLimit=true end;return "<table: max depth>" end
+    if depth >= (maxDepth or MAX_DEPTH) then if loss then loss.depthLimit=true end;return "<table: max depth>" end
     seen[v] = true
     -- array-like?
     local n = 0
@@ -299,14 +299,14 @@ toJsonSafe = function(v, depth, seen, loss)
     local out
     if n >= 0 and n == #v then
       out = {}
-      for i = 1, #v do out[i] = toJsonSafe(v[i], depth + 1, seen, loss) end
+      for i = 1, #v do out[i] = toJsonSafe(v[i], depth + 1, seen, loss, maxDepth) end
       if #out == 0 then setmetatable(out, { __jsontype = "array" }) end
     else
       out = {}
       for k, val in pairs(v) do
         local key = type(k) == "string" and k or tostring(k)
         if loss and type(k)~="string" and type(k)~="number" then loss.unsupportedKey=true end
-        out[key] = toJsonSafe(val, depth + 1, seen, loss)
+        out[key] = toJsonSafe(val, depth + 1, seen, loss, maxDepth)
       end
     end
     seen[v] = nil
@@ -893,9 +893,16 @@ local function attributeMeta(attr)
   return m
 end
 
-local function channelSetRows(cf)
+local function channelSetRows(cf, detailsBudget)
   local out = {}
-  for _, cs in ipairs(safeCall(cf, "Children") or {}) do
+  local children = safeCall(cf, "Children")
+  if detailsBudget and type(children) ~= "table" then return nil, "unavailable" end
+  for _, cs in ipairs(children or {}) do
+    if detailsBudget then
+      if detailsBudget.used >= detailsBudget.limit then return emptyArray(out), "truncated" end
+      if not isHandle(cs) then return nil, "unavailable" end
+      detailsBudget.used = detailsBudget.used + 1
+    end
     out[#out + 1] = {
       name = safeProp(cs, "name"), dmxFrom = textProp(cs, "DmxFrom"), dmxTo = textProp(cs, "DmxTo"),
       physicalFrom = numProp(cs, "PhysicalFrom"), physicalTo = numProp(cs, "PhysicalTo"), wheelSlotIndex = numProp(cs, "WheelSlotIndex"),
@@ -1031,7 +1038,7 @@ local function resolveMode(main)
   return nil
 end
 
-local function walkMode(main, includeSets, limitations)
+local function walkMode(main, includeSets, limitations, keepLogicalHandles)
   local mode = resolveMode(main)
   if not mode then table.insert(limitations, "no DMX mode handle could be resolved for the fixture type (Get(\"Mode\"), FixtureType.DMXModes); the fixture type could not be walked"); return nil end
   local channelsNode
@@ -1050,6 +1057,7 @@ local function walkMode(main, includeSets, limitations)
     if defCf then entry.defaultChannelFunction = safeProp(defCf, "name") end
     for _, lc in ipairs(safeCall(dc, "Children") or {}) do
       local lce = { name = safeProp(lc, "name"), attribute = attributeMeta(handleProp(lc, "Attribute")), functions = {} }
+      if keepLogicalHandles then lce.logicalHandle = lc end
       for _, cf in ipairs(safeCall(lc, "Children") or {}) do lce.functions[#lce.functions + 1] = channelFunctionMeta(cf, includeSets) end
       entry.logicalChannels[#entry.logicalChannels + 1] = lce
     end
@@ -1077,7 +1085,7 @@ local function pickChannelSet(sets, raw, bits)
 end
 
 -- Attribute rows through the UI channel API. nil when the API is unavailable (caller falls back to the type walk).
-local function uiChannelAttributes(fx, includeSets, rtRows, limitations)
+local function uiChannelAttributes(fx, includeSets, rtRows, limitations, functionParents)
   local okU, uis = callApi("GetUIChannels", fx, false)
   if not okU then table.insert(limitations, "GetUIChannels unavailable: " .. tostring(uis)); return nil end
   if type(uis) ~= "table" or #uis == 0 then table.insert(limitations, "GetUIChannels returned no UI channels for this fixture"); return nil end
@@ -1112,6 +1120,7 @@ local function uiChannelAttributes(fx, includeSets, rtRows, limitations)
           merge(row, channelFunctionMeta(cf, includeSets))
           local lc = safeCall(cf, "Parent")
           if lc then
+            if functionParents then functionParents[row] = lc end
             local names = {}
             for _, f in ipairs(safeCall(lc, "Children") or {}) do names[#names + 1] = safeProp(f, "name") end
             if #names > 0 then row.channelFunctions = names end
@@ -1132,8 +1141,8 @@ local function uiChannelAttributes(fx, includeSets, rtRows, limitations)
 end
 
 -- Attribute rows from the static fixture-type walk (one row per logical channel of the DMX mode).
-local function fixtureTypeAttributes(main, includeSets, rtRows, limitations)
-  local walk = walkMode(main, includeSets, limitations)
+local function fixtureTypeAttributes(main, includeSets, rtRows, limitations, functionParents)
+  local walk = walkMode(main, includeSets, limitations, functionParents ~= nil)
   if not walk then return {} end
   local rows = {}
   for _, entry in ipairs(walk) do
@@ -1144,6 +1153,7 @@ local function fixtureTypeAttributes(main, includeSets, rtRows, limitations)
       local names = {}
       for _, f in ipairs(lc.functions) do names[#names + 1] = f.channelFunction end
       if #names > 0 then row.channelFunctions = names end
+      if functionParents then functionParents[row] = lc.logicalHandle end
       row.dmxChannel = { name = entry.name, dmxBreak = entry.dmxBreak, coarseOffset = entry.coarse, fineOffset = entry.fine, ultraOffset = entry.ultra, geometry = entry.geometry, default = entry.default }
       if rtRows then
         local rt = matchRtChannel(rtRows, nil, entry.name)
@@ -2968,21 +2978,22 @@ end
 -------------------------------------------------------------------------------
 
 -- FR-07: attribute discovery for one (sub)fixture.
---   args: { ref = "Fixture 601" | "Fixture 501.3", limit, offset, includeChannelSets }
+--   args: { ref = "Fixture 601" | "Fixture 501.3", limit, offset, includeChannelSets, includeChannelFunctions }
 ops.fixtureAttributes = function(args)
   local fx, main = resolveFixture(args.ref)
   local limit, offset = pageArgs(args, 100, 500)
   local includeSets = args.includeChannelSets == true
+  local functionParents = args.includeChannelFunctions == true and {} or nil
   local limitations = {}
   local res = fixtureIdentity(fx, main)
   res.subfixtures = listSubfixtures(fx)
   res.subfixtureCount = #res.subfixtures
   local rtRows, rtSource = fixtureRtChannels(fx, main, limitations)
-  local rows = uiChannelAttributes(fx, includeSets, rtRows, limitations)
+  local rows = uiChannelAttributes(fx, includeSets, rtRows, limitations, functionParents)
   if rows then
     res.source = "uiChannels"
   else
-    rows = fixtureTypeAttributes(main, includeSets, rtRows, limitations)
+    rows = fixtureTypeAttributes(main, includeSets, rtRows, limitations, functionParents)
     res.source = "fixtureTypeWalk"
   end
   res.channels = emptyArray(rtRows or {})
@@ -2991,6 +3002,47 @@ ops.fixtureAttributes = function(args)
   local page = paginate(rows, limit, offset)
   res.total, res.offset, res.count, res.attributes = page.total, page.offset, page.count, page.items
   res.includeChannelSets = includeSets
+  if functionParents then
+    local budget = { limit = MAX_EXPANDED_OBJECTS, used = 0, truncated = false }
+    for _, row in ipairs(page.items) do
+      local logical = functionParents[row]
+      local functions = logical and safeCall(logical, "Children")
+      local label = tostring(row.attribute or row.uiChannel or "(unnamed)")
+      if type(functions) ~= "table" then
+        table.insert(limitations, "detailed channel functions unavailable for " .. label)
+      else
+        local details = {}
+        for _, cf in ipairs(functions) do
+          if budget.used >= budget.limit then
+            row.channelFunctionDetailsTruncated, budget.truncated = true, true
+            table.insert(limitations, "detailed channel functions truncated at the " .. budget.limit .. "-item request budget for " .. label)
+            break
+          end
+          if not isHandle(cf) then
+            details = nil
+            table.insert(limitations, "detailed channel functions unavailable for " .. label .. ": a logical channel child is not a handle")
+            break
+          end
+          budget.used = budget.used + 1
+          local detail, attr = channelFunctionMeta(cf, false), attributeMeta(handleProp(cf, "Attribute"))
+          detail.name = detail.channelFunction
+          detail.attribute = attr.attribute or textProp(cf, "Attribute")
+          detail.attributeIndex, detail.physicalUnit = attr.attributeIndex, attr.physicalUnit
+          local setState
+          detail.channelSets, setState = channelSetRows(cf, budget)
+          if setState == "truncated" then
+            detail.channelSetsTruncated, budget.truncated = true, true
+            table.insert(limitations, "detailed channel sets truncated at the " .. budget.limit .. "-item request budget for " .. tostring(detail.name or label))
+          elseif setState == "unavailable" then
+            table.insert(limitations, "channel sets unavailable for channel function " .. tostring(detail.name or label))
+          end
+          details[#details + 1] = detail
+        end
+        if details then row.channelFunctionDetails = emptyArray(details) end
+      end
+    end
+    res.includeChannelFunctions, res.channelFunctionDetailsBudget = true, budget
+  end
   res.limitations = emptyArray(limitations)
   return res
 end
@@ -7027,7 +7079,7 @@ local function readPresetHandle(h, args)
     end
   end
   emptyArray(out.rows); emptyArray(out.dependencies)
-  return out
+  return out, data
 end
 
 ops["preset.read"] = function(args)
@@ -7207,7 +7259,13 @@ end
 
 -- Read the actual stored cue-part channels. No selection, playback, tracking edit or export.
 -- Full raw fields supplement the convenience projection, so checkpoint hashes do not hide edits.
-ops["cue.content"] = function(args)
+ops["cue.content"] = function(args, capture)
+  -- The second argument is internal-only; the paging wrapper supplies capture bounds.
+  local cueLimit = capture and capture.maxCueObjects or 500
+  local capturedBytes, capturedParts = 0, 0
+  local function captureBudget()
+    if capture and capture.deadline and now() > capture.deadline then raise("[capture-limit] native cue capture exceeded its time budget") end
+  end
   local h = resolve(args.ref)
   local class = safeCall(h, "GetClass")
   if class ~= "Sequence" and class ~= "Cue" then raise("[not-cue] ref must resolve to one Sequence or Cue") end
@@ -7215,6 +7273,7 @@ ops["cue.content"] = function(args)
   local budget = { entries = 0 }
   local function raw(value, depth)
     budget.entries = budget.entries + 1
+    if capture and budget.entries > 100000 then raise("[capture-limit] native cue capture exceeds 100000 raw entries") end
     if budget.entries > 100000 or depth > 10 then out.complete = false; return { unreadable = "serialization bound" } end
     if isHandle(value) then return { object = objectRefInfo(value) } end
     local kind = type(value)
@@ -7245,28 +7304,60 @@ ops["cue.content"] = function(args)
   if class == "Sequence" then out.sequence = { addr = safeCall(h,"Addr"), name = safeProp(h,"name"), fields = props(h) } end
   for _, cue in ipairs(cues) do
     if safeCall(cue,"GetClass") == "Cue" then
-      if #out.cues >= 500 then out.complete = false; break end
+      captureBudget()
+      if #out.cues >= cueLimit then out.complete = false; break end
       local item = { addr = safeCall(cue,"Addr"), name = safeProp(cue,"name"), no = safeProp(cue,"no"), fields = props(cue), parts = {} }
+      if capture then item.fields.AllowDuplicates = getProp(cue, "AllowDuplicates", true) end
       local parts = safeCall(cue,"Children")
       if type(parts) ~= "table" then out.complete = false; parts = {} end
+      local seenParts = {}
       for _, part in ipairs(parts) do
         if safeCall(part,"GetClass") == "Part" then
+          captureBudget()
+          capturedParts = capturedParts + 1
+          if capture and capturedParts > 50000 then raise("[capture-limit] native cue capture exceeds 50000 parts") end
           local addr = safeCall(part,"Addr")
+          local partNo = safeProp(part,"no")
+          if capture then
+            -- Part number is a separate native property, not the child index in Addr.
+            partNo = getProp(part, "Part", false)
+            if type(partNo) == "string" and partNo:match("^%d+$") then partNo = tonumber(partNo) end
+            -- On 2.5.1.1 the internal OffCue/CueZero main parts have no Part property.
+            local internal = (item.name == "OffCue" and item.no == nil) or (item.name == "CueZero" and item.no == 0)
+            if partNo == nil and internal and #parts == 1 and type(item.addr) == "string"
+              and addr == item.addr .. ".0" and safeProp(part, "name") == "Part 0" then partNo = 0 end
+            if type(partNo) ~= "number" or partNo % 1 ~= 0 or partNo < 0 or partNo > 999 or seenParts[partNo] then
+              partNo = nil
+              out.complete = false
+            else
+              seenParts[partNo] = true
+            end
+          end
           -- Reuse the supported preset reader for its normalized steps, links and fixture identity.
           local content
-          local okRead, read = pcall(readPresetHandle, part, { ref = addr })
+          local okRead, read, data = pcall(readPresetHandle, part, { ref = addr })
           if okRead then content = read else out.complete = false; content = { error = tostring(read) } end
-          local okData, data = callApi("GetPresetData", part, false, true)
+          local okData = okRead
+          if not capture then okData, data = callApi("GetPresetData", part, false, true) end
           local rawChannels
           if okData and type(data) == "table" then
             rawChannels = raw(data,0)
             local expected = tonumber(data.count)
             if not content or content.truncated or content.byFixtures ~= true or (expected and expected ~= content.count) then out.complete = false end
           else out.complete = false end
-          item.parts[#item.parts+1] = { addr = addr, no = safeProp(part,"no"), name = safeProp(part,"name"), fields = props(part), encoding = "json", contentJson = content and json.encode(content), rawChannelsJson = rawChannels and json.encode(rawChannels) }
+          item.parts[#item.parts+1] = { addr = addr, no = partNo, name = safeProp(part,"name"), fields = props(part), encoding = "json", contentJson = content and json.encode(content), rawChannelsJson = rawChannels and json.encode(rawChannels) }
         end
       end
-      emptyArray(item.parts); out.cues[#out.cues+1] = item
+      emptyArray(item.parts)
+      if capture then
+        captureBudget()
+        local cueBytes = #json.encode(item)
+        if cueBytes > capture.maxPageBytes then raise("[capture-limit] one cue exceeds the 8MiB page data budget") end
+        capture.cueBytes[#capture.cueBytes + 1] = cueBytes
+        capturedBytes = capturedBytes + cueBytes
+        if capturedBytes > 32 * 1024 * 1024 then raise("[capture-limit] native cue capture exceeds 32MiB") end
+      end
+      out.cues[#out.cues+1] = item
     end
   end
   emptyArray(out.cues)
@@ -7614,7 +7705,7 @@ ops._fastpath = (function()
   local fastpath = { generation = generation }
   -- Bounded work executed by the bridge loop between client-service passes. A cancellation can
   -- stop the next step; it cannot undo or interrupt a native command already in progress.
-  local leases, batches, snapshots = {}, {}, {}
+  local leases, batches, snapshots, cueSnapshots = {}, {}, {}, {}
   local serial, contextEpoch, previousIdentity, batchCursor = 0, 0, nil, 0
   local READ_OPS = {}
   for word in ("ping modules object children objects dump getfader executor executors api fixtureAttributes programmer fixtureOutput dmx cueContents cue.content view.content feedback.describe feedback.read feedback.context feedback.watch feedback.unwatch input.status input.routing input.sequence.status control.status patch.state patch.types patch.list patch.check patch.collections patch.fingerprint patch.library patch.libraryStat patch.typeInfo patch.typeStructure patch.importState patch.cellLayout patch.moveCheck patch.moveState patch.groupsOf dmx.output vars.get tags tags.of show.files dialog.read osc.read group.read selection.grid preset.read preset.context timecode.read fast.context fast.batch programmer.snapshot"):gmatch("%S+") do READ_OPS[word] = true end
@@ -7671,7 +7762,11 @@ ops._fastpath = (function()
       guard(l.contextKey)
     end
   end
-  ops["fast.context"] = function() return identity() end
+  ops["fast.context"] = function()
+    local current = identity()
+    current.previewCommandSeries = 1
+    return current
+  end
   ops["fast.lease"] = function(args, ctx)
     local action = args.action or "status"
     local l = lease()
@@ -7695,7 +7790,88 @@ ops._fastpath = (function()
   local function sweep()
     local t = now()
     for k,s in pairs(snapshots) do if s.expiresAt <= t then snapshots[k] = nil end end
+    for k,s in pairs(cueSnapshots) do if s.expiresAt <= t then cueSnapshots[k] = nil end end
     for k,b in pairs(batches) do if b.status ~= "running" and b.endedAt and t - b.endedAt > 60 then batches[k] = nil end end
+  end
+  -- Freeze one bounded native capture, then page the retained plain data without native rescans.
+  -- Capture itself is an observed read, not a console transaction; pages share exactly that read.
+  local nativeCueContent = ops["cue.content"]
+  local CUE_PAGE_BYTES = 8 * 1024 * 1024
+  local function cueMembership(ref)
+    local object = resolve(ref)
+    local class = safeCall(object,"GetClass")
+    if class ~= "Sequence" and class ~= "Cue" then fail("not-cue","ref must resolve to one Sequence or Cue") end
+    local children = class == "Cue" and {object} or safeCall(object,"Children")
+    if type(children) ~= "table" then fail("unreadable","cue membership is unavailable") end
+    local order, seen = {}, {}
+    for _,cue in ipairs(children) do
+      if safeCall(cue,"GetClass") == "Cue" then
+        local address = safeCall(cue,"Addr")
+        if type(address) ~= "string" or address == "" or #address > 128 or seen[address] then fail("unreadable","cue membership is missing, oversized or duplicated") end
+        seen[address] = true; order[#order+1] = address
+        if #order > 10002 then fail("snapshot-limit","native cue capture exceeds 10002 objects") end
+      end
+    end
+    return emptyArray(order)
+  end
+  local function cuePage(s, offset, limit)
+    local out = {}; for k,v in pairs(s.result) do out[k] = v end
+    local cues, bytes = {}, 0
+    for i=offset+1,math.min(#s.result.cues,offset+limit) do
+      bytes = bytes + s.cueBytes[i]
+      if bytes > CUE_PAGE_BYTES then break end
+      cues[#cues+1]=s.result.cues[i]
+    end
+    out.cues,out.offset,out.count=emptyArray(cues),offset,#cues
+    out.protocol,out.snapshotId,out.contextKey="gma3-cue-snapshot-v1",s.id,s.contextKey
+    out.environment,out.capturedAt,out.expiresAt=s.environment,s.capturedAt,s.expiresAt
+    out.frozen,out.atomic,out.total,out.capturedCount=true,false,#s.result.cues,#s.result.cues
+    if offset==0 then out.cueOrder=s.order end
+    out.nextCursor=offset+#cues<#s.result.cues and (s.id.."/"..tostring(offset+#cues)) or nil
+    return out
+  end
+  ops["cue.content"] = function(args,ctx)
+    if args.action == nil then return nativeCueContent({ref=args.ref}) end
+    if args.action == "capabilities" then return {protocol="gma3-cue-snapshot-v1",frozen=true,atomic=false,maxCueObjects=10002,maxPageCues=200,maxPageDataBytes=CUE_PAGE_BYTES,maxSnapshotBytes=32*1024*1024,maxCaptureMs=30000} end
+    sweep()
+    local action,limit=args.action,args.limit or 200
+    if type(limit)~="number" or limit%1~=0 or limit<1 or limit>200 then fail("validation","cue page limit must be an integer 1..200") end
+    if action=="create" then
+      if type(args.ref)~="string" or #args.ref==0 or #args.ref>1024 then fail("validation","cue snapshot ref must have 1..1024 bytes") end
+      local count,own,bytes=0,0,0
+      for _,s in pairs(cueSnapshots) do count=count+1;bytes=bytes+s.bytes;if s.client==ctx.client then own=own+1 end end
+      if count>=8 or own>=2 then fail("snapshot-limit","at most two cue snapshots per connection and eight globally; release an old snapshot") end
+      local ttl,captureMs=args.ttlMs or 60000,args.maxCaptureMs or 15000
+      if type(ttl)~="number" or ttl%1~=0 or ttl<1000 or ttl>60000 then fail("validation","cue snapshot ttlMs must be an integer 1000..60000") end
+      if type(captureMs)~="number" or captureMs%1~=0 or captureMs<100 or captureMs>30000 then fail("validation","cue maxCaptureMs must be an integer 100..30000") end
+      local before=identity();guard(before.contextKey)
+      if before.environment~="Normal" and before.environment~="Preview" then fail("identity-unavailable","cue snapshot environment could not be verified") end
+      local order=cueMembership(args.ref)
+      local capture = {maxCueObjects=10002,deadline=now()+captureMs/1000,cueBytes={},maxPageBytes=CUE_PAGE_BYTES}
+      local result=nativeCueContent({ref=args.ref},capture)
+      local after=guard(before.contextKey)
+      if after.environment~=before.environment or encode(cueMembership(args.ref))~=encode(order) then fail("context-changed","cue membership/order or environment changed during capture") end
+      if #result.cues~=#order then fail("context-changed","native cue capture does not cover original membership") end
+      for i,cue in ipairs(result.cues) do if cue.addr~=order[i] then fail("context-changed","native cue capture order changed") end end
+      local size=#json.encode(result)
+      if size>32*1024*1024 or bytes+size>64*1024*1024 then fail("snapshot-limit","cue snapshots exceed the 32MiB capture/64MiB retained budget") end
+      local s={id=id("cue-snapshot"),client=ctx.client,result=result,order=order,cueBytes=capture.cueBytes,bytes=size,contextKey=before.contextKey,environment=before.environment,capturedAt=before.observedAt,expiresAt=now()+ttl/1000}
+      cueSnapshots[s.id]=s;return cuePage(s,0,limit)
+    end
+    local s=cueSnapshots[args.snapshotId]
+    if not s or s.client~=ctx.client then fail("snapshot-unavailable","cue snapshot expired, disconnected, or belongs to another connection") end
+    if action=="release" then cueSnapshots[s.id]=nil;return {released=true} end
+    if action~="page" then fail("validation","cue snapshot action must be create, page or release") end
+    local valid,current=pcall(guard,s.contextKey)
+    if not valid then cueSnapshots[s.id]=nil;error(current,0) end
+    if current.environment~=s.environment then cueSnapshots[s.id]=nil;fail("context-changed","cue snapshot environment changed") end
+    local prefix=s.id.."/";local cursor=args.cursor
+    if type(cursor)~="string" or cursor:sub(1,#prefix)~=prefix then fail("cursor-invalid","cursor does not belong to this cue snapshot") end
+    local suffix=cursor:sub(#prefix+1)
+    if not suffix:match("^%d+$") then fail("cursor-invalid","invalid cue snapshot cursor") end
+    local offset=tonumber(suffix)
+    if not offset or offset<0 or offset>=#s.result.cues then fail("cursor-invalid","cue snapshot cursor offset is out of bounds") end
+    return cuePage(s,offset,limit)
   end
   local function page(s, offset, limit)
     local out = {}
@@ -7811,6 +7987,63 @@ ops._fastpath = (function()
     for _,word in ipairs({ "error", "illegal", "invalid", "unknown", "failed", "not allowed", "not executed", "no such", "no valid", "not found", "does not exist", "doesn't exist", "cannot", "can't", "access denied", "insufficient", "read-only", "read only", "nothing to", "nothing selected", "empty selection", "out of range" }) do if text:find(word,1,true) then return "failed" end end
     return text:sub(1,2) == "ok" and not text:sub(3,3):match("[%w_]") and "succeeded" or "unknown"
   end
+  local previewUnits = { Percent = true, PercentFine = true, Physical = true, Natural = true,
+    Decimal8 = true, Decimal16 = true, Decimal24 = true }
+  local function previewSelection(command)
+    local expression = command:match("^Fixture (%d.*)$")
+    if not expression then return false end
+    for token in expression:gmatch("%S+") do
+      if token ~= "+" and token ~= "-" and token:lower() ~= "thru" and not token:match("^%d[%d%.]*$") then return false end
+    end
+    return true
+  end
+  local function previewValue(command)
+    local intensity = tonumber(command:match("^At ([%d%.]+)$"))
+    if intensity then return intensity >= 0 and intensity <= 100 end
+    local value = tonumber(command:match('^Attribute "[%a][%w_.]*" At Absolute (%-?[%d%.]+)$'))
+    if value then return math.abs(value) < math.huge end
+    local unit, number = command:match('^Attribute "[%a][%w_.]*" At Absolute (%w+) (%-?[%d%.]+)$')
+    local numeric = tonumber(number)
+    return previewUnits[unit] == true and numeric ~= nil and math.abs(numeric) < math.huge
+  end
+  -- Keep the pre-Store readback outside this operation. Only adjacent static look commands are
+  -- coalesced, with an identity/environment check and an individual receipt for each command.
+  ops["fast.previewCommands"] = function(args, ctx)
+    local commands = args.commands
+    if type(commands) ~= "table" or #commands < 3 or #commands > 16 then
+      fail("validation", "Preview command series needs 3..16 commands")
+    end
+    for i, command in ipairs(commands) do
+      if not commandAllowed(command) or #command > 1024 or
+         (i == 1 and command ~= "ClearSelection") or
+         (i == 2 and not previewSelection(command)) or
+         (i >= 3 and not previewValue(command)) then
+        fail("validation", "Unsupported command in the Preview static look series")
+      end
+    end
+    local function ready()
+      if guard(args.contextKey).environment ~= "Preview" then fail("preview-required", "Preview environment is required") end
+      if inputBusy() then fail("busy", "Console input ownership is active") end
+    end
+    ready()
+    local steps, status = {}, "succeeded"
+    for i, command in ipairs(commands) do
+      local allowed, reason = pcall(ready)
+      if not allowed then
+        steps[i] = { command = command, status = "failed", error = type(reason) == "table" and reason.message or tostring(reason) }
+      else
+        local ok, result = pcall(ops.cmd, { command = command }, ctx)
+        if ok then
+          steps[i] = { command = command, status = classify(result), feedback = result and result.feedback }
+        else
+          steps[i] = { command = command, status = "unknown", error = type(result) == "table" and result.message or tostring(result) }
+        end
+      end
+      status = steps[i].status
+      if status ~= "succeeded" then break end
+    end
+    return { status = status, steps = steps }
+  end
   local function stop(b,status,message) b.status,b.error,b.endedAt = status,message,now() end
   local function equal(a,b,depth)
     if type(a) ~= type(b) then return false end
@@ -7890,10 +8123,11 @@ ops._fastpath = (function()
   function fastpath.close(client)
     if leases.current and leases.current.client == client then leases.current = nil end
     for k,s in pairs(snapshots) do if s.client == client then snapshots[k] = nil end end
+    for k,s in pairs(cueSnapshots) do if s.client == client then cueSnapshots[k] = nil end end
     for k,b in pairs(batches) do if b.client == client then batches[k] = nil end end
   end
   function fastpath.reset()
-    leases,batches,snapshots = {},{},{}
+    leases,batches,snapshots,cueSnapshots = {},{},{},{}
     contextEpoch,previousIdentity,batchCursor = 0,nil,0
     generation = tostring(os.time()) .. ":" .. tostring(socket.gettime()) .. ":" .. tostring({})
     fastpath.generation = generation
@@ -7949,7 +8183,8 @@ local function handleLine(client, line)
   if okR then
     -- Batch details were already converted once before retention. Converting the envelope again
     -- would spend its depth budget on steps/detail and silently truncate native phaser steps.
-    return encode({ id = id, ok = true, result = req.op == "fast.batch" and result or toJsonSafe(result) })
+    local detailDepth = req.op == "fixtureAttributes" and args.includeChannelFunctions == true and 8 or nil
+    return encode({ id = id, ok = true, result = req.op == "fast.batch" and result or toJsonSafe(result, nil, nil, nil, detailDepth) })
   end
   return errorReply(id, req.op, result)
 end

@@ -22,6 +22,7 @@
  */
 import { z } from "zod";
 import type { Gma3Bridge } from "../bridge.js";
+import { canGroupStaticLook, previewSeriesContext, previewSeriesStep } from "../preview-command-series.js";
 import { createEnvironmentReader } from "../programmer-environment.js";
 import { verifyReleases, type ReleaseSpec } from "../tracking/release.js";
 import {
@@ -53,12 +54,15 @@ import {
   MAX_ATTRIBUTES,
   PROGRAMMER_MAX_CHANNELS,
   attributeCommand,
+  attributeTimingShape,
   captureProgrammer,
   formatValue,
+  parseAttributeTiming,
   presetRef,
   snapshotProgrammer,
   verifyPresetLink,
   verifyProgrammer,
+  type AttributeTiming,
   type AttributeUnit,
   type Expectation,
   type ProgrammerSnapshot,
@@ -70,6 +74,7 @@ import { SEQUENCE_SETTINGS, configureSequence, findReferences, settingValue, typ
 import { HeldLock } from "../mutations.js";
 import { VarTracker, variablePresence, variableRefs } from "./variables.js";
 import { dataPoolShape, inDataPool } from "./datapool.js";
+import { fixtureRange } from "./inspection.js";
 
 export const MAX_CUES = 100;
 export const MAX_LOOKS = 16;
@@ -90,7 +95,7 @@ interface PresetSpec {
   preset: number | string;
   ref: string;
 }
-interface ValueSpec {
+interface ValueSpec extends AttributeTiming {
   attribute: string;
   value: number;
   unit?: AttributeUnit;
@@ -106,8 +111,15 @@ export interface LookSpec {
   /** SU-14: a phaser built on the look's fixtures (steps and phaser layers, as gma3_build_phaser takes them). */
   phaser?: Effect;
 }
+function canGroupLook(look: LookSpec): boolean {
+  return !look.presets.length && !look.phaser && !look.releases?.length
+    && !look.values.some(value => value.layer === "relative" || value.fade !== undefined || value.delay !== undefined)
+    && canGroupStaticLook(look.fixtures, look.values.length + (look.intensity === undefined ? 0 : 1));
+}
 export interface CueSpec {
   cue: string;
+  /** Internal explicit target for existing-cue value edits. Other builders keep the default cue store. */
+  part?: number;
   name?: string;
   looks: LookSpec[];
   /** SU-14: the cue's command (Part 0 Command), run when the cue is called. */
@@ -208,17 +220,19 @@ function validateLook(v: Validator, raw: unknown, path: string, defaultFixtures:
     else if (r.values.length > MAX_ATTRIBUTES) v.fail(`${path}: at most ${MAX_ATTRIBUTES} values per look`);
     else
       r.values.forEach((e, i) => {
-        const x = (e ?? {}) as { attribute?: unknown; value?: unknown; unit?: unknown; layer?: unknown };
+        const x = (e ?? {}) as Record<string, unknown>;
         const attribute = v.check(() => attributeName(`${path}.values[${i}].attribute`, x.attribute));
         const layer = v.check(() => oneOf(`${path}.values[${i}].layer`, x.layer, ["absolute", "relative"] as const, { optional: true }));
         const unit = v.check(() => oneOf(`${path}.values[${i}].unit`, x.unit, ATTRIBUTE_UNIT_NAMES, { optional: true }));
         const rule = unit ? ATTRIBUTE_UNITS[unit] : { min: undefined, max: undefined, integer: false };
+        const timing = parseAttributeTiming(v, x, `${path}.values[${i}].`);
         if (layer === "relative" && unit !== "percent" && unit !== "physical") v.fail(`${path}.values[${i}]: relative values require explicit percent or physical units for verified read-back`);
+        if (layer === "relative" && (timing.fade !== undefined || timing.delay !== undefined)) v.fail(`${path}.values[${i}]: individual fade and delay require an absolute value`);
         const value = v.check(() => finiteNumber(`${path}.values[${i}].value`, x.value, { min: layer === "relative" && unit === "percent" ? -100 : rule.min, max: rule.max, integer: rule.integer }));
         if (value !== undefined && value < 0 && layer !== "relative" && !(unit === "physical" || unit === "natural")) v.fail(`${path}.values[${i}].value must not be negative for unit ${unit ?? "readout"}`);
         if (attribute && values.some((y) => y.attribute.toLowerCase() === attribute.toLowerCase() && (y.layer ?? "absolute") === (layer ?? "absolute"))) v.fail(`${path}: attribute ${attribute} appears twice in the ${layer ?? "absolute"} layer`);
         if (attribute && intensity !== undefined && attribute.toLowerCase() === "dimmer" && layer !== "relative") v.fail(`${path}: Dimmer and intensity are the same attribute: give one of them`);
-        if (attribute && value !== undefined) values.push({ attribute, value, ...(unit ? { unit } : {}), ...(layer ? { layer } : {}) });
+        if (attribute && value !== undefined) values.push({ attribute, value, ...(unit ? { unit } : {}), ...(layer ? { layer } : {}), ...timing });
       });
   }
   const releases: ReleaseSpec[] = [];
@@ -290,7 +304,7 @@ function validateTiming(v: Validator, raw: Record<string, unknown>, path: string
   return timing;
 }
 
-function validateCues(v: Validator, raw: unknown, defaultFixtures: string | undefined): CueSpec[] {
+export function validateCues(v: Validator, raw: unknown, defaultFixtures: string | undefined): CueSpec[] {
   if (!Array.isArray(raw) || raw.length === 0) {
     v.fail("cues must be a non-empty list");
     return [];
@@ -367,6 +381,8 @@ interface Batch extends StoreTrackingOptions {
   verify: boolean;
   /** SU-14: delete every existing cue first (the sequence object, and so its executor assignments, stay). */
   replace?: boolean;
+  storeScope?: { fixtures: string; attributes: string[] };
+  verifyStored?: (cue: CueSpec) => Promise<Verification>;
 }
 
 type CueStatus = "stored" | "failed" | "unknown" | "not_attempted";
@@ -395,8 +411,8 @@ interface BatchResult {
   verification: Verification;
 }
 
-function storeCommand(sequence: number, cue: string, mode: StoreMode, tracking: StoreTrackingOptions): string {
-  return `Store ${cueRef(sequence, cue)}${mode === "merge" ? " /Merge" : mode === "overwrite" ? " /Overwrite" : ""}${storeTrackingFlags(tracking)} /NoConfirmation`;
+function storeCommand(sequence: number, cue: CueSpec, mode: StoreMode, tracking: StoreTrackingOptions, filter: string): string {
+  return `Store ${cueRef(sequence, cue.cue, cue.part)}${filter}${mode === "merge" ? " /Merge" : mode === "overwrite" ? " /Overwrite" : ""}${storeTrackingFlags(tracking)} /NoConfirmation`;
 }
 
 function setStep(bridge: Gma3Bridge, name: string, ref: string, property: string, value: string | number, t: number): { name: string; run: StepFn } {
@@ -463,7 +479,7 @@ async function checkLookPhaser(bridge: Gma3Bridge, fixtures: string, effect: Eff
 /** The expectations of a look's attribute values (intensity is Dimmer in percent), for verifyProgrammer. */
 const expectationsOf = (look: LookSpec): Expectation[] => [
   ...(look.intensity !== undefined ? [{ attribute: "Dimmer", value: look.intensity, unit: "percent" as const }] : []),
-  ...look.values.filter((x) => x.layer !== "relative").map((x) => ({ attribute: x.attribute, value: x.value, unit: x.unit ?? ("readout" as const) })),
+  ...look.values.filter((x) => x.layer !== "relative").map(({ layer: _layer, unit, ...value }) => ({ ...value, unit: unit ?? ("readout" as const) })),
 ];
 
 const worst = (list: Verification[], checked: string): Verification => {
@@ -617,6 +633,7 @@ export async function buildInPreview(ctx: ToolContext, o: { items: PreviewItem[]
   ]);
   const steps: StepResult[] = [...inspect.steps];
   if (inspect.outcome !== "succeeded") return { steps, readBack, warnings, items: reports, sent: false, backInNormal: true, normalProgrammer: "not_entered" };
+  const seriesContext = allLooks.some(canGroupLook) ? await previewSeriesContext(bridge, t) : undefined;
 
   // 2. Build in Preview.
   let entered = false;
@@ -686,8 +703,23 @@ export async function buildInPreview(ctx: ToolContext, o: { items: PreviewItem[]
       }
       item.looks.forEach((look, j) => {
         const lp = `${pre}look ${j + 1} `;
-        plan.push({ name: `${lp}clear_selection`, run: () => commandStep(bridge, `${lp}clear_selection`, "ClearSelection", t) });
-        plan.push({ name: `${lp}select`, run: () => commandStep(bridge, `${lp}select`, look.fixtures, t) });
+        const grouped = seriesContext !== undefined && canGroupLook(look);
+        const valueCommands = [
+          ...(look.intensity === undefined ? [] : [{ name: "intensity", command: `At ${formatValue(look.intensity)}` }]),
+          ...look.values.map(value => ({
+            name: value.attribute + (value.layer === "relative" ? " relative" : ""),
+            command: attributeCommand(value.attribute, value.value, value.unit ? ATTRIBUTE_UNITS[value.unit].keyword : undefined, value)
+              .replace(" At Absolute", value.layer === "relative" ? " At Relative" : " At Absolute"),
+          })),
+        ];
+        if (grouped) {
+          const name = `${lp}stage static values`;
+          plan.push({ name, run: () => previewSeriesStep(bridge, name, seriesContext,
+            ["ClearSelection", look.fixtures, ...valueCommands.map(value => value.command)], t) });
+        } else {
+          plan.push({ name: `${lp}clear_selection`, run: () => commandStep(bridge, `${lp}clear_selection`, "ClearSelection", t) });
+          plan.push({ name: `${lp}select`, run: () => commandStep(bridge, `${lp}select`, look.fixtures, t) });
+        }
         const entry: NonNullable<PreviewItemReport["looks"]>[number] = { fixtures: look.fixtures, presets: look.presets.map((p) => p.ref), verification: o.verify ? "matched" : "not_requested" };
         report.looks!.push(entry);
         const parts: Verification[] = [];
@@ -715,8 +747,10 @@ export async function buildInPreview(ctx: ToolContext, o: { items: PreviewItem[]
           plan.push({ name: `${lp}apply ${p.ref}`, run: () => commandStep(bridge, `${lp}apply ${p.ref}`, `At ${p.ref}`, t) });
           if (o.verify && p !== sharedPreset) plan.push(check(`${lp}check ${p.ref}`, p.ref, async () => (await verifyPresetLink(bridge, presets.get(p.ref) as { addrNative: string; label: string }, readBack)).verification));
         }
-        if (look.intensity !== undefined) plan.push({ name: `${lp}intensity`, run: () => commandStep(bridge, `${lp}intensity`, `At ${formatValue(look.intensity as number)}`, t) });
-        look.values.forEach((x) => plan.push({ name: `${lp}${x.attribute}${x.layer === "relative" ? " relative" : ""}`, run: () => commandStep(bridge, `${lp}${x.attribute}`, attributeCommand(x.attribute, x.value, x.unit ? ATTRIBUTE_UNITS[x.unit].keyword : undefined).replace(" At Absolute", x.layer === "relative" ? " At Relative" : " At Absolute"), t) }));
+        if (!grouped) for (const value of valueCommands) {
+          const name = `${lp}${value.name}`;
+          plan.push({ name, run: () => commandStep(bridge, name, value.command, t) });
+        }
         if (sharedPreset) {
           plan.push({ name: `${lp}capture final values`, run: async () => {
             try {
@@ -809,6 +843,14 @@ export async function buildCueBatch(ctx: ToolContext, b: Batch): Promise<BatchRe
   const { bridge } = ctx;
   const t = ctx.requestTimeoutMs;
   let existing: CueListEntry[] | null = null;
+  let filter = "";
+  if (b.storeScope) {
+    const fixtures = fixtureRange("store scope fixtures", b.storeScope.fixtures);
+    if (!b.storeScope.attributes.length || b.storeScope.attributes.length > MAX_ATTRIBUTES) throw new ValidationError("Store scope must have a bounded nonempty attribute list");
+    const attributes = b.storeScope.attributes.map(value => `"${attributeName("store scope attribute", value)}"`);
+    filter = ` If ${fixtures} Attribute ${attributes.join(" + ")} EndIf`;
+  }
+  const nativeChecks = new Map<string, Verification>();
   const readSequence = {
     name: "read_sequence",
     run: async (): Promise<StepResult> => {
@@ -826,14 +868,26 @@ export async function buildCueBatch(ctx: ToolContext, b: Batch): Promise<BatchRe
   };
   const items: PreviewItem[] = b.cues.map((c) => {
     const pre = `cue ${c.cue}: `;
-    const part0 = cueRef(b.sequence, c.cue, 0);
+    const part = cueRef(b.sequence, c.cue, c.part ?? 0);
     const cueObj = cueRef(b.sequence, c.cue);
-    const store: Array<{ name: string; run: StepFn }> = [{ name: `${pre}store`, run: () => commandStep(bridge, `${pre}store`, storeCommand(b.sequence, c.cue, b.mode, b), t) }];
-    if (c.name !== undefined) store.push(setStep(bridge, `${pre}name`, part0, "Name", c.name, t));
-    for (const [k, val] of Object.entries(c.timing) as Array<[keyof CueSpec["timing"], number]>) store.push(setStep(bridge, `${pre}${k}`, part0, TIMING_PROPS[k], val, t));
+    const store: Array<{ name: string; run: StepFn }> = [{ name: `${pre}store`, run: () => commandStep(bridge, `${pre}store`, storeCommand(b.sequence, c, b.mode, b, filter), t) }];
+    if (c.name !== undefined) store.push(setStep(bridge, `${pre}name`, part, "Name", c.name, t));
+    for (const [k, val] of Object.entries(c.timing) as Array<[keyof CueSpec["timing"], number]>) store.push(setStep(bridge, `${pre}${k}`, part, TIMING_PROPS[k], val, t));
     if (c.trigger) store.push(setStep(bridge, `${pre}trigger`, cueObj, "TrigType", TRIGGERS[c.trigger], t));
     if (c.time !== undefined) store.push(setStep(bridge, `${pre}trigger_time`, cueObj, "TrigTime", c.time, t));
-    if (c.command !== undefined) store.push(setStep(bridge, `${pre}command`, part0, "Command", c.command, t));
+    if (c.command !== undefined) store.push(setStep(bridge, `${pre}command`, part, "Command", c.command, t));
+    const verifyStored = b.verifyStored;
+    if (verifyStored) {
+      const name = `${pre}verify_native_store`;
+      store.push({ name, run: async () => {
+        let verification: Verification;
+        try { verification = await verifyStored(c); }
+        catch (err) { verification = unavailable(err instanceof Error ? err.message : String(err)); }
+        nativeChecks.set(c.cue, verification);
+        return asRead({ name, op: "cue.content", status: verification.status === "matched" ? "succeeded" : "failed", detail: verification,
+          ...(verification.status !== "matched" ? { error: verification.detail ?? "Native Store readback did not match" } : {}) });
+      } });
+    }
     return { prefix: pre, looks: c.looks, store };
   });
   // replace: every existing cue is deleted once everything was checked (Delete ... Cue 1 Thru keeps the sequence object,
@@ -874,7 +928,8 @@ export async function buildCueBatch(ctx: ToolContext, b: Batch): Promise<BatchRe
   const { steps, readBack, warnings, normalProgrammer } = built;
   const reports: CueReport[] = b.cues.map((c, i) => {
     const r = built.items[i];
-    return { cue: c.cue, status: r.status, verification: r.verification, ...(r.looks ? { looks: r.looks } : {}), ...(r.error ? { error: r.error } : {}) };
+    const verified = nativeChecks.get(c.cue);
+    return { cue: c.cue, status: r.status, verification: verified ? worst([r.verification, verified], "Preview looks and native Store readback") : r.verification, ...(r.looks ? { looks: r.looks } : {}), ...(r.error ? { error: r.error } : {}) };
   });
   const sequenceExisted = existing !== null;
   if (!built.sent) return { steps, readBack, warnings, cues: reports, sent: false, backInNormal: true, normalProgrammer: "not_entered", sequenceExisted, verification: unavailable("nothing was sent") };
@@ -906,7 +961,7 @@ export async function buildCueBatch(ctx: ToolContext, b: Batch): Promise<BatchRe
           r.name = typeof cf.Name === "string" ? cf.Name : null;
           let actual: Record<string, unknown> = { ...cf };
           if (Object.keys(timingExpected).length) {
-            const pr = (await bridge.request("objects", { ref: cueRef(b.sequence, c.cue, 0), fields: Object.keys(timingExpected), limit: 1 }, t)) as { items?: Array<{ fields?: Record<string, unknown> }> };
+            const pr = (await bridge.request("objects", { ref: cueRef(b.sequence, c.cue, c.part ?? 0), fields: Object.keys(timingExpected), limit: 1 }, t)) as { items?: Array<{ fields?: Record<string, unknown> }> };
             actual = { ...actual, ...(pr.items?.[0]?.fields ?? {}) };
           }
           props = compareFields(checked, { ...expected, ...timingExpected }, actual, { normalize: TIME_NORMALIZERS });
@@ -1058,7 +1113,7 @@ async function observeChase(
 const EXCLUSIVE_REASON =
   "exclusive must be true: the cues are built in the console's Preview environment (its own programmer and selection; the operator's Normal programmer and the output are not touched), and nobody else may use the console while the build runs";
 
-function batchResult(op: string, target: Record<string, unknown>, r: BatchResult, extra: Record<string, unknown>, verification?: Verification): OperationResult {
+export function batchResult(op: string, target: Record<string, unknown>, r: BatchResult, extra: Record<string, unknown>, verification?: Verification): OperationResult {
   const result = buildResult({
     operation: op,
     target,
@@ -1781,6 +1836,7 @@ export async function buildChase(ctx: ToolContext, raw: Record<string, unknown>)
 
 const presetSchema = z.object({ pool: z.number().describe("Preset pool: 1 Dimmer, 2 Position, 3 Gobo, 4 Color, 5 Beam, 6 Focus, 7 Control, 8 Shapers, 9 Video, 21.. All."), preset: z.union([z.number(), z.string()]).describe("Preset number in the pool, or its name.") });
 const valueSchema = z.object({
+  ...attributeTimingShape,
   attribute: z.string().describe('Attribute name, e.g. "Pan", "ColorRGB_W".'),
   value: z.number(),
   layer: z.enum(["absolute", "relative"]).optional().describe("Default absolute. Relative requires explicit percent or physical units; signed values are preserved and checked independently."),
@@ -1790,7 +1846,7 @@ const lookShape = {
   fixtures: z.string().optional().describe('Target, e.g. "101 Thru 112", "Group 3" (default: the call\'s fixtures).'),
   presets: z.array(presetSchema).optional().describe(`Presets applied in order (At Preset), up to ${MAX_PRESETS_PER_LOOK}.`),
   intensity: z.number().optional().describe("Intensity 0..100 percent (At <value>)."),
-  values: z.array(valueSchema).optional().describe(`Attribute values (Attribute ... At Absolute), up to ${MAX_ATTRIBUTES}; applied after the presets.`),
+  values: z.array(valueSchema).optional().describe(`Attribute values, up to ${MAX_ATTRIBUTES}. Applied after presets. Absolute values may specify individual fade and delay in seconds.`),
   releases: z.array(z.union([z.string(), z.object({ attribute: z.string(), layer: z.enum(["absolute", "relative"]).optional() })])).optional().describe("Stored tracking release per attribute/layer. String defaults absolute. Sends At Absolute|Relative Release; requires active native release marker before Store. Off Attribute is never substituted."),
   phaser: z
     .object({

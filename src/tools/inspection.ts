@@ -19,6 +19,8 @@
 import { z } from "zod";
 import type { Gma3Bridge } from "../bridge.js";
 import { BridgeError } from "../bridge.js";
+import { readNativeCueContent } from "../native-cue-reader.js";
+import { nativePartIdentity } from "../native-cues.js";
 import { json, type RegisterTools, type ToolContext } from "./context.js";
 import type { ToolResult } from "../results.js";
 import { Validator, ValidationError, cueNumber, describe, finiteNumber, objectNumber, oneOf, partNumber, safeRef } from "../validate.js";
@@ -43,6 +45,22 @@ export const ATTRIBUTE_ROW_KEYS = [
   "uiChannel", "attribute", "attributeIndex", "pretty", "feature", "featureGroup", "activationGroup", "physicalUnit", "readout", "color",
   "channelFunction", "channelFunctions", "dmxFrom", "dmxTo", "default", "physicalFrom", "physicalTo", "realFade", "dmx", "dmxChannel",
 ] as const;
+
+const FUNCTION_DETAIL_KEYS = ["name", "channelFunction", "attribute", "attributeIndex", "dmxFrom", "dmxTo", "default", "physicalFrom", "physicalTo", "physicalUnit", "realFade", "realAcceleration", "channelSets"] as const;
+const CHANNEL_SET_KEYS = ["name", "dmxFrom", "dmxTo", "physicalFrom", "physicalTo", "wheelSlotIndex"] as const;
+
+function isRecord(value: unknown): value is Row {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function functionDetails(value: unknown): Row[] | null {
+  if (!Array.isArray(value) || !value.every(isRecord)) return null;
+  return value.map((item) => {
+    const detail = withNulls(item, FUNCTION_DETAIL_KEYS);
+    const sets = detail.channelSets;
+    return { ...detail, channelSets: Array.isArray(sets) && sets.every(isRecord) ? sets.map(set => withNulls(set, CHANNEL_SET_KEYS)) : null };
+  });
+}
 
 export const PROGRAMMER_ROW_KEYS = [
   "fixture", "fid", "subfixtureIndex", "uiChannel", "attribute", "attributeIndex", "present", "value", "valueRaw", "relative", "masks", "stepCount", "steps", "phaser", "absPreset", "relPreset",
@@ -207,7 +225,8 @@ export const registerInspectionTools: RegisterTools = (server, ctx: ToolContext)
       title: "Discover a fixture's attributes",
       description:
         "List the attributes of one fixture or subfixture with stable identifiers (attribute name, attributeIndex, uiChannel), pretty name, feature/feature group, activation group, " +
-        "physical unit, natural readout, the channel function's DMX and physical ranges, defaults, optional channel sets, and the DMX address mapping (coarse/fine/ultra as universe.address) from the RT channels. " +
+        "physical unit, natural readout, the selected/default channel function's DMX and physical ranges, defaults, optional channel sets, and the DMX address mapping (coarse/fine/ultra as universe.address) from the RT channels. " +
+        "include_channel_functions:true adds per-function attributes, units, ranges and channel sets for the logical channels on this page. Unavailable detail lists and metadata are null. " +
         "Subfixtures of a compound fixture are listed explicitly (`subfixtures[]`, with their patch index); pass `Fixture 501.3` to inspect one. " +
         WORKS_WITHOUT_LUA +
         "The fixture is resolved by fixture ID through the console (patch index is reported separately as subfixtureIndex, never assumed equal). " +
@@ -215,7 +234,8 @@ export const registerInspectionTools: RegisterTools = (server, ctx: ToolContext)
         "Null fields were not supplied by the console (explicitly unavailable, never inferred). Results are paginated. Not available: current values (use gma3_programmer / gma3_fixture_output).",
       inputSchema: {
         fixture: z.union([z.number(), z.string()]).describe('Fixture ID (101), subfixture ("501.3") or command reference ("Fixture 501.3"). One (sub)fixture only.'),
-        include_channel_sets: z.boolean().optional().describe("Include each channel function's ChannelSets (named ranges such as gobo slots). Default false."),
+        include_channel_sets: z.boolean().optional().describe("Include the selected/default function's channelSets (named ranges such as gobo slots). Default false."),
+        include_channel_functions: z.boolean().optional().describe("Include each logical channel function's own metadata and channel sets in channelFunctionDetails. Default false."),
         ...pageShape(100, 500),
       },
     },
@@ -226,17 +246,22 @@ export const registerInspectionTools: RegisterTools = (server, ctx: ToolContext)
         const { limit, offset } = pageArgs(v, args, 100, 500);
         if (!v.ok || !ref) return validationError("gma3_fixture_attributes", v.errors);
         const includeSets = args.include_channel_sets === true;
-        const res = await op(bridge, "fixtureAttributes", { ref, limit, offset, includeChannelSets: includeSets }, timeoutMs);
+        const includeFunctions = args.include_channel_functions === true;
+        const res = await op(bridge, "fixtureAttributes", { ref, limit, offset, includeChannelSets: includeSets, ...(includeFunctions ? { includeChannelFunctions: true } : {}) }, timeoutMs);
         const keys = includeSets ? [...ATTRIBUTE_ROW_KEYS, "channelSets"] : [...ATTRIBUTE_ROW_KEYS];
         return {
           tool: "gma3_fixture_attributes",
           ref,
           ...res,
-          attributes: asArray(res.attributes).map((row) => withNulls(row, keys)),
+          attributes: asArray(res.attributes).map((value) => {
+            const row = withNulls(value, keys);
+            if (includeFunctions) row.channelFunctionDetails = functionDetails(row.channelFunctionDetails);
+            return row;
+          }),
           subfixtures: asArray(res.subfixtures),
           channels: asArray(res.channels),
           source: res.source ?? null,
-          limitations: stringList(res.limitations),
+          limitations: [...stringList(res.limitations), ...(includeFunctions && res.includeChannelFunctions !== true ? ["Detailed channel functions were requested but not provided by this bridge version. Update the console plugin to expose them."] : [])],
           notes: [NULL_NOTE, "programmer and output values are not part of discovery; use gma3_programmer and gma3_fixture_output", "selection and programmer were not changed"],
         };
       }),
@@ -443,10 +468,12 @@ export const registerInspectionTools: RegisterTools = (server, ctx: ToolContext)
         let native: Row | null = null, nativeError: string | null = null;
         const nativeRef = typeof res.ref === "string" ? res.ref : typeof sequence === "number" ? `Sequence ${sequence} Cue ${cue}` : null;
         if (nativeRef) {
-          try { native = await op(bridge, "cue.content", { ref: nativeRef }, timeoutMs); }
+          try { native = await readNativeCueContent(bridge, nativeRef, timeoutMs); }
           catch (err) { nativeError = err instanceof Error ? err.message : String(err); }
         }
-        const nativeParts = asArray(asArray(native?.cues)[0] && (asArray(native?.cues)[0] as Row).parts) as Row[];
+        const nativeCues = asArray(native?.cues);
+        const nativeCue = nativeCues.length === 1 && isRecord(nativeCues[0]) ? nativeCues[0] : undefined;
+        const nativeParts = asArray(nativeCue?.parts).filter(isRecord);
         const parts = asArray(res.parts).map((p) => {
           const row = withNulls(p, PART_KEYS);
           row.timing = withNulls(row.timing, PART_TIMING_KEYS);
@@ -456,7 +483,8 @@ export const registerInspectionTools: RegisterTools = (server, ctx: ToolContext)
           row.otherChildren = asArray(row.otherChildren);
           row.storedValues = null;
           const partNo = nativePartNumber(row.part);
-          const actual = partNo === undefined ? undefined : nativeParts.find(item => nativePartNumber(item.no) === partNo);
+          const matches = partNo === undefined || !nativeCue ? [] : nativeParts.filter(item => nativePartIdentity(nativeCue, item) === partNo);
+          const actual = matches.length === 1 ? matches[0] : undefined;
           if (actual && typeof actual.contentJson === "string") {
             try {
               const parsed = JSON.parse(actual.contentJson) as Row;

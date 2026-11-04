@@ -6,10 +6,8 @@ Module: `src/tools/fixtures.ts`. Tools: `gma3_select`, `gma3_set_attribute`, `gm
 `gma3_apply_preset` and `gma3_release_attributes`. The SU-05 tools take the same `fixtures` / `use_selection` /
 `add_to_selection` target; `gma3_apply_preset` needs bridge 0.27.0 for its read-back.
 
-All five use only the existing bridge ops: `cmd` for every mutation, `objects` for read-only checks and
-selection read-back, `children` to list selected members. No Lua is generated, so they work with Lua
-execution disabled. Results follow the shared model in `src/results.ts` (outcome, verification, one step
-per bridge request).
+The tools use `cmd` for mutations and structured reads for selection, attributes and programmer values.
+They work with Lua execution disabled. Results follow the shared model in `src/results.ts`.
 
 ## Facts about the console these tools rely on
 
@@ -38,9 +36,7 @@ Absolute, Percent, PercentFine, Physical, Natural, Decimal8/16/24, ClearSelectio
   usable as a field.
 * `Attribute "<name>"` resolves through `ObjectList` to the show's attribute definition, so the existence
   of an attribute *name* can be checked read-only. Whether a particular fixture has that attribute cannot.
-* Programmer values are **not** readable through the structured ops. Every set tool reports verification
-  `unavailable` with the detail "programmer values are not readable through the structured ops; use
-  gma3_programmer (FR-08) when available".
+* The `programmer` op supplies the values and per-channel metadata for verification.
 
 ## Rules common to all five tools
 
@@ -108,6 +104,7 @@ Set one attribute to an absolute value.
 | `attribute` | string, required | `Dimmer`, `Pan`, `Tilt`, `Zoom`, `ColorRGB_R`, `Gobo1`, ... |
 | `value` | number, required | Absolute value in `unit`. |
 | `unit` | optional enum | `percent` (0..100), `percent_fine` (0..100), `physical` (degrees/Hz/rpm, signed), `natural` (the attribute's natural readout, signed), `decimal8` (0..255 int), `decimal16` (0..65535 int), `decimal24` (0..16777215 int). Omitted: no value-type keyword; the console's current readout applies (a warning says so). |
+| `fade`, `delay` | optional numbers | Individual attribute timing in seconds, from 0 to 3600. Zero is explicit. |
 
 Negative values are accepted only with `physical` or `natural`: for the other units a leading `-` could be
 read as the Minus keyword, so they are refused.
@@ -123,9 +120,8 @@ Commands, in order:
 3. With `fixtures` (unless `add_to_selection`): `ClearSelection`.
 4. With `fixtures`: `<fixtures>` (selects them; with `add_to_selection` see add-vs-replace above and a
    warning is added).
-5. `Attribute "<attribute>" At Absolute [<Unit keyword>] <value>` — e.g.
-   `Attribute "Dimmer" At Absolute Percent 75`, `Attribute "Pan" At Absolute Physical -45.5`,
-   `Attribute "Zoom" At Absolute 50` (no unit).
+5. `Attribute "<attribute>" At Absolute [<Unit keyword>] <value> [Fade <seconds>] [Delay <seconds>]`.
+   For example, `Attribute "Dimmer" At Absolute Percent 75 Fade 1.25 Delay 0` sets a 1.25-second fade with no delay.
 6. `programmer` op, scope `selection` (read-only), plus up to 8 follow-up `programmer` calls with scope
    `fixtures` for compound fixtures: the read-back described below.
 
@@ -145,6 +141,10 @@ programmer for the current selection through the `programmer` bridge op and comp
   function range (`physicalFrom`..`physicalTo` from the same row); `natural` and no unit through the
   attribute's natural readout (`Percent` or `Physical`). When a range or readout is unknown the result is
   `unavailable`, not a guess. A multi-step phaser on the attribute is a mismatch (it is not the static value).
+  Physical programmer values are compared from the minimum to the maximum of the range, including descending Zoom endpoints.
+* Requested individual Fade and Delay must each be active for individual storage and read within 0.001 seconds
+  of the requested time. An inactive timing layer is `mismatched`. Missing timing data or activation masks
+  leave timing verification `unavailable`.
 * `decimal8/16/24` values are compared exactly, as DMX values: the row's raw 24-bit value (`valueRaw`) is cut to
   its top 8, 16 or 24 bits (SU-11). The row's percent is a share of the attribute's channel-function range, not of
   the whole channel: Decimal8 104 on a colour wheel whose first function covers DMX 0..127 reads 81.89 %, and a
@@ -216,9 +216,9 @@ as defined in its fixture type (e.g. Pan -225..225); values outside it are left 
 ## gma3_set_attributes (SU-05)
 
 A whole look on one target in one call. `intensity` (0..100 %) is sent as `At <value>`, the Dimmer attribute.
-`values` is a list of up to 32 `{attribute, value, unit?}`, each sent as `Attribute "<name>" At Absolute
-[<unit keyword>] <value>`, in the order given and with the same units and range rules as `gma3_set_attribute`. An
-attribute may appear once, and Dimmer cannot be given together with `intensity`.
+`values` is a list of up to 32 `{attribute, value, unit?, fade?, delay?}` entries, sent in order with the
+same units and timing rules as `gma3_set_attribute`. To time intensity individually, give a Dimmer value
+with its timing. An attribute may appear once, and Dimmer cannot be given together with `intensity`.
 
 Pre-checks: each attribute exists in the show; small explicit targets are checked against the fixture types'
 attributes (`check_attributes`). The commands stop at the first one the console rejects (partial result). Read-back

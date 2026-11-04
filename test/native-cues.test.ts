@@ -79,3 +79,53 @@ test("native cue observation does not call an environment switch or uncertain id
     assert.equal((await h.callJson("gma3_native_cue_data",{sequence:1})).result.contextMatched,false);
   } finally { await h.close(); }
 });
+
+test("AllowDuplicates chooses the highest native part separately for absolute and relative layers", () => {
+  const p = (no: number, value: number, relative?: number) => ({ ...part([{ ...row(value), ...(relative === undefined ? {} : { hasRelative: true, relative }) }]), no });
+  const duplicated = { ...cue(1000, []), fields: { AllowDuplicates: "Yes" }, parts: [p(2, 80), p(0, 20, 5), p(1, 50)] };
+  const result = reconstructNativeCues(content([duplicated, cue(2000, [])]));
+  assert.equal(result.complete, true, result.limitations.join("; "));
+  assert.deepEqual(result.cues[0].effective.map(c => [c.layer, c.value, c.sourcePart]), [["absolute", 80, 2], ["relative", 5, 0]]);
+  assert.deepEqual(result.cues[1].effective.map(c => [c.layer, c.value]), [["absolute", 80], ["relative", 5]]);
+});
+test("duplicate layers refuse inferred precedence when AllowDuplicates is absent or false", () => {
+  for (const fields of [{}, { AllowDuplicates: "" }, { AllowDuplicates: "No" }]) {
+    const duplicate = { ...cue(1000, []), fields, parts: [part([row(20)]), { ...part([row(80)]), no: 2 }] };
+    assert.equal(reconstructNativeCues(content([duplicate])).complete, false);
+  }
+});
+test("missing or malformed part identity is never silently treated as the main part", () => {
+  for (const no of [undefined, null, false, "", "garbage", -1, 1.5]) {
+    const result = reconstructNativeCues(content([{ ...cue(1000, []), parts: [{ ...part([row(10)]), no }] }]));
+    assert.equal(result.complete, false, String(no));
+  }
+});
+test("legacy native part identity uses an exact numeric parent cue address", () => {
+  const { no: _discarded, ...legacyPart } = part([row(40)]);
+  const parent = "14.14.1.7.9030.2000";
+  const legacy = { ...cue(1000, []), addr: parent, parts: [{ ...legacyPart, addr: `${parent}.0` }] };
+  const result = reconstructNativeCues(content([legacy]));
+  assert.equal(result.complete, true);
+  assert.equal(result.cues[0].effective[0].sourcePart, 0);
+  assert.equal(reconstructNativeCues(content([{ ...legacy, parts: [{ ...legacyPart, addr: `${parent}0.0` }] }])).complete, false);
+});
+test("native delta distance tracks through the inclusive starting cue plus numeric delta", () => {
+  const limited = { ...cue(2000, []), parts: [{ ...part([row(80)]), fields: { TrackingDistance: "Δ +2.5" } }] };
+  const result = reconstructNativeCues(content([cue(1000, [row(10)]), limited, cue(4000, []), cue(4500, []), cue(4501, [])]));
+  assert.equal(result.complete, true, result.limitations.join("; "));
+  assert.deepEqual(result.cues.map(c => c.effective[0]?.value), [10, 80, 80, 80, 10]);
+});
+
+test("duplicate, reordered and coercible cue identities cannot qualify an inheritance chain", () => {
+  for (const entries of [[cue(2000, []), cue(1000, [])], [cue(1000, []), cue(1000, [])], [{ ...cue(0, []), no: false }]]) {
+    assert.equal(reconstructNativeCues(content(entries)).complete, false);
+  }
+});
+
+test("large tracked lists stop materializing before the effective cell budget is exceeded", () => {
+  const channels = Array.from({ length: 1000 }, (_, i) => ({ ...row(40), fixture: String(i + 1) }));
+  const result = reconstructNativeCues(content([cue(1000, channels), ...Array.from({ length: 1000 }, (_, i) => cue((i + 2) * 1000, []))]));
+  assert.equal(result.complete, false);
+  assert.equal(result.cues.length, 1000);
+  assert.match(result.limitations.join(" "), /1000000 materialized cells/);
+});

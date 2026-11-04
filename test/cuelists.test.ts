@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { registerCueListTools, expectedOrder, judgeCycle, planObservation } from "../src/tools/cuelists.ts";
+import { buildCueBatch, registerCueListTools, expectedOrder, judgeCycle, planObservation } from "../src/tools/cuelists.ts";
+import { registerCueRangeEditTools } from "../src/tools/cue-range-edits.ts";
 import { SILENT } from "./helpers/fake-bridge.ts";
 import { startHarness, type Harness } from "./helpers/tool-harness.ts";
 
@@ -19,6 +20,8 @@ type Env = "Normal" | "Preview";
 interface Value {
   value: number;
   preset?: string;
+  fade?: number;
+  delay?: number;
   /** SU-14: a phaser's step values (step 1 first), and its layers. */
   steps?: number[];
   phase?: number;
@@ -123,7 +126,7 @@ class Console {
       }
     } else if ((m = cmd.match(/^At ([\d.]+)$/))) {
       for (const f of sel) if (this.fixtures[f].includes("Dimmer")) this.set(f, "Dimmer", { value: +m[1] });
-    } else if ((m = cmd.match(/^Attribute "(.+)" At Absolute(?: Percent)? (-?[\d.]+)$/))) {
+    } else if ((m = cmd.match(/^Attribute "(.+)" At Absolute(?: Percent)? (-?[\d.]+)(?: Fade ([\d.]+))?(?: Delay ([\d.]+))?$/))) {
       for (const f of sel) {
         if (!this.fixtures[f].includes(m[1])) continue;
         const old = this.prog[this.env].get(f)?.get(m[1]);
@@ -131,7 +134,11 @@ class Console {
           const steps = [...(old?.steps ?? [old?.value ?? 0])];
           steps[this.step - 1] = +m[2];
           this.set(f, m[1], { value: steps[0], steps });
-        } else this.set(f, m[1], { value: +m[2] });
+        } else this.set(f, m[1], {
+          value: +m[2],
+          ...(m[3] === undefined ? {} : { fade: +m[3] }),
+          ...(m[4] === undefined ? {} : { delay: +m[4] }),
+        });
       }
     } else if ((m = cmd.match(/^At Preset (\d+)\.(\d+)$/))) {
       const key = `${m[1]}.${m[2]}`;
@@ -189,6 +196,13 @@ class Console {
         subfixtureIndex: +fid,
         attribute,
         ...(v.steps && v.steps.length > 1 ? { steps: v.steps.map((x) => ({ absolute: x })), phaser: { gridPos: order.indexOf(fid), phase: v.phase ?? 0, speed: v.speed ?? 1 } } : { value: v.value }),
+        ...(v.fade !== undefined || v.delay !== undefined ? {
+          phaser: { fade: v.fade, delay: v.delay },
+          masks: {
+            activePhaser: 64 + (v.fade === undefined ? 0 : 4) + (v.delay === undefined ? 0 : 8),
+            individual: 64 + (v.fade === undefined ? 0 : 4) + (v.delay === undefined ? 0 : 8),
+          },
+        } : {}),
         stepCount: v.steps?.length ?? 1,
         physicalFrom: 0,
         physicalTo: 1,
@@ -311,14 +325,210 @@ class Console {
   }
 }
 
-async function setup() {
-  const h = await startHarness(registerCueListTools);
+async function setup(register = registerCueListTools) {
+  const h = await startHarness(register);
   const c = new Console();
   c.install(h);
   // The operator's own work in the Normal programmer: it must survive every build.
   c.prog.Normal.set("301", new Map([["Dimmer", { value: 33 }]]));
   return { h, c };
 }
+
+test("static look series still checks the programmer before storing a cue", async () => {
+  const { h, c } = await setup();
+  try {
+    h.fake.on("fast.context", () => ({ contextKey: "lab", environment: c.env, identityUncertain: [], previewCommandSeries: 1 }));
+    h.fake.on("fast.previewCommands", args => {
+      assert.equal(c.env, "Preview");
+      const commands = args.commands as string[];
+      const steps = commands.map(command => ({ command, status: "succeeded", feedback: c.apply(command) }));
+      return { status: "succeeded", steps };
+    });
+    const r = await h.callJson("gma3_store_cues", { sequence: 969, mode: "create", exclusive: true,
+      cues: [{ cue: 1, fixtures: "101", intensity: 55, values: [{ attribute: "ColorRGB_B", value: 90, unit: "percent" }] }] });
+    assert.equal(r.isError, false, r.text);
+    assert(h.fake.requests.some(r => r.op === "fast.previewCommands"));
+    assert.equal(c.seqs.get(969)?.cues[0].data["101"].Dimmer, 55);
+    assert.equal(c.env, "Normal");
+  } finally { await h.close(); }
+});
+
+test("uncertain static look series is not replayed or stored", async () => {
+  const { h, c } = await setup();
+  try {
+    h.fake.on("fast.context", () => ({ contextKey: "lab", environment: c.env, identityUncertain: [], previewCommandSeries: 1 }));
+    h.fake.on("fast.previewCommands", args => {
+      const commands = args.commands as string[];
+      c.apply(commands[0]);
+      return { status: "unknown", steps: [{ command: commands[0], status: "unknown", feedback: "uncertain" }] };
+    });
+    const r = await h.callJson("gma3_store_cues", { sequence: 969, mode: "create", exclusive: true,
+      cues: [{ cue: 1, fixtures: "101", intensity: 55 }] });
+    assert.equal(r.isError, true);
+    assert.equal(h.fake.requests.filter(r => r.op === "fast.previewCommands").length, 1);
+    assert.equal(c.seqs.has(969), false);
+    assert.equal(h.fake.commands.some(command => command === "At 55"), false);
+    assert.equal(c.env, "Normal");
+  } finally { await h.close(); }
+});
+
+test("timed looks use individual commands and verify timing before Store", async () => {
+  const { h, c } = await setup();
+  try {
+    h.fake.on("fast.context", () => ({ contextKey: "lab", environment: c.env, identityUncertain: [], previewCommandSeries: 1 }));
+    h.fake.on("fast.previewCommands", () => assert.fail("timed look must use individual commands"));
+    const timedCommand = 'Attribute "Dimmer" At Absolute Percent 40 Fade 1.25 Delay 0';
+    const args = {
+      sequence: 969, mode: "create", exclusive: true,
+      cues: [{ cue: 1, fixtures: "101", values: [{ attribute: "Dimmer", value: 40, unit: "percent", fade: 1.25, delay: 0 }] }],
+    };
+    const stored = await h.callJson("gma3_store_cues", args);
+    assert.equal(stored.isError, false, stored.text);
+    assert(h.fake.commands.includes(timedCommand));
+    assert.equal(c.seqs.get(969)?.cues[0].data["101"].Dimmer, 40);
+    h.fake.onCommand(command => c.apply(command === timedCommand ? command.replace("Fade 1.25", "Fade 2") : command));
+    const mismatch = await h.callJson("gma3_store_cues", { ...args, sequence: 970 });
+    assert.equal(mismatch.isError, true, mismatch.text);
+    assert.match(mismatch.text, /fade reads 2 s, expected 1\.25 s/);
+    assert.equal(c.seqs.has(970), false);
+    assert.equal(c.env, "Normal");
+  } finally { await h.close(); }
+});
+
+test("scoped Store addresses the requested part and stops after native readback failure", async () => {
+  const { h, c } = await setup();
+  try {
+    c.addCue(980, 1); c.addCue(980, 2);
+    const result = await buildCueBatch(h.ctx, {
+      sequence: 980, mode: "merge", cue_only: "off", verify: true,
+      cues: ["1", "2"].map(cue => ({ cue, part: 2, looks: [], timing: {} })),
+      storeScope: { fixtures: "Fixture 101", attributes: ["Dimmer"] },
+      verifyStored: async () => ({ status: "mismatched", detail: "Scoped native data did not match" }),
+    });
+    assert.deepEqual(h.fake.commands.filter(c => c.startsWith("Store")), [
+      'Store Sequence 980 Cue 1 Part 2 If Fixture 101 Attribute "Dimmer" EndIf /Merge /CueOnly "Off" /NoConfirmation',
+    ]);
+    assert.equal(result.cues[0].status, "failed");
+    assert.equal(result.cues[0].verification.status, "mismatched");
+    assert.equal(result.cues[1].status, "not_attempted");
+    assert.equal(result.normalProgrammer, "untouched");
+  } finally { await h.close(); }
+});
+
+test("scoped Store refuses malformed filter attributes before reading the console", async () => {
+  const { h } = await setup();
+  try {
+    await assert.rejects(buildCueBatch(h.ctx, {
+      sequence: 980, mode: "merge", cues: [], verify: true,
+      storeScope: { fixtures: "Fixture 101", attributes: ['Dimmer" ; Go'] },
+    }), /attribute name/i);
+    assert.equal(h.fake.requests.length, 0);
+  } finally { await h.close(); }
+});
+
+const rangeInput = { sequence: 981, fixtures: "101", from: 1, to: 2, tracking: "cue_only", values: [{ attribute: "ColorRGB_B", value: 100 }] };
+
+async function rangeSetup(options: { locked?: string; ignoreStore?: boolean; restore?: boolean; preset?: boolean } = {}) {
+  const { h, c } = await setup(registerCueRangeEditTools);
+  const seq = 981, storeOptions = { StoreLook: "No", StoreSource: "Programmer", ChannelFilter: "Active", TrackingShield: "Off" };
+  c.addCue(seq, 1, { "101": { Dimmer: 45, ColorRGB_B: 20 } });
+  c.addCue(seq, 2, { "101": { Dimmer: 65 } });
+  c.addCue(seq, 3, {});
+  h.fake.on("fast.context", () => ({ contextKey: "range-test-context", environment: c.env, identityUncertain: [] }));
+  h.fake.on("preset.context", () => ({ preferences: storeOptions }));
+  h.fake.on("objects", (args) => {
+    const result = c.objects(String(args.ref), (args.fields ?? []) as string[]);
+    if ((args.fields as string[] | undefined)?.includes("Lock")) for (const item of result.items) {
+      Object.assign(item.fields, { Lock: args.ref === options.locked ? "UL" : "" });
+    }
+    return result;
+  });
+  h.fake.on("cue.content", args => {
+    const m = String(args.ref).match(/ Cue ([\d.]+)$/);
+    const cues = c.seqs.get(seq)!.cues.filter(x => !m || x.no === +m[1]).map(x => ({ no: x.no * 1000, name: x.name, fields: {}, parts: [{ no: 0, fields: {},
+      contentJson: JSON.stringify({ byFixtures: true, truncated: false, rows: Object.entries(x.data).flatMap(([fixture, attrs]) => Object.entries(attrs).map(([attribute, value]) => ({ fixture, attribute, hasAbsolute: true, hasRelative: false, value }))) }),
+    }] }));
+    return { complete: true, sequence: { fields: { Tracking: "Yes" } }, cues };
+  });
+  if (options.preset) h.fake.on("preset.read", () => ({ truncated: false, byFixtures: true, count: 2, pool: { no: 4 }, no: 902,
+    rows: [{ fixture: "101", attribute: "ColorRGB_B", hasAbsolute: true }, { fixture: "101", attribute: "Dimmer", hasAbsolute: true }] }));
+  h.fake.onCommand(cmd => {
+    const store = cmd.match(/^Store Sequence 981 Cue (\d+) Part 0 If Fixture 101 Attribute "ColorRGB_B" EndIf \/Merge \/CueOnly "(On|Off)" \/NoConfirmation$/);
+    if (!store) return c.apply(cmd);
+    if (options.ignoreStore) return "OK";
+    const cue = c.cue(seq, +store[1])!;
+    const following = c.seqs.get(seq)!.cues.find(x => x.no > cue.no);
+    if (options.restore !== false && store[2] === "On" && following && following.data["101"]?.ColorRGB_B === undefined) {
+      let prior;
+      for (const x of c.seqs.get(seq)!.cues) {
+        if (x.no > cue.no) break;
+        if (x.data["101"]?.ColorRGB_B !== undefined) prior = x.data["101"].ColorRGB_B;
+      }
+      if (prior !== undefined) (following.data["101"] ??= {}).ColorRGB_B = prior;
+    }
+    (cue.data["101"] ??= {}).ColorRGB_B = c.prog.Preview.get("101")!.get("ColorRGB_B")!.value;
+    return "OK";
+  });
+  return { h, c, storeOptions };
+}
+
+test("range edit previews only existing targets, then keeps Dimmer and restores later color", async () => {
+  const { h, c } = await rangeSetup();
+  try {
+    const { result: preview, isError: previewError } = await h.callJson("gma3_edit_cue_values", rangeInput);
+    assert.equal(previewError, false, preview.summary);
+    assert.deepEqual(preview.plan.selectedCues, [1, 2]);
+    assert.deepEqual(preview.plan.restorationCandidates, [2, 3]);
+    assert.equal(preview.plan.preservesIntensity, true);
+    assert.deepEqual(h.fake.commands, []);
+    const { result, isError } = await h.callJson("gma3_edit_cue_values", { ...rangeInput, preview: false, exclusive: true, expected_fingerprint: preview.fingerprint });
+    assert.equal(isError, false, result.summary);
+    assert.equal(result.verification.status, "matched");
+    assert.deepEqual(c.cue(981, 1)?.data, { "101": { Dimmer: 45, ColorRGB_B: 100 } });
+    assert.deepEqual(c.cue(981, 2)?.data, { "101": { Dimmer: 65, ColorRGB_B: 100 } });
+    assert.deepEqual(c.cue(981, 3)?.data, { "101": { ColorRGB_B: 20 } });
+    assert.equal(c.prog.Normal.get("301")?.get("Dimmer")?.value, 33);
+  } finally { await h.close(); }
+});
+
+test("range apply refuses missing/locked targets, stale preview, or unsafe Store preferences before commands", async () => {
+  const { h, c, storeOptions } = await rangeSetup({ locked: "Sequence 981 Cue 2 Part 0" });
+  try {
+    const apply = { ...rangeInput, preview: false, exclusive: true };
+    for (const args of [{ ...apply, from: undefined, to: undefined, cues: [1, 999] }, { ...apply, part: 2 }, apply]) {
+      const { isError } = await h.callJson("gma3_edit_cue_values", args);
+      assert.equal(isError, true);
+    }
+    const { result: preview } = await h.callJson("gma3_edit_cue_values", rangeInput);
+    c.cue(981, 1)!.data["101"].Dimmer = 77;
+    assert.equal((await h.callJson("gma3_edit_cue_values", { ...apply, expected_fingerprint: preview.fingerprint })).isError, true);
+    storeOptions.StoreLook = "Yes";
+    assert.match((await h.callJson("gma3_edit_cue_values", apply)).result.summary, /Store preferences/);
+    assert.deepEqual(h.fake.commands, []);
+  } finally { await h.close(); }
+});
+
+test("range stops after an acknowledged Store that did not change native cue data", async () => {
+  const { h } = await rangeSetup({ ignoreStore: true });
+  try {
+    const { result, isError } = await h.callJson("gma3_edit_cue_values", { ...rangeInput, preview: false, exclusive: true });
+    assert.equal(isError, true);
+    assert.equal(result.cues[0].status, "failed");
+    assert.equal(result.cues[1].status, "not_attempted");
+    assert.equal(h.fake.commands.filter(cmd => cmd.startsWith("Store")).length, 1);
+  } finally { await h.close(); }
+});
+
+test("range preview uses native preset coverage and excludes implicit preset Dimmer", async () => {
+  const { h } = await rangeSetup({ preset: true });
+  try {
+    const { result, isError } = await h.callJson("gma3_edit_cue_values", { ...rangeInput, values: undefined, presets: [{ pool: 4, preset: 902 }] });
+    assert.equal(isError, false, result.summary);
+    assert.deepEqual(result.plan.attributes, [{ attribute: "ColorRGB_B", layer: "absolute" }]);
+    assert.equal(result.plan.preservesIntensity, true);
+    assert.deepEqual(h.fake.commands, []);
+  } finally { await h.close(); }
+});
 
 /** Every step error of a result, for matching. */
 const errors = (r: { result: any }): string => (r.result.steps ?? []).map((s: any) => s.error ?? "").join(" | ");

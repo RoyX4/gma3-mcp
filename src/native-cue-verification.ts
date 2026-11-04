@@ -11,14 +11,19 @@ export function verifyNativeOwnedState(compilation: Compilation, native: unknown
   const reconstruction = reconstructNativeCues(native);
   const checked = "compiler-owned channel layers in actual native cue-part data after Store, including tracked inheritance";
   if (!reconstruction.complete) return { status: "unavailable", checked, detail: reconstruction.limitations.join("; ") };
-  const authored = reconstruction.cues.filter(cue => cue.no > 0), through = Math.max(0, ...authored.map(cue => cue.no));
+  const authored = reconstruction.cues.filter(cue => cue.no > 0);
   if (!authored.length && compilation.cues.length) return {status: "unavailable", checked, detail: "No authored native cue exists to compare; an empty sequence is not verification of the plan."};
   const problems: string[] = [], unsupported: string[] = [];
-  let comparisons = 0;
+  const byNumber = new Map<number, typeof authored[number]>();
+  let comparisons = 0, through = 0;
   const numbers = new Set(compilation.cues.map(cue => Math.round(Number(cue.cue) * 1000)));
-  for (const cue of authored) if (!numbers.has(cue.no)) problems.push(`Unexpected native cue ${cue.no / 1000} exists in the owned sequence.`);
+  for (const cue of authored) {
+    byNumber.set(cue.no, cue);
+    if (!numbers.has(cue.no)) problems.push(`Unexpected native cue ${cue.no / 1000} exists in the owned sequence.`);
+    through = Math.max(through, cue.no);
+  }
   for (const wanted of compilation.cues.filter(cue => Math.round(Number(cue.cue) * 1000) <= through)) {
-    const actual = authored.find(cue => cue.no === Math.round(Number(wanted.cue) * 1000));
+    const actual = byNumber.get(Math.round(Number(wanted.cue) * 1000));
     if (!actual) { problems.push(`Native cue ${wanted.cue} is missing.`); continue; }
     const values = new Map(actual.effective.map(cell => [key(cell), cell]));
     const ownedKeys = new Set(wanted.state.map(key));

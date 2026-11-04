@@ -126,9 +126,10 @@ local function check(name, cond, detail)
   else failures = failures + 1; print("FAIL " .. name .. (detail and (": " .. tostring(detail)) or "")) end
 end
 local function J(v) local ok, s = pcall(json.encode, v); return ok and s or tostring(v) end
-local function request(op, args)
+local defaultClient = { id = 1 }
+local function request(op, args, client)
   local line = json.encode({ id = "t", op = op, args = args or {} })
-  local co = coroutine.create(function() return state._handleLine({ id = 1 }, line) end)
+  local co = coroutine.create(function() return state._handleLine(client or defaultClient, line) end)
   local ok, res = coroutine.resume(co)
   while ok and coroutine.status(co) == "suspended" do ok, res = coroutine.resume(co) end
   assert(ok, res)
@@ -198,6 +199,56 @@ check("preset.read: native abs_release flag identifies release without guessing 
 registry[part].addr="14.14.1.7.9.-1.0"
 r=request("cue.content",{ref="Sequence 1"})
 check("cue.content: native negative cue-part database addresses need no re-resolution",r.ok and r.result.complete==true and json.decode(r.result.cues[1].parts[1].contentJson).count==2,J(r))
+
+-- Frozen cue pages cover large lists without rescanning or mixing later edits into the capture.
+local previousRoot, previousUser, previousEnvironment = Root, CurrentUser, CurrentEnvironment
+Root = function() return { MANetSocket = { Get = function() return "Paged Lab" end }, maNetSocket = { hostname = "Paged Station" } } end
+CurrentUser = function() return {name="Admin"} end
+CurrentEnvironment = function() return {name="Normal"} end
+local function internalCue(name, no, addr)
+  local p = H({name="Part 0",class="Part",addr=addr..".0"})
+  presetData[p] = {count=0,by_fixtures={}}
+  return H({name=name,no=no,class="Cue",addr=addr,children={p}})
+end
+local internalSeq = H({name="Internals",class="Sequence",addr="INTERNAL",children={
+  internalCue("OffCue",nil,"INTERNAL.0"), internalCue("CueZero",0,"INTERNAL.1000")
+}})
+objects["Sequence 6"] = internalSeq
+local internalRead = request("cue.content",{action="create",ref="Sequence 6"})
+check("cue.content: recognized internal main parts need no native Part property",
+  internalRead.ok and internalRead.result.complete and internalRead.result.cues[1].parts[1].no==0
+  and internalRead.result.cues[2].parts[1].no==0,J(internalRead))
+request("cue.content",{action="release",snapshotId=internalRead.result.snapshotId})
+local pagedParts, pagedCues = {}, {}
+for i=1,503 do
+  -- Native Part numbers can differ from address slots; the handle's no is absent.
+  local p=H({name="Paged Part",class="Part",addr="PAGED.C"..i..".1",props={Part=i==201 and 2 or 0}})
+  pagedParts[i]=p; presetData[p]={count=0,by_fixtures={}}
+  pagedCues[i]=H({name="Paged "..i,class="Cue",no=i*1000,addr="PAGED.C"..i,children={p},props={AllowDuplicates="Yes"}})
+end
+local pagedSeq=H({name="Paged",class="Sequence",no=5,addr="PAGED",children=pagedCues,props={Tracking="Yes"}})
+objects["Sequence 5"]=pagedSeq
+local nativeReads=0
+GetPresetData=function(h) nativeReads=nativeReads+1; return presetData[h] end
+local caps=request("cue.content",{action="capabilities"})
+check("cue.content: declares bounded frozen paging capability",caps.ok and caps.result.protocol=="gma3-cue-snapshot-v1" and caps.result.maxCueObjects==10002 and caps.result.maxPageCues==200,J(caps))
+local captured=request("cue.content",{action="create",ref="Sequence 5",limit=200,ttlMs=60000})
+local cs=captured.ok and captured.result or {}
+check("cue.content: captures all503 objects but replies with200",captured.ok and cs.complete and cs.frozen and cs.atomic==false and cs.total==503 and #cs.cues==200 and #cs.cueOrder==503 and cs.cues[1].fields.AllowDuplicates=="Yes",J(captured))
+local readsAtCapture=nativeReads
+check("cue.content: normalized and raw data use one native observation per part",readsAtCapture==503,tostring(readsAtCapture))
+presetData[pagedParts[201]]={count=999,by_fixtures={}}
+local nextPage=request("cue.content",{action="page",snapshotId=cs.snapshotId,cursor=cs.nextCursor,limit=200})
+check("cue.content: later edit cannot mix into frozen pages or trigger native rescan",nextPage.ok and nextPage.result.offset==200 and #nextPage.result.cues==200 and json.decode(nextPage.result.cues[1].parts[1].contentJson).count==0 and nativeReads==readsAtCapture,J(nextPage):sub(1,1200))
+check("cue.content: raw Part property supplies the native part number instead of the address slot",nextPage.ok and nextPage.result.cues[1].parts[1].no==2)
+local foreign=request("cue.content",{action="page",snapshotId=cs.snapshotId,cursor=cs.nextCursor,limit=200},{id=2})
+check("cue.content: frozen snapshots belong to one client",not foreign.ok and foreign.code=="snapshot-unavailable",J(foreign))
+local tail=request("cue.content",{action="page",snapshotId=cs.snapshotId,cursor=nextPage.ok and nextPage.result.nextCursor,limit=200})
+check("cue.content: final page covers remaining103 without rescan",tail.ok and tail.result.offset==400 and #tail.result.cues==103 and tail.result.nextCursor==nil and nativeReads==readsAtCapture,J(tail))
+check("cue.content: invalid cursor and limit are rejected",not request("cue.content",{action="page",snapshotId=cs.snapshotId,cursor="foreign/200"}).ok and not request("cue.content",{action="create",ref="Sequence 5",limit=201}).ok)
+check("cue.content: snapshot release is confirmed",request("cue.content",{action="release",snapshotId=cs.snapshotId}).result.released==true)
+check("cue.content: released snapshot cannot be reused",not request("cue.content",{action="page",snapshotId=cs.snapshotId,cursor=cs.nextCursor}).ok)
+Root, CurrentUser, CurrentEnvironment = previousRoot, previousUser, previousEnvironment
 
 function methods.PropertyCount(u) local n=0; for _ in pairs(registry[u].props) do n=n+1 end; return n end
 function methods.PropertyName(u,i) local names={}; for k in pairs(registry[u].props) do names[#names+1]=k:upper() end; table.sort(names); return names[i+1] end

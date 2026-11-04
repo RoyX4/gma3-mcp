@@ -570,6 +570,7 @@ do
   attr("ColorRGB_G", 107, "G", featRGB, agRGB, "ColorComponent", "Percent", "0,1,0,1")
   attr("ColorRGB_B", 108, "B", featRGB, agRGB, "ColorComponent", "Percent", "0,0,1,1")
   attr("Shutter1", 149, "Sh1", featShutter, nil, "None", "Percent")
+  attr("Strobe1", 150, "Strobe", featShutter, nil, "Frequency", "Physical")
 
   -- Fixture types: DMXMode -> DMXChannels -> DMXChannel -> LogicalChannel -> ChannelFunction -> ChannelSet
   local function cf(name, attrName, dmxFrom, dmxTo, physFrom, physTo, sets)
@@ -599,7 +600,10 @@ do
     dmxChannel("Main Module", "Tilt", 3, 4, { cf("Tilt 1", "Tilt", "000000", "FFFFFF", "-135.0000000000", "135.0000000000") }),
     dmxChannel("Main Module", "Dimmer", 5, nil, { cf("Dimmer 1", "Dimmer", "000000", "FFFFFF", "0.0", "1.0") }),
     dmxChannel("Main Module", "Gobo1", 6, nil, { cf("Gobo1 1", "Gobo1", "000000", "FFFFFF", "0.0", "1.0", goboSets) }),
-    dmxChannel("Main Module", "Shutter1", 7, nil, { cf("Shutter1 1", "Shutter1", "000000", "0F0F0F", "0.0", "0.0"), cf("Shutter1 Strobe", "Shutter1", "101010", "FFFFFF", "1.0", "20.0") }),
+    dmxChannel("Main Module", "Shutter1", 7, nil, {
+      cf("Shutter1 1", "Shutter1", "000000", "0F0F0F", "0.0", "0.0", { { "Closed", "000000", "0F0F0F", "0.0", "0.0" } }),
+      cf("Shutter1 Strobe", "Strobe1", "101010", "FFFFFF", "1.0", "20.0", { { "Slow to fast", "101010", "FFFFFF", "1.0", "20.0" } }),
+    }),
   })
   local washMode = mode("Pixel", {
     dmxChannel("Main Module", "Dimmer", 1, nil, { cf("Dimmer 1", "Dimmer", "000000", "FFFFFF", "0.0", "1.0") }),
@@ -783,6 +787,56 @@ do
   check("fixtureAttributes: channel sets with wheel slots", gobo and #gobo.channelSets == 3 and gobo.channelSets[2].name == "gobo 1" and gobo.channelSets[2].dmxFrom == "0B0B0B" and gobo.channelSets[2].wheelSlotIndex == 2, json.encode(gobo))
   local shutter = r.ok and byAttr(r.result.attributes, "Shutter1")
   check("fixtureAttributes: all channel functions of the logical channel are named", shutter and #shutter.channelFunctions == 2 and shutter.channelFunctions[2] == "Shutter1 Strobe", json.encode(shutter))
+  check("fixtureAttributes: function details are opt-in", shutter and shutter.channelFunctionDetails == nil, json.encode(shutter))
+  r = request("fixtureAttributes", { ref = "Fixture 3", includeChannelFunctions = true })
+  local detailedShutter = r.ok and byAttr(r.result.attributes, "Shutter1")
+  local details = detailedShutter and detailedShutter.channelFunctionDetails
+  check("fixtureAttributes: detailed function option is acknowledged", r.ok and r.result.includeChannelFunctions == true, json.encode(r))
+  check("fixtureAttributes: detailed functions keep different raw DMX and physical ranges", details and #details == 2
+    and details[1].name == "Shutter1 1" and details[1].dmxFrom == "000000" and details[1].dmxTo == "0F0F0F" and details[1].physicalFrom == 0
+    and details[2].name == "Shutter1 Strobe" and details[2].dmxFrom == "101010" and details[2].dmxTo == "FFFFFF" and details[2].physicalFrom == 1 and details[2].physicalTo == 20, json.encode(details))
+  check("fixtureAttributes: detailed functions use each function's own attribute and unit", details and details[1].attribute == "Shutter1" and details[1].physicalUnit == "None"
+    and details[2].attribute == "Strobe1" and details[2].attributeIndex == 150 and details[2].physicalUnit == "Frequency", json.encode(details))
+  check("fixtureAttributes: detailed functions carry their own channel sets", details and details[1].channelSets[1].name == "Closed" and details[2].channelSets[1].name == "Slow to fast"
+    and details[2].channelSets[1].physicalFrom == 1 and details[2].channelSets[1].dmxFrom == "101010", json.encode(details))
+  check("fixtureAttributes: detailed option does not alter legacy selected metadata or add legacy sets", detailedShutter and detailedShutter.channelFunction == "Shutter1 1"
+    and detailedShutter.dmxTo == "0F0F0F" and detailedShutter.physicalTo == 0 and detailedShutter.channelSets == nil, json.encode(detailedShutter))
+  local strobeHandle = findCf(moverMode, "Shutter1 Strobe")
+  local strobeProps, strobeChildren = registry[strobeHandle].props, registry[strobeHandle].children
+  local strobeAttribute, strobeUnitFrom, strobeTo = strobeProps.attribute, strobeProps.physicalfrom, strobeProps.dmxto
+  strobeProps.attribute, strobeProps.physicalfrom, strobeProps.dmxto, registry[strobeHandle].children = nil, nil, nil, nil
+  r = request("fixtureAttributes", { ref = "Fixture 3", includeChannelFunctions = true })
+  details = r.ok and byAttr(r.result.attributes, "Shutter1").channelFunctionDetails
+  check("fixtureAttributes: unreadable function fields and sets stay unavailable", details and details[2].attribute == nil and details[2].physicalUnit == nil
+    and details[2].physicalFrom == nil and details[2].dmxTo == nil and details[2].channelSets == nil and has(r.result.limitations, "channel sets.*unavailable"), json.encode(r))
+  strobeProps.attribute, strobeProps.physicalfrom, strobeProps.dmxto, registry[strobeHandle].children = strobeAttribute, strobeUnitFrom, strobeTo, strobeChildren
+  local manySets = {}
+  for i = 1, 1001 do manySets[i] = strobeChildren[1] end
+  registry[strobeHandle].children = manySets
+  r = request("fixtureAttributes", { ref = "Fixture 3", includeChannelFunctions = true })
+  details = r.ok and byAttr(r.result.attributes, "Shutter1").channelFunctionDetails
+  check("fixtureAttributes: detailed sets obey the existing 1000-item request bound with an honest flag", details and #details[2].channelSets < 1000
+    and details[2].channelSetsTruncated == true and r.result.channelFunctionDetailsBudget.used == 1000 and r.result.channelFunctionDetailsBudget.truncated == true
+    and has(r.result.limitations, "channel sets truncated.*1000"), json.encode(r.result and r.result.limitations))
+  registry[strobeHandle].children = strobeChildren
+  local logical = registry[strobeHandle].parent
+  local originalFunctions, manyFunctions = registry[logical].children, {}
+  for i = 1, 1001 do manyFunctions[i] = originalFunctions[1] end
+  registry[logical].children = manyFunctions
+  r = request("fixtureAttributes", { ref = "Fixture 3", includeChannelFunctions = true })
+  detailedShutter = r.ok and byAttr(r.result.attributes, "Shutter1")
+  check("fixtureAttributes: detailed functions obey the existing 1000-item request bound with an honest flag", detailedShutter and #detailedShutter.channelFunctionDetails < 1000
+    and detailedShutter.channelFunctionDetailsTruncated == true and r.result.channelFunctionDetailsBudget.used == 1000 and r.result.channelFunctionDetailsBudget.truncated == true
+    and has(r.result.limitations, "channel functions truncated.*1000"), json.encode(r.result and r.result.limitations))
+  registry[logical].children = originalFunctions
+  local goboHandle = findCf(moverMode, "Gobo1 1")
+  local originalGoboSets = registry[goboHandle].children
+  registry[goboHandle].children = manySets
+  r = request("fixtureAttributes", { ref = "Fixture 3", includeChannelFunctions = true, limit = 1, offset = 4 })
+  detailedShutter = r.ok and byAttr(r.result.attributes, "Shutter1")
+  check("fixtureAttributes: detail budget applies to the requested attribute page", detailedShutter and #detailedShutter.channelFunctionDetails == 2
+    and r.result.channelFunctionDetailsBudget.used == 4 and r.result.channelFunctionDetailsBudget.truncated == false, json.encode(r))
+  registry[goboHandle].children = originalGoboSets
   r = request("fixtureAttributes", { ref = "Fixture 3", limit = 2, offset = 3 })
   check("fixtureAttributes: pagination", r.ok and r.result.total == 5 and r.result.count == 2 and r.result.offset == 3 and r.result.attributes[1].attribute == "Gobo1", json.encode(r))
 
@@ -825,6 +879,13 @@ do
   check("fixtureAttributes: walk rows carry mode offsets, no UI channel, and matched addresses", pan and pan.uiChannel == nil and pan.dmxChannel.name == "Main Module_Pan" and pan.dmxChannel.coarseOffset == "1" and pan.dmxChannel.fineOffset == "2" and pan.dmx.coarse == "2.001" and pan.physicalFrom == -270, json.encode(pan))
   gobo = r.ok and byAttr(r.result.attributes, "Gobo1")
   check("fixtureAttributes: walk rows include channel sets", gobo and gobo.channelSets and #gobo.channelSets == 3, json.encode(gobo))
+  GetUIChannels = nil
+  r = request("fixtureAttributes", { ref = "Fixture 3", includeChannelFunctions = true })
+  GetUIChannels = savedGetUIChannels
+  detailedShutter = r.ok and byAttr(r.result.attributes, "Shutter1")
+  details = detailedShutter and detailedShutter.channelFunctionDetails
+  check("fixtureAttributes: walk fallback includes all detailed functions and their own attributes", r.ok and r.result.source == "fixtureTypeWalk" and details and #details == 2
+    and details[2].attribute == "Strobe1" and details[2].physicalUnit == "Frequency" and details[2].dmxFrom == "101010" and details[2].channelSets[1].name == "Slow to fast", json.encode(r))
 
   r = request("fixtureAttributes", { ref = "Group 1" })
   check("fixtureAttributes: non-fixture reference rejected", r.ok == false and r.error:find("not a Fixture"), json.encode(r))

@@ -136,8 +136,10 @@ try {
       cursors.add(cursor);
     }
   } while (cursor);
-  assert.equal(names.length, 150, "packaged server tool inventory changed");
-  for (const name of ["gma3_cue_settings", "gma3_configure_cue"]) assert.ok(names.includes(name), `missing cue settings tool ${name}`);
+  assert.equal(names.length, 152, "packaged server tool inventory changed");
+  for (const name of ["gma3_cue_settings", "gma3_configure_cue", "gma3_edit_cue_values", "gma3_cue_tracking_action"]) {
+    assert.ok(names.includes(name), `missing cue workflow tool ${name}`);
+  }
   assert.equal(new Set(names).size, names.length, "packaged server has duplicate tool names");
   for (const name of criticalTools) assert.ok(names.includes(name), `missing critical tool ${name}`);
   await client.close(); client = undefined;

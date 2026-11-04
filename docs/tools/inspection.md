@@ -43,10 +43,11 @@ Attribute discovery for one fixture or subfixture.
 | Parameter | Type | Meaning |
 | --- | --- | --- |
 | `fixture` | number or string | `101`, `"501.3"`, `"Fixture 501.3"`. Exactly one (sub)fixture; groups and ranges are refused. |
-| `include_channel_sets` | boolean | Add each channel function's ChannelSets (gobo slots, colour slots ...). Default false. |
+| `include_channel_sets` | boolean | Add the selected/default function's `channelSets`, such as gobo slots. Default false. |
+| `include_channel_functions` | boolean | Add each function's own attribute, unit, ranges and sets to `channelFunctionDetails`. Default false. |
 | `limit`, `offset` | integer | Pagination over the attribute rows (default 100, max 500). |
 
-Sends one bridge request: `fixtureAttributes {ref, limit, offset, includeChannelSets}`. The fixture is resolved
+Sends `fixtureAttributes {ref, limit, offset, includeChannelSets}` with `includeChannelFunctions:true` when detailed functions are requested. The fixture is resolved
 with `ObjectList(ref)`, i.e. **by fixture ID**; the patch index is read from `SubfixtureIndex` and reported
 separately (`subfixtureIndex`). For a SubFixture the owning Fixture is found through `Parent()` and supplies
 FixtureType, Mode, Patch and FID.
@@ -81,6 +82,12 @@ channel matches the attribute by name), `dmxChannel` (walk path only), and `chan
   appear once (stated in `limitations`). The DMXMode handle is resolved from `Get("Mode")`, the `Mode` field, or
   (because the console returned the display text `"1 Mode 0"` instead of a handle for one fixture live) from
   `FixtureType -> DMXModes` matched by that text.
+
+With `include_channel_functions: true`, each returned attribute row includes `channelFunctionDetails`. The legacy `channelFunctions` list holds names, and the row's top-level ranges describe the selected/default function. Each detailed entry includes the function's own name and attribute, physical unit, DMX bounds and default, physical bounds, fade, acceleration, and channel sets. A shutter's strobe function can therefore expose a different attribute and unit from the logical channel's selected function.
+
+Per-function channel sets include names, DMX and physical bounds, and wheel-slot indices. The new option includes them independently of `include_channel_sets`. `null` means a field or list is unavailable. `[]` means a readable list is empty. A supporting bridge acknowledges the request with `includeChannelFunctions:true`. Older bridges return the regular attribute data with an explicit limitation for the requested details.
+
+The detail budget counts up to 1,000 function and channel-set entries on the returned attribute page. `channelFunctionDetailsBudget` reports the limit, usage and truncation. `channelFunctionDetailsTruncated` and `channelSetsTruncated` identify affected lists. The direct opt-in bridge response allows two extra serialization levels for the nested sets and retains cycle handling. These fields describe fixture-profile definitions. Read actual levels separately with `gma3_programmer` or `gma3_fixture_output`.
 
 Not available: current values (use `gma3_programmer` / `gma3_fixture_output`), and a per-attribute DMX mapping
 when several RT channels share the attribute name (compound fixtures; `channels[]` still has the full map).

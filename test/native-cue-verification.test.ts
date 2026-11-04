@@ -19,6 +19,13 @@ test("native semantic verifier cannot call incomplete content a match", () => {
 test("an empty native sequence cannot verify a nonempty authored plan", () => {
   assert.notEqual(verifyNativeOwnedState(compilation, {...native(),cues:[]}).status,"matched");
 });
+test("a second native cue with the same number cannot be hidden by the first matching cue", () => {
+  const observed = native();
+  observed.cues.push(native(80).cues[0]);
+  const result = verifyNativeOwnedState(compilation, observed);
+  assert.equal(result.status, "unavailable");
+  assert.match(result.detail ?? "", /native cue numbers are duplicated/i);
+});
 test("a phaser containing one released step is not an entirely released layer", () => {
   const p=compileTracking({version:1,sequence:9001,cues:[{cue:1,changes:[{kind:"value",fixtures:"1",attribute:"Dimmer",value:40}]},{cue:2,changes:[{kind:"release",fixtures:"1",attribute:"Dimmer"}]}]});
   const n=native();

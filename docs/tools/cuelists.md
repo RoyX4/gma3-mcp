@@ -17,11 +17,14 @@ A cue's content is one look or several. A look is a target and what to give it:
 | `fixtures` | the target (`"101 Thru 112"`, `"Group 3"`); defaults to the call's `fixtures` |
 | `presets` | presets applied in order, each `{pool, preset}` (number or name), `At Preset P.N` |
 | `intensity` | 0–100 %, `At <value>` |
-| `values` | attribute values as in `gma3_set_attributes` (`attribute`, `value`, `unit`), applied after the presets |
+| `values` | attribute values as in `gma3_set_attributes` (`attribute`, `value`, `unit`), applied after the presets. Absolute values may specify individual `fade` and `delay` in seconds |
 
 A cue gives either the shorthand fields (`fixtures`, `presets`, `intensity`, `values`: one look) or `looks` (up to
 16). Looks are applied in order, so a later look wins on fixtures they share. Setting one colour attribute
 activates the fixture's whole colour group (KB-17), so a cue can hold more values than were given.
+
+Timing on a `values` entry applies to that attribute. Cue-level `fade` and `delay` set the general timing on Part 0.
+Use a Dimmer value entry for individual intensity timing. For example, `{"attribute":"Dimmer","value":40,"unit":"percent","fade":1.25,"delay":0}`.
 
 ## How a batch is built
 
@@ -51,6 +54,7 @@ activates the fixture's whole colour group (KB-17), so a cue can hold more value
 - every preset must be linked on every selected fixture or its cells, as `gma3_apply_preset` checks, right after its
   recall: a later preset of the same look may take over its channels, which is the order asked for;
 - the intensity and values are compared per fixture and cell, as `gma3_set_attributes` compares them.
+  Requested individual timing must be active for storage and match within 0.001 seconds.
 
 With verification enabled, a mismatched or unavailable required look check **stops the batch before that cue is
 stored**. Cues already stored stay; nothing is undone or retried. `verify:false` skips the look checks and does

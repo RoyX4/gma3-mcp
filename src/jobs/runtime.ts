@@ -17,10 +17,12 @@ import type { Verification } from "../results.js";
 import { observeRebind } from "./rebind.js";
 import { nativeContentFingerprint } from "../native-cues.js";
 import { NATIVE_CONTENT_FINGERPRINT_VERSION } from "../native-fingerprint.js";
+import { readNativeCueContent, requireNativeCuePaging } from "../native-cue-reader.js";
 
 const engines = new WeakMap<ToolContext, JobEngine>();
-// cue.content in the maintained Lua bridge is bounded to 500 objects, including internal cues.
-const NATIVE_CHECKPOINT_CUE_OBJECT_LIMIT = 500;
+// Older bridges cap a complete scan at 500 native objects, including internal cues.
+const LEGACY_CUE_OBJECT_LIMIT = 500;
+const INTERNAL_CUE_ALLOWANCE = 2;
 function routeIdentity():RouteIdentity {
   const route:RouteIdentity={};
   if(process.platform==="linux") {
@@ -39,10 +41,9 @@ export function engineFor(ctx: ToolContext): JobEngine {
 
 /** Exact native sequence data is mandatory. Metadata-only hashes never stand in for hard cue values. */
 export async function observeSequence(ctx: ToolContext, compilation: Compilation, expectedCues = 0): Promise<Observation> {
-  if (compilation.cues.length >= NATIVE_CHECKPOINT_CUE_OBJECT_LIMIT) {
-    throw new Error(`Plans with ${NATIVE_CHECKPOINT_CUE_OBJECT_LIMIT} or more authored cues require a paginated native checkpoint reader; internal cues also use the current scan bound. No batch was sent.`);
-  }
   const requests: RequestTiming[] = [], timed = timedBridge(ctx.bridge, requests, ctx.requestTimeoutMs);
+  const requiresPaging = compilation.cues.length + INTERNAL_CUE_ALLOWANCE > LEGACY_CUE_OBJECT_LIMIT;
+  if (requiresPaging) await requireNativeCuePaging(timed, compilation.cues.length + INTERNAL_CUE_ALLOWANCE, ctx.requestTimeoutMs);
   const route=routeIdentity();
   const before = await readFastContext(timed, ctx.requestTimeoutMs);
   if (!before.contextKey || before.identityUncertain?.length) throw new Error("console identity is incomplete; generation, show, host, user and profile are required");
@@ -52,7 +53,10 @@ export async function observeSequence(ctx: ToolContext, compilation: Compilation
   if (existence.exists === "unknown") throw new Error(`sequence existence is unknown: ${existence.error}`);
   let content: unknown = { exists: false }, complete = true, existingCueCount = 0;
   if (existence.exists) {
-    const result = await scoped.bridge.request<Record<string, unknown>>("cue.content", { ref }, ctx.requestTimeoutMs);
+    const result = await readNativeCueContent(scoped.bridge, ref, ctx.requestTimeoutMs, {
+      requirePaging: requiresPaging,
+      context: { contextKey: before.contextKey, environment: before.environment },
+    });
     complete = result.complete === true;
     content = result;
     existingCueCount = Array.isArray(result.cues) ? result.cues.filter((c: any) => Number(c.no) > 0).length : 0;
