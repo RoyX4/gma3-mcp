@@ -34,6 +34,7 @@ the live test procedure on a disposable show.
 | Fixture-type library (SU-03, bridge 0.26.0; changes need `exclusive: true`) | `gma3_patch_library`, `gma3_patch_import`, `gma3_patch_remove_type` | [patch.md](patch.md) |
 | Fixture-type files into the user library (SU-22, bridge 0.38.0) | `gma3_patch_library_add` | [patch.md](patch.md#gma3_patch_library_add) |
 | Fixtures under a grouping fixture, retyping (bridge 0.42.0 / 0.29.0; need `exclusive: true`) | `gma3_patch_move`, `gma3_patch_retype` | [patch.md](patch.md#gma3_patch_move) |
+| Stages: list, create, rename, remove empty ones (#97, bridge 0.48.0, 0.49.0 for the bridge-side removal checks; changes need `exclusive: true`) | `gma3_patch_stages` | [patch.md](patch.md#gma3_patch_stages) |
 | Console dialogs (KB-27 in part, bridge 0.42.0; pressing needs `exclusive: true`) | `gma3_dialog` | [dialog.md](dialog.md) |
 | Fixture-type structure (SU-07, bridge 0.28.0; read-only) | `gma3_patch_type_structure` (and cell counts in `gma3_patch_types`, `gma3_patch_list`) | [patch.md](patch.md) |
 | Fixture positions in 3D (SU-04; no undo, refused while the patch copy is open) | `gma3_fixture_positions`, `gma3_place_fixtures` | [positions.md](positions.md) |
@@ -43,7 +44,7 @@ the live test procedure on a disposable show.
 | Groups with selection grids and MAtricks (SB-02, bridge 0.21.0; storing a group needs `exclusive: true`) | `gma3_selection_grid`, `gma3_store_group`, `gma3_matricks`, `gma3_configure_matricks` | [groups.md](groups.md) |
 | Presets with explicit storage rules (SB-03, bridge 0.22.0; storing needs `exclusive: true`) | `gma3_preset`, `gma3_store_preset` | [presets.md](presets.md) |
 | Phasers and effect distributions (SB-04, bridge 0.23.0; building needs `exclusive: true`) | `gma3_build_phaser`, `gma3_phaser_release` | [phasers.md](phasers.md) |
-| Recipes and cooking (SB-05, bridge 0.24.0) | `gma3_recipes`, `gma3_edit_recipe`, `gma3_cook_recipes` | [recipes.md](recipes.md) |
+| Recipes and cooking (SB-05, bridge 0.24.0) | `gma3_recipes`, `gma3_edit_recipe`, `gma3_store_recipe_cues`, `gma3_cook_recipes` | [recipes.md](recipes.md) |
 | Shared speed and synchronisation (SB-06; sequence links through `gma3_configure_sequence`) | `gma3_speed_masters`, `gma3_configure_speed_master`, `gma3_speed_master_action`, `gma3_observe_tempo` | [speed.md](speed.md) |
 | Macros as show actions (SB-07; authoring never runs a macro) | `gma3_macros`, `gma3_store_macro`, `gma3_edit_macro_line`, `gma3_run_macro` | [macros.md](macros.md) |
 | Timecode shows (SB-08, bridge 0.25.0; building never plays or records) | `gma3_timecodes`, `gma3_build_timecode`, `gma3_timecode_transport` | [timecode.md](timecode.md) |
@@ -98,6 +99,9 @@ is a default for each item, and an item's own fields win.
 | `gma3_configure_sequence` | `sequences` | numbers and `"a Thru b"` ranges; the same settings on each |
 | `gma3_store_cues` | `sequences` | `{sequence, sequence_name, mode, fixtures, cues}` |
 | `gma3_set_variable` | `variables` | `{scope, name, value, type}` or `{scope, name, delete: true}` (SU-15) |
+
+`gma3_store_recipe_cues` (#101) is a list tool of its own: `cues` are cue parts of one sequence, each an item under the
+rules below, with the references checked once for the whole call ([recipes.md](recipes.md#gma3_store_recipe_cues)).
 
 The rules (`src/batch.ts`):
 - Each item runs through the single form, so it gets that form's checks before anything is sent and its own

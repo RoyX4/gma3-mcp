@@ -12,7 +12,8 @@
  *                              menu) and no modal is open
  *   2. read   check_*          the tool's pre-flight (patch.check): FIDs and DMX ranges free, fixtures exist
  *   3. mut.   enter            patch.enter queues ChangeDestination into the copy (CmdIndirect)
- *   4. read   wait_copy        poll patch.state until the copy is open at the stage's Fixtures
+ *   4. read   wait_copy        poll patch.state until the copy is open at the stage's Fixtures (from bridge 0.45.0
+ *                              the stage is compared by the destination object's address, not its text: #98)
  *   5. mut.   add|set|remove   the edit, in the copy only (the bridge re-checks and undoes its own change
  *                              on any problem)
  *   6. read   isolation_check  fingerprints of the copy and the live patch, one collection per request,
@@ -33,6 +34,7 @@ import { BridgeError, type Gma3Bridge } from "../bridge.js";
 import {
   asRead,
   buildResult,
+  compactItems,
   notRequested,
   stepFromError,
   unavailable,
@@ -57,6 +59,11 @@ export interface PatchState {
   modal: false | { name?: string; class?: string; display?: number };
   stages: string[];
   lastCommand?: string;
+  /**
+   * Bridge 0.45.0: the copy's stage whose Fixtures the command line is at (index: its position in Stages), found by the
+   * destination object's address (by "text" only when that cannot be read). Absent when it is at none.
+   */
+  destinationStage?: { index: number; no?: number; name?: string; text?: string; by?: string } | null;
 }
 
 export interface FixtureRow {
@@ -187,8 +194,11 @@ async function checkStateStep(bridge: Gma3Bridge, t: number): Promise<StepResult
   }
 }
 
-/** Poll patch.state until `pred` holds. */
-async function waitStep(bridge: Gma3Bridge, name: string, t: number, pred: (s: PatchState) => boolean, what: string): Promise<StepResult> {
+/**
+ * Poll patch.state until `pred` holds. `settled` explains a last state that will not change by waiting longer (the copy
+ * open at another destination): the step then fails with that message instead of the timing one.
+ */
+async function waitStep(bridge: Gma3Bridge, name: string, t: number, pred: (s: PatchState) => boolean, what: string, settled?: (s: PatchState) => string | undefined): Promise<StepResult> {
   let last: PatchState | undefined;
   for (let i = 0; i < POLL_TRIES; i++) {
     try {
@@ -199,7 +209,28 @@ async function waitStep(bridge: Gma3Bridge, name: string, t: number, pred: (s: P
     if (pred(last)) return asRead({ name, status: "succeeded", op: "patch.state", detail: { destination: last.destination, copyOpen: last.copyOpen, polls: i + 1 } });
     await sleep(POLL_MS);
   }
+  const why = last && settled?.(last);
+  if (why) return asRead({ name, status: "failed", op: "patch.state", error: why, detail: last });
   return asRead({ name, status: "unknown", op: "patch.state", error: `${what} did not happen within ${(POLL_TRIES * POLL_MS) / 1000} s (CmdIndirect lands on a later frame)`, detail: last });
+}
+
+/**
+ * What wait_copy waits for, from patch.enter's reply. A bridge from 0.45.0 names the stage's position (stageIndex), and
+ * patch.state the stage whose Fixtures the command line is at, compared by address: a named stage's Fixtures reads
+ * "Stage 1 'Main Floor'.Fixtures", never the "<name>.Fixtures" an older bridge expected (#98). An older bridge, and the
+ * fixture-type pool (SU-03), are still compared by the exact destination text.
+ */
+export function copyArrival(entered: { expectDestination?: string; stageIndex?: number } | undefined): { at: (s: PatchState) => boolean; settled: (s: PatchState) => string | undefined } {
+  const expectDest = entered?.expectDestination;
+  const index = typeof entered?.stageIndex === "number" ? entered.stageIndex : undefined;
+  const there = (s: PatchState) => (index !== undefined ? s.destinationStage?.index === index : expectDest === undefined || s.destination === expectDest);
+  const expected = index !== undefined ? `${expectDest !== undefined ? JSON.stringify(expectDest) : "the Fixtures"} (stage ${index})` : JSON.stringify(expectDest);
+  // An older bridge at a named stage's Fixtures: say why its text can never match.
+  const oldBridge = (s: PatchState) => (index === undefined && expectDest?.endsWith(".Fixtures") && /^Stage \d+ '.*'\.Fixtures$/.test(s.destination ?? "") ? ` (a bridge before 0.45.0 expects "<name>.Fixtures", which a named stage never shows: install bridge 0.45.0)` : "");
+  return {
+    at: (s) => s.copyOpen && there(s),
+    settled: (s) => (s.copyOpen && !there(s) ? `the patch copy is open, but the command line destination is ${JSON.stringify(s.destination)}, expected ${expected}${oldBridge(s)}` : undefined),
+  };
 }
 
 /**
@@ -218,6 +249,12 @@ interface IsolationSpec {
   excludeTypesLive?: Array<{ index: number; guid: string }>;
   /** false: fixtures are compared without their position in their list (a move renumbers the fixtures after the moved ones). */
   fixturePositions?: false;
+  /**
+   * Stage sessions (#97, bridge 0.48.0), by stage position per side: excludeStages leaves a stage out with its content
+   * (one the session appended, copy side, or removed, live side); bareStages hashes a stage without its number and Name
+   * but its content in full (a renamed stage, and the stages after a removed one, which move up a place).
+   */
+  stages?: { excludeLive?: number[]; excludeCopy?: number[]; bareLive?: number[]; bareCopy?: number[] };
 }
 
 /** Collections an import appends to (the bridge applies prefixOfLive only there either way). */
@@ -232,17 +269,21 @@ async function fingerprints(bridge: Gma3Bridge, iso: IsolationSpec, t: number): 
   let complete = true;
   const reasons: string[] = [];
   if (JSON.stringify(cols.live) !== JSON.stringify(cols.copy)) mismatched.push(`collections differ: live ${cols.live.join(", ")} / copy ${cols.copy.join(", ")}`);
+  const st = iso.stages;
+  const stageArgs = (exclude: number[] | undefined, bare: number[] | undefined) => ({ ...(exclude?.length ? { excludeStages: exclude } : {}), ...(bare?.length ? { bareStages: bare } : {}) });
   for (const collection of cols.live) {
     const positions = iso.fixturePositions === false ? { fixturePositions: false } : {};
-    const live = (await bridge.request("patch.fingerprint", { side: "live", collection, excludeFids, ...positions, ...(iso.excludeGuidsLive?.length ? { excludeGuids: iso.excludeGuidsLive } : {}), ...(iso.excludeTypesLive?.length ? { excludeTypes: iso.excludeTypesLive } : {}) }, ft)) as Fingerprint;
+    const stagesLive = st && collection === "Stages" ? stageArgs(st.excludeLive, st.bareLive) : {};
+    const stagesCopy = st && collection === "Stages" ? stageArgs(st.excludeCopy, st.bareCopy) : {};
+    const live = (await bridge.request("patch.fingerprint", { side: "live", collection, excludeFids, ...positions, ...stagesLive, ...(iso.excludeGuidsLive?.length ? { excludeGuids: iso.excludeGuidsLive } : {}), ...(iso.excludeTypesLive?.length ? { excludeTypes: iso.excludeTypesLive } : {}) }, ft)) as Fingerprint;
     const prefix = iso.prefixOfLive && PREFIX_COLLECTIONS.has(collection);
-    const copy = (await bridge.request("patch.fingerprint", { side: "copy", collection, excludeFids, ...positions, ...(prefix ? { prefixOfLive: true } : {}) }, ft)) as Fingerprint;
+    const copy = (await bridge.request("patch.fingerprint", { side: "copy", collection, excludeFids, ...positions, ...stagesCopy, ...(prefix ? { prefixOfLive: true } : {}) }, ft)) as Fingerprint;
     if (!live.complete || !copy.complete) {
       complete = false;
       reasons.push(`${collection}: ${live.reason ?? copy.reason ?? "incomplete"}`);
     } else if (live.objects !== copy.objects || live.hash !== copy.hash) mismatched.push(collection);
   }
-  const leftOut = { ...(iso.prefixOfLive ? { prefixOfLive: true } : {}), ...(iso.excludeGuidsLive?.length ? { excludeGuidsLive: iso.excludeGuidsLive } : {}), ...(iso.excludeTypesLive?.length ? { excludeTypesLive: iso.excludeTypesLive } : {}), ...(iso.fixturePositions === false ? { fixturePositions: false } : {}) };
+  const leftOut = { ...(st ? { stages: st } : {}), ...(iso.prefixOfLive ? { prefixOfLive: true } : {}), ...(iso.excludeGuidsLive?.length ? { excludeGuidsLive: iso.excludeGuidsLive } : {}), ...(iso.excludeTypesLive?.length ? { excludeTypesLive: iso.excludeTypesLive } : {}), ...(iso.fixturePositions === false ? { fixturePositions: false } : {}) };
   return { equal: complete && mismatched.length === 0, complete, mismatched, detail: { collections: cols.live, excludeFids, ...leftOut, ...(reasons.length ? { incomplete: reasons } : {}) } };
 }
 
@@ -387,10 +428,10 @@ export async function runSessionLocked(ctx: ToolContext, spec: SessionSpec): Pro
       steps.push(...skippedSteps(planned(1), "entering the patch copy was refused"));
       return finish("failed", `${spec.operation} was not performed: entering the patch copy was refused: ${enter.error}. The show is unchanged.`, spec.verify ? unavailable("nothing was changed") : notRequested(), { committed: false, copyLeftOpen: false });
     }
-    const entered = enter.detail as { expectDestination?: string; stage?: string } | undefined;
-    const expectDest = entered?.expectDestination;
+    const entered = enter.detail as { expectDestination?: string; stageIndex?: number; stage?: string } | undefined;
+    const arrival = copyArrival(entered);
     const wc = enter.status === "succeeded"
-      ? await waitStep(bridge, "wait_copy", t, (s) => s.copyOpen && (expectDest === undefined || s.destination === expectDest), "opening the patch copy")
+      ? await waitStep(bridge, "wait_copy", t, arrival.at, "opening the patch copy", arrival.settled)
       : asRead({ name: "wait_copy", status: "unknown", op: "patch.state", error: "the enter request got no reply" } as StepResult);
     steps.push(wc);
 
@@ -403,7 +444,7 @@ export async function runSessionLocked(ctx: ToolContext, spec: SessionSpec): Pro
       return finish(outcome, `${spec.operation} was not completed: ${reason}. ${state}.`, spec.verify ? unavailable("nothing was committed") : notRequested(), { committed: false, copyLeftOpen: c.leftOpen });
     };
 
-    if (wc.status !== "succeeded") return abort("unknown", `the patch copy did not open as expected (${wc.error ?? wc.status})`, planned(2));
+    if (wc.status !== "succeeded") return abort(wc.status === "failed" ? "failed" : "unknown", wc.status === "failed" ? `${wc.error}` : `the patch copy did not open as expected (${wc.error ?? wc.status})`, planned(2));
 
     let editSteps: StepResult[];
     let editDetail: unknown;
@@ -526,6 +567,7 @@ interface AddArgs {
   stage?: string;
   exclusive?: boolean;
   verify?: boolean;
+  detail?: boolean;
 }
 
 /** Address of fixture i of a consecutive block. */
@@ -656,7 +698,24 @@ export async function patchAdd(ctx: ToolContext, raw: AddArgs): Promise<Operatio
         : {}),
     };
   }
-  return result;
+  // #100: a block of fixtures on a clean success: per fixture its FID, name and address instead of every row.
+  if (count === 1) return result;
+  const c = checkDetail as { type?: unknown; mode?: unknown } | undefined;
+  // Without a read-back (verify: false): the name asked for (the bridge gives each fixture of the block that same
+  // name), else the console's own name from patch.add's reply (`created`, read in the copy right after AddFixtures),
+  // and the block address, which the bridge verified exactly in the copy before replying.
+  const created = new Map((((result.steps.find((st) => st.name === "add")?.detail as { created?: FixtureRow[] } | undefined)?.created) ?? []).map((r) => [r.fid, r]));
+  return compactItems(result, raw.detail === true, {
+    set: { check: { type: c?.type, mode: c?.mode } },
+    drop: ["fixtures"],
+    items: rows.length
+      ? rows.map((r) => ({ fid: r.fid, name: r.name, address: r.patch ?? "" }))
+      : fids.map((f, i) => {
+          const n = name ?? created.get(f)?.name;
+          return { fid: f, ...(n !== undefined ? { name: n } : {}), address: resolvedAddress ? blockAddress(resolvedAddress, footprint, i) : "" };
+        }),
+    hint: "detail: true returns every step's detail, the pre-check and the read-back rows",
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -676,6 +735,7 @@ interface SetArgs {
   preview?: boolean;
   exclusive?: boolean;
   verify?: boolean;
+  detail?: boolean;
 }
 
 export async function patchSet(ctx: ToolContext, raw: SetArgs): Promise<OperationResult> {
@@ -706,7 +766,7 @@ export async function patchSet(ctx: ToolContext, raw: SetArgs): Promise<Operatio
   const t = ctx.requestTimeoutMs;
   let before: unknown;
 
-  return runSession(ctx, {
+  const result = await runSession(ctx, {
     operation: op,
     target,
     preview: raw.preview,
@@ -765,6 +825,23 @@ export async function patchSet(ctx: ToolContext, raw: SetArgs): Promise<Operatio
         return { steps: [asRead(stepFromError("read_back", err, { op: "patch.list" }))], verification: unavailable("the patch could not be read back") };
       }
     },
+  });
+  // #100: on a clean success, per edit the FID and [before, after] of what it changed instead of every fixture's rows.
+  const was = new Map(((before as FixtureRow[] | undefined) ?? []).map((r) => [r.fid, r]));
+  const now = new Map(((result.after as FixtureRow[] | undefined) ?? []).map((r) => [r.fid, r]));
+  return compactItems(result, raw.detail === true, {
+    set: { target: { edits: edits.length } },
+    drop: ["before", "after"],
+    items: edits.map((e) => {
+      const b = was.get(e.fid);
+      const a = now.get(e.fid);
+      return {
+        fid: e.fid,
+        ...(e.address !== undefined ? { address: [b?.patch ?? "", a ? (a.patch ?? "") : e.address] } : {}),
+        ...(e.name !== undefined ? { name: [b?.name ?? null, a ? a.name : e.name] } : {}),
+      };
+    }),
+    hint: "detail: true returns the edits, every step's detail, the fixtures before and the read-back rows",
   });
 }
 
@@ -927,7 +1004,7 @@ export function shapeLibraryPage(page: LibraryPage, compact: boolean, maxChars =
     }
     return { ...head, ...nextOffset, ...truncated, compact: true, files, ...(Object.keys(inShow).length ? { inShow } : {}), ...(Object.keys(inShowCount).length ? { inShowCount } : {}), ...(Object.keys(oversizedFiles).length ? { oversized: oversizedFiles } : {}), ...(Object.keys(notVerified).length ? { notVerified } : {}) };
   };
-  const size = (v: unknown) => JSON.stringify(v, null, 2).length;
+  const size = (v: unknown) => JSON.stringify(v).length;
   let keep = page.entries.length;
   let out = render(keep);
   for (let len = size(out); keep > 1 && len > maxChars; len = size(out)) {
@@ -1181,9 +1258,11 @@ export const SESSION_DESC =
   "Runs one patch session through the patch edit copy, never a dialog: read-only pre-checks (command line at Root, the copy closed, so nobody is in the Patch menu, no modal open, plus the tool's own checks), then enter the copy, apply the change there, an isolation check, commit, and read back. " +
   "Requires exclusive: true. Patch changes need exclusive use of the console: the isolation check compares fingerprints of the copy and the live patch, left out the touched FIDs, over several seconds. It is best-effort detection of someone else's changes, not a guarantee, and on a mismatch nothing is committed and the copy is left open for the operator. " +
   "A committed patch change has NO UNDO (Oops does not revert it). Takes about 10 s (mostly the isolation check). " +
-  "When a session cannot be finished, the copy is closed again only if it provably holds no change; otherwise the result says copyLeftOpen: true and the command line stays inside the edit patch with no Patch window open: the operator keeps the copy by typing ChangeDestination Root at the console (no way to discard it without the Patch menu is known). Needs bridge 0.19.0.";
+  "When a session cannot be finished, the copy is closed again only if it provably holds no change; otherwise the result says copyLeftOpen: true and the command line stays inside the edit patch with no Patch window open: the operator keeps the copy by typing ChangeDestination Root at the console (no way to discard it without the Patch menu is known). Needs bridge 0.19.0; a session in a stage with a Name needs bridge 0.45.0.";
 export const EXCLUSIVE_DESC = "Required, must be true: confirms nobody else uses the console while this runs (see the description). Without it the call is refused and nothing is sent.";
 export const VERIFY_DESC = "Read the patch back after the commit and compare (default true).";
+export const DETAIL_DESC =
+  "Return the full result on a success too: every step's detail and each fixture's state before and after (default false: a clean success, committed and read back matched or not requested, lists one entry per fixture in items; anything else is always returned in full).";
 
 export const registerPatchTools: RegisterTools = (server, ctx) => {
   server.registerTool(
@@ -1230,7 +1309,7 @@ export const registerPatchTools: RegisterTools = (server, ctx) => {
         "Add count fixtures of one fixture type and DMX mode at consecutive FIDs from fid, patched consecutively from a DMX address (address, or the first free block found from findFreeFrom), or unpatched when neither is given. " +
         "Pre-checks (nothing sent on failure): the FIDs are free, the whole block is free and fits inside one universe, explicit multi-break addresses are checked independently. Fixtures are added at the top level of a stage (default: the first stage). " +
         SESSION_DESC +
-        " verify reads the new FIDs back: present, patch addresses, name (when given) and mode.",
+        " verify reads the new FIDs back: present, patch addresses, name (when given) and mode. With count above 1 a clean success lists each new fixture as {fid, name, address} in items (detail: true for the full rows).",
       inputSchema: {
         type: z.union([z.number(), z.string()]).describe("Fixture type number or name, as gma3_patch_types lists it."),
         mode: z.union([z.number(), z.string()]).describe("DMX mode number or name within that type."),
@@ -1241,9 +1320,10 @@ export const registerPatchTools: RegisterTools = (server, ctx) => {
         breaks: z.array(z.object({ break: z.number(), address: z.string() }).strict()).optional().describe("Explicit per-break addresses; each fixture advances separately by that break footprint. Cannot combine with address/findFreeFrom."),
         preview: z.boolean().optional(),
         findFreeFrom: z.string().optional().describe('Instead of address: use the first free block from this "U.AAA".'),
-        stage: z.string().optional().describe("Stage name (default: the first stage)."),
+        stage: z.string().optional().describe("Stage name (default: the first stage). A stage with a Name needs bridge 0.45.0."),
         exclusive: z.boolean().optional().describe(EXCLUSIVE_DESC),
         verify: z.boolean().optional().describe(VERIFY_DESC),
+        detail: z.boolean().optional().describe(DETAIL_DESC),
       },
     },
     async (args) => operation(() => patchAdd(ctx, args as AddArgs)),
@@ -1257,7 +1337,7 @@ export const registerPatchTools: RegisterTools = (server, ctx) => {
         "Change existing fixtures: per edit, a new DMX address (address), unpatch: true, and/or a new name. Addresses are applied together, so fixtures can swap addresses or move across their own current range. " +
         "Pre-checks (nothing sent on failure): every FID exists, all requested DMX breaks are valid, and the new ranges overlap no other patched fixture. In the copy the bridge re-checks and restores every change of the call on any problem. " +
         SESSION_DESC +
-        " verify reads each edited fixture back (address and/or name).",
+        " verify reads each edited fixture back (address and/or name). A clean success lists per edit {fid, address?: [before, after], name?: [before, after]} in items (detail: true for the full rows).",
       inputSchema: {
         edits: z
           .array(
@@ -1273,6 +1353,7 @@ export const registerPatchTools: RegisterTools = (server, ctx) => {
         preview: z.boolean().optional(),
         exclusive: z.boolean().optional().describe(EXCLUSIVE_DESC),
         verify: z.boolean().optional().describe(VERIFY_DESC),
+        detail: z.boolean().optional().describe(DETAIL_DESC),
       },
     },
     async (args) => operation(() => patchSet(ctx, args as SetArgs)),

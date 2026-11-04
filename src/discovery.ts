@@ -19,7 +19,7 @@ export const TASK_TOOLS: ReadonlyArray<{ task: string; tools: readonly string[] 
   { task: "cameras/2D Layouts", tools: ["gma3_cameras", "gma3_configure_camera", "gma3_bind_camera_view", "gma3_build_layout"] },
   { task: "appearances/screen windows (Lua opt-in)", tools: ["gma3_configure_appearance", "gma3_build_workspace"] },
   { task: "fixture type library", tools: ["gma3_patch_library", "gma3_patch_import", "gma3_patch_library_add", "gma3_patch_types", "gma3_patch_remove_type"] },
-  { task: "patch fixtures", tools: ["gma3_patch_add", "gma3_patch_set", "gma3_patch_remove", "gma3_patch_list", "gma3_patch_move", "gma3_patch_retype"] },
+  { task: "patch fixtures/stages", tools: ["gma3_patch_add", "gma3_patch_set", "gma3_patch_remove", "gma3_patch_list", "gma3_patch_move", "gma3_patch_retype", "gma3_patch_stages"] },
   { task: "fixture modes/cells", tools: ["gma3_patch_type_structure"] },
   { task: "3D placement", tools: ["gma3_place_fixtures", "gma3_fixture_positions"] },
   { task: "cell layouts", tools: ["gma3_layout_cells", "gma3_assign_cell_layout"] },
@@ -31,7 +31,7 @@ export const TASK_TOOLS: ReadonlyArray<{ task: string; tools: readonly string[] 
   { task: "chases", tools: ["gma3_build_chase"] },
   { task: "executors/playback", tools: ["gma3_assign_to_executor", "gma3_configure_executor", "gma3_configure_sequence", "gma3_playback", "gma3_goto_cue", "gma3_set_fader"] },
   { task: "speed masters", tools: ["gma3_configure_speed_master", "gma3_speed_master_action", "gma3_speed_masters"] },
-  { task: "recipes", tools: ["gma3_recipes", "gma3_edit_recipe", "gma3_edit_recipe_steps", "gma3_cook_recipes"] },
+  { task: "recipes", tools: ["gma3_recipes", "gma3_edit_recipe", "gma3_edit_recipe_steps", "gma3_store_recipe_cues", "gma3_cook_recipes"] },
   { task: "macros/dialogs", tools: ["gma3_store_macro", "gma3_edit_macro_line", "gma3_run_macro", "gma3_macros", "gma3_dialog"] },
   { task: "variables", tools: ["gma3_variables", "gma3_set_variable"] },
   { task: "tags", tools: ["gma3_tags", "gma3_assign_tag", "gma3_store_tag", "gma3_delete_tag", "gma3_configure_tag", "gma3_playback"] },
@@ -41,7 +41,7 @@ export const TASK_TOOLS: ReadonlyArray<{ task: string; tools: readonly string[] 
   { task: "show files", tools: ["gma3_save_show", "gma3_show_files"] },
   { task: "Views/ViewButtons", tools: ["gma3_views", "gma3_view_contents", "gma3_store_view", "gma3_recall_view", "gma3_assign_view_button"] },
   { task: "tempo sync", tools: ["gma3_tempo_sync_status", "gma3_configure_tempo_sync", "gma3_playback"] },
-  { task: "show inspection", tools: ["gma3_objects", "gma3_get_object", "gma3_list_children", "gma3_programmer", "gma3_fixture_attributes", "gma3_cues", "gma3_sequences"] },
+  { task: "show inspection", tools: ["gma3_objects", "gma3_get_object", "gma3_list_children", "gma3_programmer", "gma3_fixture_attributes", "gma3_cues", "gma3_sequences", "gma3_pool_usage"] },
 ];
 
 /** Tools that watch the console over time on the server side: no Lua loop, no Lua time budget. */
@@ -69,9 +69,9 @@ export const BATCH_TOOLS: ReadonlyArray<{ tool: string; list: string }> = [
   { tool: "gma3_configure_tag", list: "tags" },
 ];
 
-const BATCH_NOTE = `Many objects at once: ${BATCH_TOOLS.map((b) => `${b.tool} (${b.list})`).join(", ")} take lists with per-item checks and read-back; never loop over them in Lua.`;
+const BATCH_NOTE = `Many objects at once: ${BATCH_TOOLS.map((b) => `${b.tool} (${b.list})`).join(", ")} take lists with per-item checks, read-back and one line per item; never loop over them in Lua.`;
 
-const OBSERVE_NOTE = `Watching over time: ${OBSERVING_TOOLS.map((o) => `${o.tool} (${o.what})`).join(", ")}. They sample on the server side; never write a Lua waiting or polling loop (each gma3_lua request is limited to about 5 s).`;
+const OBSERVE_NOTE = `Watching over time: ${OBSERVING_TOOLS.map((o) => `${o.tool} (${o.what})`).join(", ")}. They sample server-side; never write a Lua waiting or polling loop (gma3_lua has a 5 s budget).`;
 
 /** The server instructions: sent on every start; a stale build's warning comes first. */
 export function serverInstructions(staleWarning?: string): string {
@@ -82,15 +82,15 @@ export function serverInstructions(staleWarning?: string): string {
     map,
     BATCH_NOTE,
     OBSERVE_NOTE,
-    "Fallbacks, only for what no structured tool covers: gma3_command (one command line; gma3_help has the syntax) and gma3_lua (off by default; short scripts only). gma3_status shows the bridge version and the build.",
+    "Fallbacks, only for what no structured tool covers: gma3_command (one command line; gma3_help has the syntax) and gma3_lua (off by default; short scripts only). gma3_status: bridge version and build.",
   ].join("\n");
 }
 
 /** The pointer at the start of gma3_lua's description. */
 export const LUA_FALLBACK_NOTE =
-  "FALLBACK: use a structured tool when one fits; they check, read back and need no Lua. Patch: gma3_patch_library, gma3_patch_import, gma3_patch_add, gma3_patch_set, gma3_patch_move, gma3_patch_retype, gma3_patch_type_structure, gma3_place_fixtures, gma3_layout_cells. Dialogs: gma3_dialog (never Mouse()). " +
-  "Groups: gma3_store_group, gma3_configure_matricks. Presets: gma3_apply_preset, gma3_store_preset. Phasers: gma3_build_phaser. Looks: gma3_set_attributes. Cues: gma3_store_cues, gma3_edit_cues, gma3_build_chase, gma3_cue_contents. " +
-  "Playback: gma3_configure_sequence, gma3_configure_executor, gma3_playback, gma3_goto_cue. Reads: gma3_objects, gma3_get_object, gma3_list_children, gma3_programmer. " +
+  "FALLBACK: use a structured tool when one fits; they check, read back and need no Lua. Patch: gma3_patch_library, gma3_patch_import, gma3_patch_add, gma3_patch_set, gma3_patch_move, gma3_patch_stages, gma3_patch_retype, gma3_patch_type_structure, gma3_place_fixtures, gma3_layout_cells. Dialogs: gma3_dialog (never Mouse()). " +
+  "Groups: gma3_store_group, gma3_configure_matricks. Presets: gma3_apply_preset, gma3_store_preset. Phasers: gma3_build_phaser. Looks: gma3_set_attributes. Cues: gma3_store_cues, gma3_edit_cues, gma3_build_chase, gma3_cue_contents. Recipe cues: gma3_store_recipe_cues, then gma3_cook_recipes. " +
+  "Playback: gma3_configure_sequence, gma3_configure_executor, gma3_playback, gma3_goto_cue. Reads: gma3_objects, gma3_get_object, gma3_list_children, gma3_programmer; used and free pool numbers and executors: gma3_pool_usage. " +
   `${BATCH_NOTE} ` +
   `${OBSERVE_NOTE} `;
 

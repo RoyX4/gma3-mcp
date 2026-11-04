@@ -348,7 +348,9 @@ export function parseConsoleBoolean(value: unknown): boolean | null {
 
 /**
  * Normaliser for grandMA3 time display values, in seconds: "2.50" -> 2.5, "3s" -> 3, "1m00s" -> 60,
- * "1h22m56.3s" -> 4976.3, "0.50" -> 0.5. Returns null for anything else, including inherit markers
+ * "1h22m56.3s" -> 4976.3, "0.50" -> 0.5. From a minute up, onPC 2.5.1 shows the seconds without "s":
+ * a TrigTime of 64 reads "1m04.00" (live 2026-10-25), macro waits read "1h00m00.00" and "1d03h46m40.00"
+ * (docs/probes/sb-07-macros-macos-2.5.1.md). Returns null for anything else, including inherit markers
  * such as "CueTiming" and the composite "3.00 / 1.50" display of CueFade/CueDelay.
  */
 export function timeToSeconds(value: unknown): number | null {
@@ -357,9 +359,11 @@ export function timeToSeconds(value: unknown): number | null {
   const text = String(value).trim();
   const plain = parsePlainNumber(text);
   if (plain !== null && !text.includes("%")) return plain;
-  const m = text.match(/^(?:(\d+)h)?(?:(\d+)m)?(?:(\d*\.?\d+)s)?$/i);
-  if (!m || (m[1] === undefined && m[2] === undefined && m[3] === undefined)) return null;
-  return Number(m[1] ?? 0) * 3600 + Number(m[2] ?? 0) * 60 + Number(m[3] ?? 0);
+  const m = text.match(/^(?:(\d+)d)?(?:(\d+)h)?(?:(\d+)m)?(?:(\d*\.?\d+)(s)?)?$/i);
+  if (!m || (m[1] === undefined && m[2] === undefined && m[3] === undefined && m[4] === undefined)) return null;
+  // Seconds without "s" only after a larger unit ("1m04.00"); a bare number was handled above.
+  if (m[4] !== undefined && m[5] === undefined && m[1] === undefined && m[2] === undefined && m[3] === undefined) return null;
+  return Number(m[1] ?? 0) * 86400 + Number(m[2] ?? 0) * 3600 + Number(m[3] ?? 0) * 60 + Number(m[4] ?? 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -434,10 +438,48 @@ export function isErrorResult(result: OperationResult): boolean {
   return result.outcome !== "succeeded" || result.verification.status === "mismatched";
 }
 
+/** A success nothing more needs to be read from: carried out, and the read-back matched or was not asked for. */
+export function isCleanSuccess(result: OperationResult): boolean {
+  return result.outcome === "succeeded" && (result.verification.status === "matched" || result.verification.status === "not_requested");
+}
+
+export interface ItemsCompaction {
+  /** One entry per item (fixture): its id and, as [before, after], the fields the call changed. */
+  items: Array<Record<string, unknown>>;
+  /** Top-level fields to leave out (the per-item state dumps). */
+  drop?: string[];
+  /** Top-level fields to replace with a short form, e.g. target as a count instead of an echo of every item. */
+  set?: Record<string, unknown>;
+  /** Replaces the steps; by default every step stays with its name and status, without its detail. */
+  steps?: StepResult[];
+  hint: string;
+}
+
+/**
+ * The compact form of a batch tool's clean success (#100): renaming 88 fixtures returned 171 KB, mostly every fixture's
+ * state repeated in the pre-check, the edit reply, `before` and the read-back. Instead: one entry per item, the steps
+ * without their details and the verification without its expected and actual values. Anything but a clean success is
+ * returned whole, because then the details are what the caller needs; `detail: true` keeps them on a success too.
+ */
+export function compactItems(result: OperationResult, detail: boolean, o: ItemsCompaction): OperationResult {
+  if (detail || !isCleanSuccess(result)) return result;
+  const { actual: _a, expected: _e, ...verification } = result.verification;
+  const out: OperationResult = {
+    ...result,
+    ...(o.set ?? {}),
+    verification,
+    steps: o.steps ?? result.steps.map(({ detail: _d, ...rest }) => rest),
+  };
+  for (const k of o.drop ?? []) delete out[k];
+  out.items = o.items;
+  out.detailHint = o.hint;
+  return out;
+}
+
 export type ToolResult = { content: Array<{ type: "text"; text: string }>; isError?: boolean };
 
 /** Render an OperationResult as an MCP tool result, flagging anything but a verified success. */
 export function toToolResult(result: OperationResult): ToolResult {
-  const text = JSON.stringify(result, null, 2);
+  const text = JSON.stringify(result);
   return isErrorResult(result) ? { content: [{ type: "text", text }], isError: true } : { content: [{ type: "text", text }] };
 }

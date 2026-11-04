@@ -43,6 +43,7 @@ import { registerFeedbackTools } from "./tools/feedback.js";
 import { registerGroupTools } from "./tools/groups.js";
 import { registerPatchTools } from "./tools/patch.js";
 import { registerPatchMoveTools } from "./tools/patchmove.js";
+import { registerPatchStagesTool } from "./tools/patchstages.js";
 import { registerDialogTools } from "./tools/dialog.js";
 import { registerPhaserTools } from "./tools/phasers.js";
 import { registerPresetTools } from "./tools/presets.js";
@@ -63,6 +64,7 @@ import { registerTagTools, tagPlayback, tagTarget } from "./tools/tags.js";
 import { setPropertyChecked } from "./tools/setproperty.js";
 import { registerTempoSyncTools, resyncPlayback, RESYNC_NOTE } from "./tools/temposync.js";
 import { annotatePlayback, readTargetState, registerLiveStateTools, stateAfterFrame } from "./tools/livestate.js";
+import { registerPoolUsageTools, shapeListing } from "./tools/poolusage.js";
 
 const env = process.env;
 const bridgePort = Number(env.GMA3_BRIDGE_PORT ?? 9800);
@@ -123,7 +125,7 @@ const toolContext: ToolContext = {
 type ToolResult = { content: Array<{ type: "text"; text: string }>; isError?: boolean };
 
 function text(value: unknown): ToolResult {
-  const t = typeof value === "string" ? value : JSON.stringify(value, null, 2);
+  const t = typeof value === "string" ? value : JSON.stringify(value);
   return { content: [{ type: "text", text: t }] };
 }
 
@@ -406,15 +408,17 @@ server.registerTool(
   {
     title: "List child objects",
     description:
-      "List the children of an object (e.g. cues of a sequence, items of a pool, executors of a page) with name, class, address and index, plus optional property values per child. Paginated.",
+      "List the children of an object (e.g. cues of a sequence, items of a pool, executors of a page) with name, class, address and index, plus optional property values per child. Paginated: truncated: true (with a note) when more children follow. " +
+      "For the used and free numbers of a pool use gma3_pool_usage.",
     inputSchema: {
       ref: refSchema,
       fields: z.array(z.string()).optional().describe("Property names to read for each child, e.g. ['No','Name','TrigType','TrigTime']"),
       limit: z.number().int().positive().optional().describe("Max items (default 200)"),
       offset: z.number().int().nonnegative().optional(),
+      compact: z.boolean().optional().describe("With fields: drop addr and addrNative per child and return minified JSON (default false)"),
     },
   },
-  async ({ ref, fields, limit, offset }) => run(() => bridge.request("children", { ref, fields, limit, offset })),
+  async ({ ref, fields, limit, offset, compact }) => run(async () => shapeListing(await bridge.request("children", { ref, fields, limit, offset }), { compact, fields })),
 );
 
 server.registerTool(
@@ -423,15 +427,17 @@ server.registerTool(
     title: "Resolve an object range",
     description:
       "Resolve a command-line object range to a list of objects with optional property values. " +
-      'Examples: "Fixture 1 Thru 20", "Fixture Thru" (all fixtures), "Group Thru", "Sequence 1 Thru 10", "Preset 4.1 Thru 4.20", "Page 1.201 Thru 1.215".',
+      'Examples: "Fixture 1 Thru 20", "Fixture Thru" (all fixtures), "Group Thru", "Sequence 1 Thru 10", "Preset 4.1 Thru 20", "Page 1.201 Thru 1.215". ' +
+      '"Preset 4.1 Thru 4.20" and "Preset 4.1 + 21.2" need bridge 0.46.0 (an older bridge returns nothing for them; a range across pools is refused).',
     inputSchema: {
       ref: z.string().describe("Command-line object range"),
       fields: z.array(z.string()).optional().describe("Property names to read for each object"),
-      limit: z.number().int().positive().optional().describe("Max items (default 500)"),
+      limit: z.number().int().positive().optional().describe("Max items (default 500); the result has truncated: true (with a note) when more objects follow"),
       offset: z.number().int().nonnegative().optional(),
+      compact: z.boolean().optional().describe("With fields: drop addr and addrNative per object and return minified JSON (default false)"),
     },
   },
-  async ({ ref, fields, limit, offset }) => run(() => bridge.request("objects", { ref, fields, limit, offset }, 30000)),
+  async ({ ref, fields, limit, offset, compact }) => run(async () => shapeListing(await bridge.request("objects", { ref, fields, limit, offset }, 30000), { compact, fields })),
 );
 
 server.registerTool(
@@ -724,6 +730,7 @@ registerInputTools(server, toolContext);
 registerFeedbackTools(server, toolContext);
 registerPatchTools(server, toolContext);
 registerPatchMoveTools(server, toolContext);
+registerPatchStagesTool(server, toolContext);
 registerDialogTools(server, toolContext);
 registerPlaybackTools(server, toolContext);
 registerGroupTools(server, toolContext);
@@ -762,6 +769,7 @@ registerMvrImportTools(server, toolContext);
 registerWorkspaceTools(server, toolContext);
 registerCameraWitnessTools(server, toolContext);
 registerWorkspaceUiTools(server, toolContext);
+registerPoolUsageTools(server, toolContext);
 
 server.registerResource(
   "cheatsheet",

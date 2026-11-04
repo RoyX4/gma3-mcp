@@ -47,7 +47,7 @@ Use a Dimmer value entry for individual intensity timing. For example, `{"attrib
 4. **Leaving Preview.** The console is confirmed in Preview, then `ClearAll` and `Preview Off`, whatever happened.
    The Normal programmer is read again and must equal the snapshot from step 1.
 5. **Sequence name** (`sequence_name`, or `name` for a chase), written once a cue was stored.
-6. **Read-back** per stored cue: it exists, and its name, timing and trigger as given. A cue stored without a name
+6. **Read-back** per stored cue: it exists, and its name, timing and trigger as given (the call-level defaults included: a TrigType or TrigTime the console did not take is a mismatch, live 2026-11-03). A cue stored without a name
    takes the preset's name (`[4.902]`), and the result reports that name.
 
 **The look check.** Each check runs in the Preview programmer right after the command it verifies:
@@ -83,13 +83,30 @@ checks do not establish final stage output across competing playbacks, programme
 | Param | Notes |
 | --- | --- |
 | `sequence` | sequence number; the store creates it when it does not exist |
-| `sequence_name` | optional |
+| `sequence_name` | optional; a new name another sequence has is refused before anything is sent (below) |
+| `on_name_taken` | `refuse` (default) or `allow_suffix`: what happens when another sequence has `sequence_name` |
 | `mode` | `create` (refuse existing cues), `merge`, `overwrite` |
 | `cue_only` | optional: `off`, `on`, `on_default_new`, `dimmer_only`, `dimmer_only_default_new` |
 | `tracking_shield` | optional: `dimmer_rising_from_zero`, `dimmer_above_zero` |
 | `fixtures` | default target for looks without their own |
-| `cues` | 1–100 cues: `cue` (number), `name`, content, `fade`, `delay`, `out_fade`, `out_delay`, `trigger` (`go`, `time` with `time`, `follow` with optional `time`, `sound`, `bpm`) |
+| `cues` | 1–100 cues: `cue` (number), `name`, content, `fade`, `delay`, `out_fade`, `out_delay`, `trigger` (`go`, `time` with `time`, `follow` with optional `time`, `sound`, `bpm`), `note` |
+| `fade`, `delay`, `out_fade`, `out_delay`, `trigger`, `time` | call-level defaults for every cue: a cue's own keys win; a cue without a trigger takes the call's trigger and time (its own `time` replaces the call's); a cue with its own trigger takes none of the call's `time`. In the batch form they apply to every sequence's cues too. |
 | `exclusive`, `verify` | `exclusive` required; `verify` default true (look checks and read-back) |
+
+`note` (#101) is the cue's `Note`, for example the scene metadata a plugin reads. It is written with `set` on the cue
+object after the store (one line, trimmed; `""` clears it; quotes and the characters names may not hold are kept) and
+read back exactly, case included. Not verified on a console for this change. For the recipe lines of the cues, use
+[`gma3_store_recipe_cues`](recipes.md#gma3_store_recipe_cues), which also takes a note per cue.
+
+**Sequence names** ([#102](https://github.com/bdstark/gma3-mcp/issues/102)). When `sequence_name` names a new
+sequence or renames one, `gma3_store_cues` lists `DataPool.Sequences` first (`children`, fields `No` and `Name`, once
+per call) and refuses a name another sequence has before anything is sent, naming the holder (`"Looks" is Sequence
+5`; compared trimmed and case-insensitively). A sequence that already has the name keeps it and is not checked. An
+unreadable listing refuses too. The console keeps preset, tag and Quickey names unique and stores a taken one as
+`"<name>#2"`; **for sequences this is not verified**, and the tool refuses anyway because two sequences under one name
+make every lookup by name ambiguous. `on_name_taken: "allow_suffix"` stores anyway, with a warning. The name write is
+judged by its read-back: a name the console did not apply fails the step (a `"<name>#<n>"` one is expected with
+`allow_suffix`). `gma3_build_chase` does not check its `name` yet.
 
 Tracking is the sequence's own setting: with Tracking on, a cue's stored values track into later cues that do not
 store those attributes.
@@ -128,7 +145,10 @@ other modes and multipart interactions remain separately unqualified.
 
 `sequences: [{sequence, sequence_name, mode, fixtures, cues}]` stores cues in several sequences; each sequence is its
 own Preview build with the steps above, and `mode`, `fixtures` and `exclusive` may be given once for all. A sequence
-listed twice is refused. See [Batch forms](README.md#batch-forms-su-12).
+listed twice is refused. The sequence pool's names are read once for the call: a name an earlier sequence of the call
+took counts as taken, and a refused sequence fails alone, before its build. A build that leaves a name nobody read (a
+new unnamed sequence, a failed or unanswered rename) makes the next named sequence read the pool again. See
+[Batch forms](README.md#batch-forms-su-12).
 
 CueOnly and Tracking Shield can also be defaults for the whole call. An explicit value on a sequence item
 overrides that default:
@@ -261,4 +281,5 @@ It:
 5. builds a 0.5 s three-step chase and watches one full cycle;
 6. builds a six-step 1 s chase with `observe_max_seconds: 5` and watches its tail through the wrap.
 
-Everything is deleted afterwards. The chases play for a few seconds.
+Everything is deleted afterwards. The chases play for a few seconds. The sequence-name check of #102 is covered only
+by the fake bridge.

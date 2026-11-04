@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { startHarness, type Harness } from "./helpers/tool-harness.js";
 import { BridgeReplyError, SILENT } from "./helpers/fake-bridge.js";
-import { registerPatchTools, blockAddress, dmxAddress } from "../src/tools/patch.js";
+import { registerPatchTools, blockAddress, copyArrival, dmxAddress, type PatchState } from "../src/tools/patch.js";
 
 /**
  * KB-26 patch tools against a fake bridge whose patch.* ops behave like the bridge's: the copy opens and
@@ -49,6 +49,20 @@ class PatchWorld {
   occupancyUnknown: Array<{ fid: number; reason: string }> = [];
   /** Extra fields of the fixtures patch.add creates (type and cells, SU-08). */
   addExtra: Partial<Fx> = {};
+  /** The live patch's stages; named: the Name was set (the console then shows "Stage <no> '<name>'.Fixtures", #98). */
+  stages: Array<{ name: string; named?: boolean }> = [{ name: "Stage 1" }];
+  /** Bridge 0.45.0: patch.enter names the stage's position, patch.state the stage at the destination (by address). */
+  bridge045 = false;
+  /** The stage the command line lands at, when not the one entered (1-based). */
+  landAt: number | null = null;
+  /** The stage whose Fixtures the command line is at (1-based), while the copy is open. */
+  atStage: number | null = null;
+  private entering = 1;
+
+  stageText(i: number) {
+    const s = this.stages[i - 1];
+    return s.named ? `Stage ${i} '${s.name}'.Fixtures` : `Stage ${i}.Fixtures`;
+  }
 
   frame() {
     if (this.delay > 0) {
@@ -59,11 +73,13 @@ class PatchWorld {
       if (cmd === "enter") {
         if (this.neverOpen) continue;
         this.copy = this.live.map((f) => ({ ...f }));
-        this.dest = "Stage 1.Fixtures";
+        this.atStage = this.landAt ?? this.entering;
+        this.dest = this.stageText(this.atStage);
       } else if (cmd === "root") {
         if (this.copy) this.live = this.copy;
         this.copy = null;
         this.dest = "Root";
+        this.atStage = null;
         this.foreignInCopy = false;
       }
     }
@@ -84,7 +100,8 @@ class PatchWorld {
     f.on("patch.state", () => {
       this.frame();
       const copyOpen = this.copy !== null;
-      return { destination: this.dest, copyOpen, atRoot: this.dest === "Root" && !copyOpen, modal: this.modal, stages: ["Stage 1"] };
+      const at = this.bridge045 && copyOpen && this.atStage !== null ? { destinationStage: { index: this.atStage, no: this.atStage, name: this.stages[this.atStage - 1].name, text: this.stageText(this.atStage), by: "address" } } : {};
+      return { destination: this.dest, copyOpen, atRoot: this.dest === "Root" && !copyOpen, modal: this.modal, stages: this.stages.map((x) => x.name), ...at };
     });
     f.on("patch.check", (args) => {
       if (args.add) {
@@ -136,11 +153,17 @@ class PatchWorld {
     f.on("patch.enter", (args) => {
       if (args.exclusive !== true) throw new BridgeReplyError("[not-exclusive] needs exclusive", "not-exclusive");
       if (this.copy) throw new BridgeReplyError("[copy-open] the patch copy is already open", "copy-open");
+      const i = args.stage === undefined ? 1 : this.stages.findIndex((x) => x.name === args.stage) + 1;
+      if (i === 0) throw new BridgeReplyError(`[no-stage] no stage named ${args.stage}`, "no-stage");
+      this.entering = i;
       this.pending.push("enter");
-      return { queued: true, stage: "Stage 1", expectDestination: "Stage 1.Fixtures" };
+      const name = this.stages[i - 1].name;
+      // Before 0.45.0 the bridge expected "<name>.Fixtures", which only an unnamed stage shows.
+      return this.bridge045 ? { queued: true, stage: name, stageIndex: i, expectDestination: this.stageText(i) } : { queued: true, stage: name, expectDestination: `${name}.Fixtures` };
     });
     f.on("patch.add", (args) => {
-      if (!this.copy || this.dest !== `${args.stage}.Fixtures`) throw new BridgeReplyError("[wrong-destination] not at the stage", "wrong-destination");
+      const at = this.bridge045 ? this.atStage !== null && this.stages[this.atStage - 1].name === args.stage : this.dest === `${args.stage}.Fixtures`;
+      if (!this.copy || !at) throw new BridgeReplyError("[wrong-destination] not at the stage", "wrong-destination");
       if (this.addError) throw this.addError;
       const count = (args.count as number) ?? 1;
       const created: Fx[] = [];
@@ -345,6 +368,86 @@ test("gma3_patch_add: a copy that never opens ends unknown, with nothing left op
   }
 });
 
+test("copyArrival: stage by position from bridge 0.45.0, the exact text before, and the destination named when it differs", () => {
+  const st = (destination: string, extra: Partial<PatchState> = {}): PatchState => ({ destination, copyOpen: true, atRoot: false, modal: false, stages: [], ...extra });
+  const old = copyArrival({ expectDestination: "Stage 1.Fixtures" });
+  assert.equal(old.at(st("Stage 1.Fixtures")), true, "an older bridge: the old exact form is still accepted");
+  assert.equal(old.at(st("Stage 1 'Stage 1'.Fixtures")), false);
+  assert.equal(old.at(st("Stage 1.Fixtures", { copyOpen: false })), false, "the copy must be open");
+  assert.equal(old.settled(st("ShowData.Patch", { copyOpen: false })), undefined, "a closed copy is not settled: still waiting");
+  assert.equal(old.settled(st("Stage 1.Fixtures")), undefined);
+  const named = copyArrival({ expectDestination: "Main Floor.Fixtures" });
+  assert.match(named.settled(st("Stage 1 'Main Floor'.Fixtures"))!, /the patch copy is open, but the command line destination is "Stage 1 'Main Floor'\.Fixtures", expected "Main Floor\.Fixtures" \(a bridge before 0\.45\.0 .*install bridge 0\.45\.0\)/);
+  const now = copyArrival({ expectDestination: "Stage 2 'Main Floor'.Fixtures", stageIndex: 2 });
+  assert.equal(now.at(st("Stage 2 'Main Floor'.Fixtures", { destinationStage: { index: 2, by: "address" } })), true);
+  assert.equal(now.at(st("whatever the text", { destinationStage: { index: 2, by: "address" } })), true, "the position decides, not the text");
+  assert.equal(now.at(st("Stage 2 'Main Floor'.Fixtures")), false, "no destinationStage: not at the stage");
+  assert.equal(now.at(st("Stage 1.Fixtures", { destinationStage: { index: 1 } })), false);
+  assert.equal(now.settled(st("Stage 1.Fixtures", { destinationStage: { index: 1 } })), `the patch copy is open, but the command line destination is "Stage 1.Fixtures", expected "Stage 2 'Main Floor'.Fixtures" (stage 2)`);
+  assert.equal(copyArrival({ expectDestination: "FixtureTypes" }).at(st("FixtureTypes")), true, "the fixture-type pool is compared as text");
+});
+
+test("gma3_patch_add (bridge 0.45.0): into a named stage, compared by the stage's position (#98)", async () => {
+  const { h, w } = await setup();
+  try {
+    w.bridge045 = true;
+    w.stages = [{ name: "Stage 1" }, { name: "Main Floor", named: true }];
+    const { result } = await h.callJson("gma3_patch_add", { type: 6, mode: 3, fid: 901, address: "2.001", stage: "Main Floor", exclusive: true });
+    assert.equal(result.outcome, "succeeded", result.summary);
+    assert.deepEqual(stepNames(result).slice(0, 5), ["check_state:succeeded", "check_add:succeeded", "enter:succeeded", "wait_copy:succeeded", "add:succeeded"]);
+    assert.deepEqual(result.steps.find((s: any) => s.name === "enter").detail, { queued: true, stage: "Main Floor", stageIndex: 2, expectDestination: "Stage 2 'Main Floor'.Fixtures" });
+    assert.equal(h.fake.requests.find((r) => r.op === "patch.add")!.args.stage, "Main Floor");
+  } finally {
+    await h.close();
+  }
+});
+
+test("gma3_patch_set (bridge 0.45.0): the first stage named Stage 1 explicitly reads \"Stage 1 'Stage 1'.Fixtures\" and still matches", async () => {
+  const { h, w } = await setup();
+  try {
+    w.bridge045 = true;
+    w.stages = [{ name: "Stage 1", named: true }];
+    const { result } = await h.callJson("gma3_patch_set", { edits: [{ fid: 401, name: "Renamed" }], exclusive: true });
+    assert.equal(result.outcome, "succeeded", result.summary);
+    assert.equal(result.steps.find((s: any) => s.name === "wait_copy").status, "succeeded");
+  } finally {
+    await h.close();
+  }
+});
+
+test("gma3_patch_add: the copy open at another stage fails naming the destination and the expected one, closed again", async () => {
+  const { h, w } = await setup();
+  try {
+    w.bridge045 = true;
+    w.stages = [{ name: "Stage 1" }, { name: "Main Floor", named: true }];
+    w.landAt = 1;
+    const { result } = await h.callJson("gma3_patch_add", { type: 6, mode: 3, fid: 901, stage: "Main Floor", exclusive: true });
+    assert.equal(result.outcome, "failed");
+    const wc = result.steps.find((s: any) => s.name === "wait_copy");
+    assert.equal(wc.status, "failed");
+    assert.equal(wc.error, `the patch copy is open, but the command line destination is "Stage 1.Fixtures", expected "Stage 2 'Main Floor'.Fixtures" (stage 2)`);
+    assert.doesNotMatch(result.summary, /CmdIndirect/);
+    assert.match(result.summary, /destination is "Stage 1\.Fixtures", expected "Stage 2 'Main Floor'\.Fixtures".*closed again without changes/);
+    assert.equal(result.copyLeftOpen, false);
+    assert.ok(!h.fake.requests.some((r) => r.op === "patch.add"), "nothing was added");
+  } finally {
+    await h.close();
+  }
+});
+
+test("gma3_patch_add: an older bridge on a named stage fails with the destination named and the bridge to install", async () => {
+  const { h, w } = await setup();
+  try {
+    w.stages = [{ name: "Main Floor", named: true }];
+    const { result } = await h.callJson("gma3_patch_add", { type: 6, mode: 3, fid: 901, stage: "Main Floor", exclusive: true });
+    assert.equal(result.outcome, "failed");
+    assert.match(result.summary, /destination is "Stage 1 'Main Floor'\.Fixtures", expected "Main Floor\.Fixtures" \(a bridge before 0\.45\.0/);
+    assert.equal(result.copyLeftOpen, false);
+  } finally {
+    await h.close();
+  }
+});
+
 test("gma3_patch_add: an older bridge without patch ops is reported as such", async () => {
   const h = await startHarness(registerPatchTools);
   try {
@@ -526,4 +629,142 @@ test("compound fixture removal inventories descendants and requires explicit inc
     assert.deepEqual(preview.result.removalInventory["4"].descendants, descendants);
     assert.equal(h.fake.requests.filter((x) => x.op === "patch.enter").length, 0);
   } finally { await h.close(); }
+});
+
+// ---------------------------------------------------------------------------
+// #100: compact results of batch edits
+// ---------------------------------------------------------------------------
+
+/** n fixtures from FID 1001, patched at consecutive 8-channel blocks from 2.001. */
+function addRig(w: PatchWorld, n: number) {
+  for (let i = 0; i < n; i++) w.live.push({ fid: 1001 + i, name: `MHPar06 ${i + 1}`, patch: blockAddress("2.001", FP, i), mode: "Ch08", type: "6 Mega Hex Par" });
+}
+
+test("gma3_patch_set: a clean rename of 88 fixtures returns one line per fixture, under 20 KB (#100)", async (t) => {
+  const { h, w } = await setup();
+  try {
+    addRig(w, 88);
+    const edits = Array.from({ length: 88 }, (_, i) => ({ fid: 1001 + i, name: `Halloween Spot ${String(i + 1).padStart(2, "0")} SL` }));
+    const r = await h.callJson("gma3_patch_set", { edits, exclusive: true });
+    assert.equal(r.isError, false, r.text.slice(0, 2000));
+    assert.equal(r.result.verification.status, "matched");
+    assert.equal(r.result.items.length, 88);
+    assert.deepEqual(r.result.items[0], { fid: 1001, name: ["MHPar06 1", "Halloween Spot 01 SL"] });
+    assert.deepEqual(r.result.target, { edits: 88 });
+    for (const k of ["before", "after"]) assert.equal(r.result[k], undefined, `${k} is left out`);
+    assert.equal(r.result.verification.actual, undefined);
+    assert.equal(r.result.verification.expected, undefined);
+    assert.deepEqual(stepNames(r.result), ["check_state:succeeded", "check_edits:succeeded", "enter:succeeded", "wait_copy:succeeded", "set:succeeded", "isolation_check:succeeded", "commit:succeeded", "wait_commit:succeeded", "read_back:succeeded"]);
+    assert.ok(r.result.steps.every((s: any) => s.detail === undefined), "no step keeps its detail");
+    assert.match(r.result.detailHint, /detail: true/);
+    assert.ok(!r.text.includes("\n"), "compact JSON, no indentation");
+    assert.ok(r.text.length < 20_000, `${r.text.length} characters`);
+    t.diagnostic(`88 renames: ${r.text.length} characters`);
+
+    // detail: true keeps everything on a success too.
+    const back = edits.map((e, i) => ({ fid: e.fid, name: `MHPar06 ${i + 1}` }));
+    const full = await h.callJson("gma3_patch_set", { edits: back, exclusive: true, detail: true });
+    assert.equal(full.result.verification.status, "matched");
+    assert.equal(full.result.items, undefined);
+    assert.equal(full.result.before.length, 88);
+    assert.equal(full.result.after.length, 88);
+    assert.equal(full.result.target.edits.length, 88);
+    assert.ok(full.result.steps.find((s: any) => s.name === "check_edits").detail.edits.length === 88);
+    t.diagnostic(`the same with detail: true: ${full.text.length} characters`);
+  } finally {
+    await h.close();
+  }
+});
+
+test("gma3_patch_set: readdress and unpatch items show [before, after]; a mismatch returns the full result (#100)", async () => {
+  const { h, w } = await setup();
+  try {
+    addRig(w, 50);
+    let r = await h.callJson("gma3_patch_set", { edits: [{ fid: 1001, address: "5.001", name: "Moved" }, { fid: 1002, unpatch: true }], exclusive: true });
+    assert.equal(r.result.verification.status, "matched");
+    assert.deepEqual(r.result.items, [{ fid: 1001, address: ["2.001", "5.001"], name: ["MHPar06 1", "Moved"] }, { fid: 1002, address: ["2.009", ""] }]);
+
+    // The console keeps one old name: mismatched, and every detail is there to see why.
+    const orig = h.fake.handlerFor("patch.set")!;
+    h.fake.on("patch.set", async (args, req) => {
+      const res = await orig(args, req);
+      w.copy!.find((x) => x.fid === 1030)!.name = "MHPar06 30";
+      return res;
+    });
+    const edits = Array.from({ length: 50 }, (_, i) => ({ fid: 1001 + i, name: `Spot ${i + 1}` }));
+    r = await h.callJson("gma3_patch_set", { edits, exclusive: true });
+    assert.equal(r.isError, true);
+    assert.equal(r.result.verification.status, "mismatched");
+    assert.match(r.result.verification.detail, /FID 1030: name "MHPar06 30", expected "Spot 30"/);
+    assert.equal(r.result.items, undefined);
+    assert.equal(r.result.detailHint, undefined);
+    assert.equal(r.result.before.length, 50);
+    assert.equal(r.result.verification.actual.length, 50);
+    assert.equal(r.result.target.edits.length, 50);
+    assert.ok(r.result.steps.find((s: any) => s.name === "read_back").detail.length === 50);
+  } finally {
+    await h.close();
+  }
+});
+
+test("gma3_patch_set: a refused call is returned in full (#100)", async () => {
+  const { h } = await setup();
+  try {
+    const r = await h.callJson("gma3_patch_set", { edits: [{ fid: 7777, name: "Nobody" }], exclusive: true });
+    assert.equal(r.result.outcome, "failed");
+    assert.equal(r.result.items, undefined);
+    assert.ok(r.result.steps.find((s: any) => s.name === "check_edits").detail, "the pre-check keeps its detail");
+  } finally {
+    await h.close();
+  }
+});
+
+test("gma3_patch_add: a clean block of 50 lists fid, name and address per fixture; detail: true and a mismatch are full (#100)", async () => {
+  const { h, w } = await setup();
+  try {
+    let r = await h.callJson("gma3_patch_add", { type: 6, mode: "Ch08", fid: 2001, count: 50, address: "3.001", name: "Wash", exclusive: true });
+    assert.equal(r.result.verification.status, "matched", r.text.slice(0, 2000));
+    assert.equal(r.result.items.length, 50);
+    assert.deepEqual(r.result.items[1], { fid: 2002, name: "Wash", address: "3.009" });
+    assert.equal(r.result.fixtures, undefined);
+    assert.deepEqual(r.result.check, { type: { no: 6, name: "Mega Hex Par" }, mode: { no: 3, name: "Ch08", footprint: FP, breaks: 1, breakChannels: [FP] } });
+    assert.equal(r.result.address, "3.001");
+    assert.ok(r.result.steps.every((s: any) => s.detail === undefined));
+    assert.ok(r.text.length < 6_000, `${r.text.length} characters`);
+
+    r = await h.callJson("gma3_patch_add", { type: 6, mode: "Ch08", fid: 2101, count: 50, address: "4.001", exclusive: true, detail: true });
+    assert.equal(r.result.verification.status, "matched");
+    assert.equal(r.result.items, undefined);
+    assert.equal(r.result.fixtures.length, 50);
+    assert.equal(r.result.check.dmxFree, true);
+
+    // One fixture lands at another address: the full result.
+    const orig = h.fake.handlerFor("patch.add")!;
+    h.fake.on("patch.add", async (args, req) => {
+      const res = await orig(args, req);
+      w.copy!.find((x) => x.fid === 2210)!.patch = "9.001";
+      return res;
+    });
+    r = await h.callJson("gma3_patch_add", { type: 6, mode: "Ch08", fid: 2201, count: 50, address: "5.001", exclusive: true });
+    assert.equal(r.result.verification.status, "mismatched");
+    assert.equal(r.result.items, undefined);
+    assert.equal(r.result.fixtures.length, 50);
+    assert.equal(r.result.verification.actual.length, 50);
+
+    // verify: false: no read-back, so the names come from the request, or the console's names from patch.add's reply.
+    h.fake.on("patch.add", orig);
+    r = await h.callJson("gma3_patch_add", { type: 6, mode: "Ch08", fid: 2401, count: 3, address: "7.001", name: "Wash", exclusive: true, verify: false });
+    assert.equal(r.result.verification.status, "not_requested");
+    assert.deepEqual(r.result.items, [{ fid: 2401, name: "Wash", address: "7.001" }, { fid: 2402, name: "Wash", address: "7.009" }, { fid: 2403, name: "Wash", address: "7.017" }]);
+    r = await h.callJson("gma3_patch_add", { type: 6, mode: "Ch08", fid: 2501, count: 2, exclusive: true, verify: false });
+    assert.deepEqual(r.result.items, [{ fid: 2501, name: "MHPar06 1", address: "" }, { fid: 2502, name: "MHPar06 2", address: "" }], "the console's own names, from the add reply");
+
+    // A single fixture keeps the full result (it is small).
+    r = await h.callJson("gma3_patch_add", { type: 6, mode: "Ch08", fid: 2301, address: "6.001", exclusive: true });
+    assert.equal(r.result.verification.status, "matched");
+    assert.equal(r.result.items, undefined);
+    assert.equal(r.result.fixtures.length, 1);
+  } finally {
+    await h.close();
+  }
 });

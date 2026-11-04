@@ -157,7 +157,7 @@ local my_handle     = select(4, ...)
 local socket = require("socket")
 local json   = require("json")
 
-local VERSION      = "0.44.0"
+local VERSION      = "0.51.0"  -- 0.51.0: upstream 0.50.0 merged with the fork's verified programming line (runtime fingerprints, native cue ops)
 local DEFAULT_PORT = 9800
 -- Execution policy defaults for the "lua" op (see header). Changed per start with the
 -- "luatime=<ms>" / "luasteps=<n>" tokens, or at runtime with "lua on|off".
@@ -449,8 +449,97 @@ local function pageRangePlan(ref)
   return { kind = kind, items = items }
 end
 
--- ObjectList for one reference, with page/executor lists expanded into single lookups.
-local function objectList(ref)
+-- Preset ranges and lists with a pool on the second number are expanded into single lookups (bridge 0.46.0).
+-- On onPC 2.5.1 ObjectList("Preset 4.1 Thru 4.3") and ObjectList("Preset 4.1 + 4.2") return an empty list without
+-- an error, while "Preset 4.1 Thru 3" and "Preset 4.2" resolve (2026-10-25, #99). Returns nil when the reference
+-- is not such a form (no Preset keyword, no list operator, only unqualified range ends, or anything this parser
+-- does not read: names, wildcards, open ranges), so it goes to ObjectList unchanged; otherwise
+-- { { pool = P, no = N }, ... } in the given order without duplicates. A range across pools is refused.
+-- Scoped in a do block: the main chunk is at Lua's limit of 200 locals.
+local objectList
+do
+local MAX_PRESET_POOL, MAX_PRESET_NUMBER = 999, 9999
+local function presetRangePlan(ref)
+  local toks = refTokens(ref)
+  local first = toks[1]
+  if not (first and first.kind == "word" and isPrefixOf(first.lower, "preset", 2)) then return nil end
+  local qualifiedEnd, plus = false, false
+  local items, seen, i, pool = {}, {}, 2, nil
+  local function number(text, max)
+    local n = math.tointeger(tonumber(text))
+    if n == nil or n < 1 or n > max then return nil end
+    return n
+  end
+  -- "P.N" sets the pool; a bare "N" (a range end) stays in it, as the console reads "Preset 4.1 Thru 3".
+  local function parse(t, bareOk)
+    if not t or t.kind ~= "number" then return nil end
+    local p, n = t.text:match("^(%d+)%.(%d+)$")
+    if p then
+      p, n = number(p, MAX_PRESET_POOL), number(n, MAX_PRESET_NUMBER)
+      if not (p and n) then return nil end
+      return { pool = p, no = n, qualified = true }
+    end
+    if bareOk and pool and t.text:match("^%d+$") then
+      n = number(t.text, MAX_PRESET_NUMBER)
+      return n and { pool = pool, no = n } or nil
+    end
+    return nil
+  end
+  -- Parse the whole reference first; only a form that needs the expansion is bounded and expanded, so a
+  -- console-native range ("Preset 4.1 Thru 2000") still goes to ObjectList unchanged.
+  local ranges = {}
+  while true do
+    local a = parse(toks[i], false)
+    if not a then return nil end
+    pool = a.pool
+    i = i + 1
+    if toks[i] and isThruWord(toks[i]) then
+      local b = parse(toks[i + 1], true)
+      if not b then return nil end
+      if b.qualified then qualifiedEnd = true end
+      if b.pool ~= a.pool then
+        error(string.format("'%s' is a preset range across pools (%d.%d to %d.%d); name one range per pool, joined with +", ref, a.pool, a.no, b.pool, b.no), 0)
+      end
+      ranges[#ranges + 1] = { pool = a.pool, from = a.no, to = b.no }
+      i = i + 2
+    else
+      ranges[#ranges + 1] = { pool = a.pool, from = a.no, to = a.no }
+    end
+    local t = toks[i]
+    if t == nil then break end
+    if not (t.kind == "symbol" and t.text == "+") then return nil end
+    plus = true
+    i = i + 1
+  end
+  if not (qualifiedEnd or plus) then return nil end
+  local function tooMany() error(string.format("'%s' expands to more than %d presets", ref, MAX_EXPANDED_OBJECTS), 0) end
+  for _, rg in ipairs(ranges) do
+    if math.abs(rg.to - rg.from) + 1 > MAX_EXPANDED_OBJECTS then tooMany() end
+    local step = rg.to >= rg.from and 1 or -1
+    for v = rg.from, rg.to, step do
+      local key = rg.pool .. "." .. v
+      if not seen[key] then
+        seen[key] = true
+        items[#items + 1] = { pool = rg.pool, no = v }
+        if #items > MAX_EXPANDED_OBJECTS then tooMany() end
+      end
+    end
+  end
+  return items
+end
+
+-- ObjectList for one reference, with page/executor lists and pool-qualified preset lists expanded into
+-- single lookups.
+function objectList(ref)
+  local presets = presetRangePlan(ref)
+  if presets then
+    local out = {}
+    for _, it in ipairs(presets) do
+      local list = ObjectList(string.format("Preset %d.%d", it.pool, it.no))
+      if list and list[1] then out[#out + 1] = list[1] end
+    end
+    return out
+  end
   local plan = pageRangePlan(ref)
   if not plan then return ObjectList(ref) end
   local out, pages = {}, {}
@@ -472,6 +561,7 @@ local function objectList(ref)
     end
   end
   return out
+end
 end
 
 -- Resolve an object reference to a handle.
@@ -701,15 +791,30 @@ local function childSummary(c, fields, asText, playback)
   if fields and #fields > 0 then
     s.fields = {}
     for _, f in ipairs(fields) do
-      local v = getProp(c, f, asText)
+      local v, err = getProp(c, f, asText)
       s.fields[f] = v
+      -- 0.47.0 (#96): a read that raised is named in fieldErrors instead of reading like an empty field (an
+      -- executor whose Object read failed is not an empty executor). Absent when every field was read.
+      if err ~= nil then
+        s.fieldErrors = s.fieldErrors or {}
+        s.fieldErrors[f] = err
+      end
     end
   end
   return s
 end
 
 local function listChildren(h, fields, limit, offset, asText, playback)
-  local children = safeCall(h, "Children") or {}
+  -- 0.47.0 (#96): a Children() that raises is reported as enumerationError next to the empty listing it gave before,
+  -- so a parent whose children could not be listed no longer reads like an empty one. A missing method is still empty.
+  local children, enumerationError = {}, nil
+  local okF, f = pcall(function() return h.Children end)
+  if okF and type(f) == "function" then
+    local ok, res = pcall(f, h)
+    if not ok then enumerationError = tostring(res) elseif type(res) == "table" then children = res end
+  elseif not okF then
+    enumerationError = tostring(f)
+  end
   local total = #children
   offset = tonumber(offset) or 0
   limit = tonumber(limit) or 200
@@ -718,7 +823,7 @@ local function listChildren(h, fields, limit, offset, asText, playback)
     table.insert(out, childSummary(children[i], fields, asText, playback))
   end
   if #out == 0 then setmetatable(out, { __jsontype = "array" }) end
-  return { total = total, offset = offset, count = #out, items = out }
+  return { total = total, offset = offset, count = #out, items = out, enumerationError = enumerationError }
 end
 
 -------------------------------------------------------------------------------
@@ -2062,7 +2167,7 @@ end
 -- never guarded; a bridge without the module (or with it disabled) is never busy.
 local GUARDED_OPS = { cmd = "a command", set = "a property change", setfader = "a fader change", lua = "arbitrary Lua",
   ["patch.enter"] = "a patch session", ["patch.add"] = "a patch change", ["patch.set"] = "a patch change", ["patch.remove"] = "a patch change", ["patch.commit"] = "a patch commit",
-  ["patch.import"] = "a fixture-type import", ["patch.removeType"] = "a fixture-type removal" }
+  ["patch.import"] = "a fixture-type import", ["patch.removeType"] = "a fixture-type removal", ["patch.stageEdit"] = "a stage change" }
 local function inputBusy()
   local rec = hardkeysRec()
   if rec and type(rec.instance.admission) == "function" then
@@ -3462,7 +3567,8 @@ end
 -- never through a dialog (DIALOG.md "KB-25", docs/probes/kb-25-dialogs-macos-2.5.1.md):
 --   patch.enter   queues ChangeDestination into the copy and its stage's Fixtures with CmdIndirect. Never
 --                 Cmd(): a dialog opened from the plugin thread stalls the bridge. CmdIndirect lands on a
---                 later frame, so the client polls patch.state until the destination has changed.
+--                 later frame, so the client polls patch.state until the destination has changed (from
+--                 0.45.0 until patch.state's destinationStage, found by address, is the entered stage: #98).
 --   patch.add / patch.set / patch.remove   edit the copy, and only while it is open; each checks the
 --                 copy itself, and add also the destination, and refuses otherwise.
 --   patch.commit  queues ChangeDestination Root, which commits the copy silently. A committed patch edit
@@ -3507,12 +3613,12 @@ local function requireExclusive(args, what)
   end
 end
 
--- The copy must be open (and, for adding, the command line on its stage's Fixtures).
+-- The copy must be open (and, for an import, the command line at its FixtureTypes).
 local function requireCopy(expectDestination)
   if not patchCopyOpen() then raise("[copy-closed] the patch copy is not open; start a session with patch.enter and wait until patch.state reports it") end
   if expectDestination then
     local d = patchDestination()
-    if d ~= expectDestination then raise("[wrong-destination] the command line destination is " .. tostring(d) .. ", not " .. expectDestination .. " (CmdIndirect lands on a later frame; poll patch.state)") end
+    if d ~= expectDestination then raise("[wrong-destination] the command line destination is " .. tostring(d) .. ", expected " .. expectDestination) end
   end
   return ShowData().Patch
 end
@@ -3527,14 +3633,73 @@ local function patchSide(side)
   return sd.LivePatch
 end
 
-local function stageOf(p, stageName)
+-- A patch's stages and which one's Fixtures the command line is at (#98). One table: the main chunk is at Lua's limit
+-- of 200 locals.
+local patchStages = {}
+
+-- The stage named stageName (the first stage without one) and its position in Stages.
+function patchStages.of(p, stageName)
   local stages = p.Stages
   if not stages or stages:Count() == 0 then raise("[no-stage] the patch has no stages") end
-  if stageName == nil then return stages:Children()[1] end
-  for _, s in ipairs(stages:Children()) do
-    if tostring(s.name) == stageName then return s end
+  if stageName == nil then return stages:Children()[1], 1 end
+  for i, s in ipairs(stages:Children()) do
+    if tostring(s.name) == stageName then return s, i end
   end
   raise("[no-stage] no stage named " .. tostring(stageName))
+end
+
+-- How the console shows a stage's Fixtures as the command line destination (live 2026-10-25, #98): "Stage 1.Fixtures"
+-- for a stage with an empty Name, "Stage 1 'Main Floor'.Fixtures" for a named one, as pools show "21 'Phaser'". Set
+-- explicitly to the default text it reads "Stage 1 'Stage 1'.Fixtures", but Lua reads an empty Name as that default
+-- too, so for that name both texts are possible. Returns the likelier text and every possible one. The texts only
+-- name the destination in messages and stand in when its address cannot be read: a name with ' in it is shown as is
+-- between the quotes, which cannot be split back unambiguously.
+function patchStages.texts(stage, index)
+  local no = tostring(tonumber(safeProp(stage, "no")) or index)
+  local name = tostring(stage.name)
+  local plain, named = "Stage " .. no .. ".Fixtures", "Stage " .. no .. " '" .. name .. "'.Fixtures"
+  if name == "" then return plain, { plain } end
+  if name == "Stage " .. no then return plain, { plain, named } end
+  return named, { named }
+end
+
+-- The stage of p whose Fixtures the command line is at, its position and how it was found: by the destination
+-- object's address (the raw Destination is the object, as patch.moveStep compares it, 0.42.0), or by the console's
+-- text only when that address cannot be read. nil when the destination is no stage's Fixtures.
+function patchStages.find(p)
+  local ok, stages = pcall(function() return p.Stages:Children() end)
+  if not ok or type(stages) ~= "table" then return nil end
+  local okD, addr = pcall(function() return CmdObj():Get("Destination"):Addr() end)
+  if not okD then addr = nil end
+  local text = patchDestination()
+  for i, s in ipairs(stages) do
+    if addr ~= nil then
+      local okA, a = pcall(function() return s.Fixtures:Addr() end)
+      if okA and a ~= nil and a == addr then return s, i, "address" end
+    elseif text ~= nil then
+      local _, texts = patchStages.texts(s, i)
+      for _, t in ipairs(texts) do if t == text then return s, i, "text" end end
+    end
+  end
+  return nil
+end
+
+-- patch.state's row for the stage the command line is at.
+function patchStages.row(p)
+  local s, i, by = patchStages.find(p)
+  if not s then return nil end
+  return { index = i, no = safeProp(s, "no"), name = tostring(s.name), text = (patchStages.texts(s, i)), by = by }
+end
+
+-- For adding: the command line must be at the Fixtures of the copy's stage named stageName.
+function patchStages.require(p, stageName)
+  local want, wi = patchStages.of(p, stageName)
+  -- By position: two reads of one console object need not be the same Lua value.
+  local _, at = patchStages.find(p)
+  if at ~= wi then
+    raise("[wrong-destination] the command line destination is " .. tostring(patchDestination()) .. ", expected " .. (patchStages.texts(want, wi)) .. " (stage " .. wi .. ")")
+  end
+  return want
 end
 
 local function findType(p, t)
@@ -3799,6 +3964,8 @@ ops["patch.state"] = function()
   pcall(function() for _, s in ipairs(sd.LivePatch.Stages:Children()) do res.stages[#res.stages + 1] = tostring(s.name) end end)
   res.stages = emptyArray(res.stages)
   res.atRoot = res.destination == "Root" and not res.copyOpen
+  -- 0.45.0: the copy's stage whose Fixtures the command line is at ({index, no, name, text, by}); absent elsewhere.
+  if res.copyOpen then res.destinationStage = patchStages.row(sd.Patch) end
   return res
 end
 
@@ -4039,12 +4206,15 @@ ops["patch.enter"] = function(args)
   elseif args.target ~= nil and args.target ~= "stage" then
     raise("[bad-args] target must be stage (default) or fixturetypes")
   end
-  local stage = stageOf(ShowData().LivePatch, args.stage)
+  local stage, index = patchStages.of(ShowData().LivePatch, args.stage)
   local stageName = tostring(stage.name)
   if stageName:find('"') then raise("[bad-stage] the stage name contains a quote and cannot be addressed") end
   CmdIndirect('ChangeDestination "ShowData"."Patch"')
   CmdIndirect('ChangeDestination "Stages"."' .. stageName .. '"."Fixtures"')
-  return { queued = true, stage = stageName, expectDestination = stageName .. ".Fixtures" }
+  -- The copy is a copy of the live patch, so the stage has the same position there. A client from 0.45.0 waits for
+  -- patch.state's destinationStage.index to be stageIndex (compared by address); expectDestination is the console's
+  -- text for it (before 0.45.0 it was "<name>.Fixtures", which a named stage never shows: #98).
+  return { queued = true, stage = stageName, stageIndex = index, expectDestination = (patchStages.texts(stage, index)) }
 end
 
 -- Add `count` fixtures of one mode at `fid` (consecutive FIDs), patched consecutively from `address`
@@ -4055,7 +4225,8 @@ ops["patch.add"] = function(args)
   requireExclusive(args, "patch.add")
   local stageName = nameArg(args.stage, "stage")
   if not stageName then raise("[bad-args] stage is required (patch.enter reports it)") end
-  local p = requireCopy(stageName .. ".Fixtures")
+  local p = requireCopy(nil)
+  patchStages.require(p, stageName)
   local ft, mode, info = modeArgs(p, args)
   local breakPlan, breakSizes = patchBreakPlan(info, args.breaks, args.address)
   local count = integerArg(args.count or 1, "count", 1, PATCH_MAX_COUNT)
@@ -4320,6 +4491,10 @@ end
 --   excludeGuids  types (by GUID) left out with their subtree: the type a removal deletes, on the live side
 --   excludeTypes  { [position] = GUID }: the same, but only the type at that position of the list and with that GUID,
 --                 so another import of the same GDTF (same GUID) is still compared; replaces excludeGuids (0.43.0)
+--   excludeStages { [position] = true }: stages left out with their subtree, by their position in Stages (0.48.0): a
+--                 stage a stage session appended (copy side) or removed (live side)
+--   bareStages    { [position] = true }: stages hashed without their number, INDEX and Name; their content is still
+--                 hashed in full (0.48.0): a renamed stage, and the stages after a removed one, which move up a place
 --   guide         the live patch, for the copy of an import session. An import appends its type to the
 --                 fixture-type list and its attributes and features to the attribute-definition lists (live
 --                 2026-10-15), so at exactly those levels (PATCH_FP_APPEND below) a container hashes only as many
@@ -4377,7 +4552,7 @@ local function patchFingerprint(p, only, exclude, opts)
     -- 2026-10-26). Hash verified raw self-identity instead; every other reference remains hashed.
     return "self"
   end
-  local function add(h, depth, renumbered, isType)
+  local function add(h, depth, renumbered, isType, bare)
     if r.objects >= PATCH_FP_LIMIT then r.complete = false; r.reason = "more than " .. PATCH_FP_LIMIT .. " objects"; return false end
     local okc, n = pcall(function() return h:PropertyCount() end)
     if not okc or type(n) ~= "number" then r.complete = false; r.reason = "PropertyCount failed on " .. tostring(safeProp(h, "name")); return false end
@@ -4396,10 +4571,10 @@ local function patchFingerprint(p, only, exclude, opts)
     local parent = class == "Geometries" and safeCall(h, "Parent") or nil
     local copyNamingPolicy = parent and safeCall(parent, "GetClass") == "FixtureType"
       and displayProp(parent, "SpecialPurpose") == "MVR Environmental"
-    local unnumbered = renumbered or isType or (opts.fixturePositions == false and class == "Fixture")
+    local unnumbered = renumbered or isType or bare or (opts.fixturePositions == false and class == "Fixture")
     local parts = { tostring(depth), class, unnumbered and "" or tostring(safeProp(h, "no")) }
     for i, k in ipairs(pn) do
-      if not PATCH_FP_PROP_SKIP[k] and not (unnumbered and k == "INDEX")
+      if not PATCH_FP_PROP_SKIP[k] and not (unnumbered and k == "INDEX") and not (bare and k == "NAME")
         and not (copyNamingPolicy and k == "IGNOREENFORCEUNIQUECHILDNAMES") then
         local v = (k == "FIXTURETYPE" and typeIdentity(h)) or (k == "MODEDIRECT" and modeIdentity(h))
           or (k == "FIXTURE" and class == "Fixture" and environmentalSelfReference(h, i - 1))
@@ -4421,7 +4596,8 @@ local function patchFingerprint(p, only, exclude, opts)
     local name, inV, outV = tostring(safeProp(c, "name")), displayProp(c, "In"), displayProp(c, "Out")
     return (name == "Min" and inV == "000000" and outV == "000000") or (name == "Max" and inV == "FFFFFF" and outV == "FFFFFF")
   end
-  local function walk(h, depth, renumbered, guide, typeList, append, defaultCurve)
+  -- stageList: h is the Stages collection (its children are the stages, for excludeStages / bareStages).
+  local function walk(h, depth, renumbered, guide, typeList, append, defaultCurve, stageList)
     local kids = h:Children()
     local gkids = guide and guide:Children() or nil
     -- Truncate to the guide only where an import appends; elsewhere every child is hashed (so an extra one differs).
@@ -4433,8 +4609,9 @@ local function patchFingerprint(p, only, exclude, opts)
       local fid = class == "Fixture" and numericFid(c) or nil
       local skipType = typeList and (excludeTypes and excludeTypes[i] == guidOf(c) or (not excludeTypes and excludeGuids[guidOf(c)]))
       local skipPoint = defaultCurve and class == "DmxCurvePoint" and defaultEndPoint(c)
-      if not (fid and exclude[fid]) and not PATCH_FP_SKIP_CLASS[class] and not skipType and not skipPoint then
-        if not add(c, depth, renumbered, typeList) then return end
+      local skipStage = stageList and opts.excludeStages and opts.excludeStages[i]
+      if not (fid and exclude[fid]) and not PATCH_FP_SKIP_CLASS[class] and not skipType and not skipPoint and not skipStage then
+        if not add(c, depth, renumbered, typeList, stageList and opts.bareStages and opts.bareStages[i]) then return end
         walk(c, depth + 1, renumbered, gkids and gkids[i] or nil, false, append, renumbered and depth == 1 and i == 1)
       end
     end
@@ -4449,7 +4626,7 @@ local function patchFingerprint(p, only, exclude, opts)
         local append = opts.guide and PATCH_FP_APPEND[cname] or nil
         local guide = append and opts.guide[cname] or nil
         if append and not guide then r.complete = false; r.reason = "the guide has no collection " .. cname; break end
-        walk(c, 1, PATCH_FP_RENUMBERED[cname], guide, cname == "FixtureTypes", append)
+        walk(c, 1, PATCH_FP_RENUMBERED[cname], guide, cname == "FixtureTypes", append, nil, cname == "Stages")
       end
     end
   end
@@ -4465,7 +4642,8 @@ end
 
 -- args: { side = "live" | "copy", collection = <name>, excludeFids = [ ... ],
 --         excludeGuids = [ type GUID, ... ], excludeTypes = [ { index, guid }, ... ], prefixOfLive = true (copy side only: hash only what the live patch
---         has in every container, leaving out what an import appended), fixturePositions = false (a move, 0.42.0) }
+--         has in every container, leaving out what an import appended), fixturePositions = false (a move, 0.42.0),
+--         excludeStages = [ position, ... ], bareStages = [ position, ... ] (a stage session, 0.48.0) }
 ops["patch.fingerprint"] = function(args)
   if type(args.collection) ~= "string" then raise("[bad-args] collection (string) is required; patch.collections lists them") end
   local exclude = {}
@@ -4480,6 +4658,16 @@ ops["patch.fingerprint"] = function(args)
       opts.excludeTypes[i] = x.guid
     end
   end
+  for _, k in ipairs({ "excludeStages", "bareStages" }) do
+    if type(args[k]) == "table" then
+      opts[k] = {}
+      for _, x in ipairs(args[k]) do
+        local i = math.tointeger(x)
+        if not i or i < 1 then raise("[bad-args] " .. k .. " must be a list of stage positions (1-based)") end
+        opts[k][i] = true
+      end
+    end
+  end
   local p = patchSide(args.side or "live")
   if args.prefixOfLive == true then
     if args.side ~= "copy" then raise("[bad-args] prefixOfLive applies to the copy side only") end
@@ -4491,6 +4679,225 @@ ops["patch.fingerprint"] = function(args)
   fp.side = args.side or "live"
   fp.ms = math.floor((now() - started) * 1000 + 0.5)
   return fp
+end
+
+-------------------------------------------------------------------------------
+-- #97: the patch's stages (bridge 0.48.0). In the Halloween 2026 build (live, onPC 2.5.1, 2026-10-25) stages were
+-- made with gma3_lua inside the copy: ShowData().Patch.Stages:Ptr(1):Set('Name', ...) renamed one,
+-- Stages:Acquire('Stage') appended "Stage 2" with its Spaces and Fixtures children (Stages:Create(2) silently did
+-- nothing), and ChangeDestination Root committed; LivePatch.Stages then read the three stages.
+--   patch.stages     read-only: each stage's position, number, name, fixtures and spaces (live or copy)
+--   patch.stageEdit  in the copy: create (Acquire + Name), rename (Name) or remove (Delete) stages, re-checked here and
+--                    undone on any problem. Delete on Stages is not verified on a console (it is how fixtures and
+--                    fixture types are deleted), so removal is kept to empty stages after the first.
+-- Helpers live in patchStages: the main chunk is at Lua's limit of 200 locals.
+-------------------------------------------------------------------------------
+
+-- A stage's row. name is as Lua reads it: an empty Name reads as "Stage <no>", so a name of that form is "default"
+-- (empty, or set to that text: Lua cannot tell them apart, #98). fixtures counts every fixture under the stage's
+-- Fixtures, sub-fixtures included; absent when the list cannot be read. spaces: the Spaces child's children.
+-- 0.49.0 (review of #112): a read that raised is kept apart from an absent child: childrenError, fixturesError and
+-- spacesError say what could not be read (spacesList / fixturesList are then left out, not false).
+function patchStages.info(s, i)
+  local no = tonumber(safeProp(s, "no")) or i
+  local name = tostring(safeProp(s, "name"))
+  local row = { index = i, no = no, name = name, nameKind = (name == "" or name == "Stage " .. no) and "default" or "explicit", children = {} }
+  local okK, kids = pcall(function() return s:Children() end)
+  if okK and type(kids) == "table" then for _, c in ipairs(kids) do row.children[#row.children + 1] = tostring(safeProp(c, "name")) end
+  else row.childrenError = okK and "Children() returned no list" or tostring(kids) end
+  row.children = emptyArray(row.children)
+  local okF, fx = pcall(function() return s.Fixtures end)
+  if okF then row.fixturesList = fx ~= nil else row.fixturesError = tostring(fx) end
+  if row.fixturesList then
+    local n, top, other = 0, 0, 0
+    local function walk(h, d)
+      for _, c in ipairs(h:Children()) do
+        if safeCall(c, "GetClass") == "Fixture" then
+          n = n + 1
+          if d == 0 then top = top + 1 end
+          walk(c, d + 1)
+        elseif d == 0 then
+          other = other + 1
+        end
+      end
+    end
+    local okW, errW = pcall(walk, fx, 0)
+    if okW then row.fixtures, row.topLevel, row.otherObjects = n, top, other else row.fixturesError = tostring(errW) end
+  end
+  local okS, sp = pcall(function() return s.Spaces end)
+  if okS then row.spacesList = sp ~= nil else row.spacesError = tostring(sp) end
+  if row.spacesList then
+    local okC, c = pcall(function() return sp:Count() end)
+    if okC and type(c) == "number" then row.spaces = c else row.spacesError = okC and "Count() returned no number" or tostring(c) end
+  end
+  return row
+end
+
+-- Why a stage cannot be removed (nil when it can): it must be proven empty. Every read that failed is a refusal,
+-- never taken for an absent child (review of #112).
+function patchStages.notEmpty(row)
+  local what = "stage " .. row.index .. " (" .. row.name .. ")"
+  if row.childrenError then return what .. ": its children cannot be read (" .. row.childrenError .. ")" end
+  if row.fixturesError then return what .. ": its fixtures cannot be read (" .. row.fixturesError .. ")" end
+  if row.spacesError then return what .. ": its Spaces cannot be read (" .. row.spacesError .. ")" end
+  if row.fixtures == nil and row.fixturesList then return what .. ": its fixtures cannot be read" end
+  if (row.fixtures or 0) > 0 or (row.otherObjects or 0) > 0 then return what .. " holds " .. (row.fixtures or 0) .. " fixture(s)" .. ((row.otherObjects or 0) > 0 and (" and " .. row.otherObjects .. " other object(s)") or "") end
+  if row.spacesList and row.spaces ~= 0 then return what .. " has " .. tostring(row.spaces) .. " space(s)" end
+  for _, c in ipairs(row.children) do
+    if c ~= "Fixtures" and c ~= "Spaces" then return what .. " has a child " .. c .. " besides Fixtures and Spaces" end
+    if (c == "Fixtures" and not row.fixturesList) or (c == "Spaces" and not row.spacesList) then return what .. " has a child " .. c .. " that cannot be read as its " .. c .. " list" end
+  end
+  return nil
+end
+
+-- A name two stages would share after removing the stage at position k (nil when none). The stages after it move up
+-- a place, and one with a default name then reads "Stage <its new number>" (the harness models it this way; not
+-- verified live), which another stage may already have explicitly (review of #112: "Stage 2" explicit, Basement,
+-- "Stage 3" unnamed; removing Basement leaves two "Stage 2").
+function patchStages.removalClash(rows, k)
+  local left = {}
+  for _, r in ipairs(rows) do
+    if r.index ~= k then
+      local moved = r.index > k and r.nameKind == "default"
+      left[#left + 1] = { row = r, moved = moved, name = moved and ("Stage " .. (r.no - 1)) or r.name }
+    end
+  end
+  for a = 1, #left do
+    for b = a + 1, #left do
+      local x, y = left[a], left[b]
+      if (x.moved or y.moved) and x.name:lower() == y.name:lower() then
+        local m, o = x.moved and x or y, x.moved and y or x
+        return "removing stage " .. k .. " moves stage " .. m.row.index .. " (" .. m.row.name .. ", a default name) up to read " .. m.name .. ", which stage " .. o.row.index .. (o.moved and " would read too" or " is named") .. "; rename one of them first"
+      end
+    end
+  end
+  return nil
+end
+
+function patchStages.rows(p)
+  local rows = {}
+  for i, s in ipairs(p.Stages:Children()) do rows[#rows + 1] = patchStages.info(s, i) end
+  return rows
+end
+
+-- A new name for a stage: a string without quotes or control characters (nameArg), trimmed, not used by another
+-- stage (case-insensitive; the stage at `except` may already have it, in another case).
+function patchStages.checkName(p, v, field, except, taken)
+  local name = nameArg(v, field)
+  if not name then raise("[bad-args] " .. field .. " is required") end
+  if name:match("^%s") or name:match("%s$") then raise("[bad-args] " .. field .. " must not start or end with a space") end
+  local low = name:lower()
+  for i, s in ipairs(p.Stages:Children()) do
+    if i ~= except and tostring(safeProp(s, "name")):lower() == low then raise({ code = "name-taken", message = "stage " .. i .. " is already named " .. tostring(s.name) .. "; stage names must be unique (case-insensitive)" }) end
+  end
+  if taken then
+    if taken[low] then raise({ code = "name-taken", message = field .. ": " .. name .. " is given twice" }) end
+    taken[low] = true
+  end
+  return name
+end
+
+-- The stage at position index of the copy, which must still have the name the client saw in the live patch.
+function patchStages.at(p, index, expect)
+  local i = type(index) == "number" and math.tointeger(index) or nil
+  local kids = p.Stages:Children()
+  if not i or i < 1 or i > #kids then raise("[no-stage] no stage at position " .. tostring(index) .. " (the copy has " .. #kids .. ")") end
+  local s = kids[i]
+  if type(expect) == "string" and tostring(safeProp(s, "name")) ~= expect then raise({ code = "stage-changed", message = "the stage at position " .. i .. " is named " .. tostring(s.name) .. " in the copy, not " .. expect .. "; nothing was changed" }) end
+  return s, i
+end
+
+-- Puts a stage's Name back: "" for a default name, which is what an unnamed stage reads as.
+function patchStages.restoreName(s, row)
+  return pcall(function() s:Set("Name", row.nameKind == "default" and "" or row.name) end)
+end
+
+-- args: { side = "live" | "copy" }
+ops["patch.stages"] = function(args)
+  local p = patchSide(args.side)
+  if not p.Stages then raise("[no-stage] the patch has no Stages") end
+  local rows = patchStages.rows(p)
+  return { side = args.side or "live", count = #rows, stages = emptyArray(rows) }
+end
+
+-- args: { action = "create", names = [ ... ] } | { action = "rename", index, expect, name } | { action = "remove", index, expect }
+-- (expect: the stage's name as patch.stages read it in the live patch), exclusive. In the copy only.
+ops["patch.stageEdit"] = function(args)
+  requireExclusive(args, "patch.stageEdit")
+  local p = requireCopy(nil)
+  if not p.Stages then raise("[no-stage] the copy has no Stages") end
+  local stages = p.Stages
+  if args.action == "create" then
+    if type(args.names) ~= "table" or #args.names == 0 or #args.names > 32 then raise("[bad-args] names must be a list of 1-32 stage names") end
+    local taken, names = {}, {}
+    for k, v in ipairs(args.names) do names[k] = patchStages.checkName(p, v, "names[" .. k .. "]", nil, taken) end
+    local before = stages:Count()
+    local created = {}
+    -- Deletes what this call appended, newest first (Delete on Stages: see above).
+    local function undo()
+      local ok = true
+      for j = stages:Count(), before + 1, -1 do ok = pcall(function() stages:Delete(j) end) and ok end
+      return ok and stages:Count() == before
+    end
+    for k, name in ipairs(names) do
+      local n0 = stages:Count()
+      local okA, errA = pcall(function() return stages:Acquire("Stage") end)
+      local n1 = stages:Count()
+      local s = n1 == n0 + 1 and stages:Children()[n1] or nil
+      local why
+      if not okA then why = "Acquire('Stage') raised: " .. tostring(errA)
+      elseif not s then why = "Acquire('Stage') left " .. n1 .. " stages, expected " .. (n0 + 1)
+      elseif safeCall(s, "GetClass") ~= "Stage" then why = "the new object is a " .. tostring(safeCall(s, "GetClass")) .. ", not a Stage"
+      else
+        local okN, errN = pcall(function() s:Set("Name", name) end)
+        if not okN then why = "naming it raised: " .. tostring(errN)
+        elseif tostring(safeProp(s, "name")) ~= name then why = "it reads " .. tostring(s.name) .. " after naming it " .. name .. " (the console may strip characters from names)" end
+      end
+      if why then
+        local undone = undo()
+        raise({ code = "create-failed", message = "creating stage " .. name .. ": " .. why .. "; " .. (undone and ("the " .. (#created + (n1 > n0 and 1 or 0)) .. " stage(s) this call appended were deleted again") or "the stages this call appended could not all be deleted again") .. " (in the copy only)", created = emptyArray(created), undone = undone })
+      end
+      created[#created + 1] = patchStages.info(s, n1)
+    end
+    return { action = "create", created = emptyArray(created), stages = emptyArray(patchStages.rows(p)) }
+  elseif args.action == "rename" then
+    local s, i = patchStages.at(p, args.index, args.expect)
+    local name = patchStages.checkName(p, args.name, "name", i)
+    local old = patchStages.info(s, i)
+    if old.name == name then raise("[bad-args] stage " .. i .. " is already named " .. name .. "; nothing to change") end
+    local okN, errN = pcall(function() s:Set("Name", name) end)
+    local got = tostring(safeProp(s, "name"))
+    if not okN or got ~= name then
+      local restored = patchStages.restoreName(s, old)
+      raise({ code = "rename-failed", message = "renaming stage " .. i .. ": " .. (okN and ("it reads " .. got .. " after naming it " .. name) or ("Set Name raised: " .. tostring(errN))) .. "; " .. (restored and "its name was put back" or "its name could not be put back") .. " (in the copy only)", restored = restored })
+    end
+    return { action = "rename", before = old, stage = patchStages.info(s, i), stages = emptyArray(patchStages.rows(p)) }
+  elseif args.action == "remove" then
+    local s, i = patchStages.at(p, args.index, args.expect)
+    local count = stages:Count()
+    if count <= 1 then raise("[last-stage] the patch has one stage; it cannot be removed") end
+    if i == 1 then raise("[first-stage] the first stage is not removed (sessions and gma3_patch_add default to it)") end
+    local row = patchStages.info(s, i)
+    -- A stage without a Fixtures list at all is not one this op knows how to prove empty either.
+    local why = patchStages.notEmpty(row) or (not row.fixturesList and ("stage " .. i .. " (" .. row.name .. ") has no Fixtures list") or nil)
+    if why then raise({ code = "stage-not-empty", message = why .. "; nothing was removed", stage = row }) end
+    local clash = patchStages.removalClash(patchStages.rows(p), i)
+    if clash then raise({ code = "name-clash", message = clash .. "; nothing was removed" }) end
+    local after = {}
+    for k = i + 1, count do after[#after + 1] = { name = tostring(safeProp(stages:Children()[k], "name")), from = safeProp(stages:Children()[k], "no") } end
+    local okD, errD = pcall(function() stages:Delete(i) end)
+    if not okD then raise("[remove-failed] deleting stage " .. i .. " raised: " .. tostring(errD)) end
+    local left = stages:Children()
+    if #left ~= count - 1 then raise("[remove-failed] the copy has " .. #left .. " stages after Delete, expected " .. (count - 1)) end
+    for _, c in ipairs(left) do if c == s then raise("[remove-failed] the stage is still in the copy after Delete") end end
+    local renumbered = {}
+    for k, a in ipairs(after) do
+      local c = left[i + k - 1]
+      if c then renumbered[#renumbered + 1] = { from = a.from, to = safeProp(c, "no"), name = tostring(safeProp(c, "name")), was = a.name } end
+    end
+    return { action = "remove", removed = row, renumbered = emptyArray(renumbered), stages = emptyArray(patchStages.rows(p)) }
+  end
+  raise("[bad-args] action must be create, rename or remove")
 end
 
 -------------------------------------------------------------------------------
@@ -6555,7 +6962,7 @@ end)()
     elseif not source then
       raise("[already-there] the fixtures are already at the top level of " .. tostring(stageName))
     end
-    local stage = stageOf(p, stageName)
+    local stage = patchStages.of(p, stageName)
     return { stage = stage, stageName = stageName, entries = entries, source = source, target = target, parentFid = parentFid, sourceFid = srcFid or nil }
   end
 
@@ -6576,7 +6983,7 @@ end)()
   ops["patch.moveState"] = function(args)
     local p = requireCopy(nil)
     local stageName = nameArg(args.stage, "stage")
-    local stage = stageOf(p, stageName)
+    local stage = patchStages.of(p, stageName)
     local by = fixturesByFid(p)
     local d = destAddr()
     local function holderOf(v)

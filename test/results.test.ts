@@ -12,6 +12,8 @@ import {
   parseConsoleBoolean,
   buildResult,
   toToolResult,
+  compactItems,
+  isCleanSuccess,
   validationFailure,
   isErrorResult,
   stepFromError,
@@ -192,6 +194,15 @@ test("timeToSeconds interprets grandMA3 time displays and refuses markers and co
   assert.equal(timeToSeconds("1m00s"), 60);
   assert.equal(timeToSeconds("1h22m56.3s"), 4976.3);
   assert.equal(timeToSeconds("2m"), 120);
+  // onPC 2.5.1 drops the "s" from a minute up (#103): TrigTime 64 reads "1m04.00", macro waits "1h00m00.00".
+  assert.equal(timeToSeconds("1m04.00"), 64);
+  assert.equal(timeToSeconds("1m04.50"), 64.5);
+  assert.equal(timeToSeconds("1m04.00s"), 64);
+  assert.equal(timeToSeconds("1h00m00.00"), 3600);
+  assert.equal(timeToSeconds("1d03h46m40.00"), 100000);
+  assert.equal(timeToSeconds("59.99"), 59.99);
+  assert.equal(timeToSeconds("1m04.00x"), null);
+  assert.equal(timeToSeconds("m04"), null);
   assert.equal(timeToSeconds(4), 4);
   assert.equal(timeToSeconds("CueTiming"), null);
   assert.equal(timeToSeconds("3.00 / 1.50"), null);
@@ -202,6 +213,7 @@ test("timeToSeconds interprets grandMA3 time displays and refuses markers and co
 test("compareFields applies per-field normalisers and reports the interpreted value on mismatch", () => {
   const norm = { CueInFade: timeToSeconds, TrigTime: timeToSeconds };
   assert.equal(compareFields("t", { CueInFade: 60, TrigTime: 4 }, { CueInFade: "1m00s", TrigTime: "4.00" }, { normalize: norm }).status, "matched");
+  assert.equal(compareFields("t", { TrigTime: 64 }, { TrigTime: "1m04.00" }, { normalize: norm }).status, "matched");
   const m = compareFields("t", { CueInFade: 0 }, { CueInFade: "CueTiming" }, { normalize: norm });
   assert.equal(m.status, "mismatched");
   assert.match(m.detail ?? "", /CueInFade: expected 0, read "CueTiming" \(interpreted as null\)/);
@@ -234,6 +246,46 @@ test("buildResult / toToolResult: only a verified success is a non-error tool re
   const unknown = buildResult({ operation: "goto", target: {}, steps: [{ name: "goto", status: "unknown", error: "timeout" }] });
   assert.equal(unknown.outcome, "unknown");
   assert.equal(toToolResult(unknown).isError, true);
+});
+
+test("toToolResult and json() render compact JSON, with no indentation (#100)", async () => {
+  const ok = buildResult({ operation: "store_cue", target: { sequence: 1 }, steps: [{ name: "store", status: "succeeded", detail: { a: [1, 2] } }], verification: { status: "matched" } });
+  const text = toToolResult(ok).content[0].text;
+  assert.equal(text, JSON.stringify(ok));
+  assert.ok(!text.includes("\n"));
+  const { json } = await import("../src/tools/context.ts");
+  assert.equal(json({ a: { b: [1] } }).content[0].text, '{"a":{"b":[1]}}');
+  assert.equal(json("plain").content[0].text, "plain");
+});
+
+test("compactItems: a clean success gets items and loses the dumps; anything else, or detail, is returned whole (#100)", () => {
+  const steps = [{ name: "check", status: "succeeded" as const, kind: "read" as const, op: "patch.check", detail: { rows: [1, 2, 3] } }, { name: "set", status: "succeeded" as const, op: "patch.set", detail: { set: true } }];
+  const make = (status: "matched" | "mismatched" | "not_requested" | "unavailable") =>
+    buildResult({ operation: "patch_set", target: { edits: [{ fid: 1 }, { fid: 2 }] }, steps: steps.map((st) => ({ ...st })), verification: { status, checked: "names", expected: [1], actual: [2] }, extra: { before: [1, 2], after: [3, 4], committed: true } });
+  const o = { items: [{ fid: 1, name: ["a", "b"] }], drop: ["before", "after"], set: { target: { edits: 2 } }, hint: "detail: true returns more" };
+  for (const status of ["matched", "not_requested"] as const) {
+    const r = make(status);
+    assert.equal(isCleanSuccess(r), true);
+    const c = compactItems(r, false, o);
+    assert.deepEqual(c.items, o.items);
+    assert.deepEqual(c.target, { edits: 2 });
+    assert.equal(c.before, undefined);
+    assert.equal(c.after, undefined);
+    assert.equal(c.committed, true, "other extras stay");
+    assert.deepEqual(c.verification, { status, checked: "names" });
+    assert.deepEqual(c.steps, [{ name: "check", status: "succeeded", kind: "read", op: "patch.check" }, { name: "set", status: "succeeded", op: "patch.set" }]);
+    assert.equal(c.detailHint, o.hint);
+    assert.ok(r.before && r.steps[0].detail, "the full result itself is not changed");
+    assert.equal(compactItems(r, true, o), r, "detail: true returns the full result");
+  }
+  for (const status of ["mismatched", "unavailable"] as const) {
+    const r = make(status);
+    assert.equal(isCleanSuccess(r), false);
+    assert.equal(compactItems(r, false, o), r);
+  }
+  const failed = make("matched");
+  failed.outcome = "unknown";
+  assert.equal(compactItems(failed, false, o), failed);
 });
 
 test("validationFailure reports every problem and no steps", () => {

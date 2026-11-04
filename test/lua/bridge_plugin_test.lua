@@ -1633,7 +1633,7 @@ do
   r = request("feedback.read", {}, nil, C)
   check("feedback.read without items is refused with a code", r.ok == false and r.code == "no-items", r.error)
   r = request("feedback.read", { readers = { "commandText", "lastCommand", "blind", "solo", "page", "freeze", "selectedSequence", "previewBar", "sequenceActive" }, displays = { 1, 2, 9 }, executors = { 201, 202 }, sequences = { 5, 6 } }, nil, C)
-  check("feedback.read answers with Lua disabled", r.ok and r.result.atomic == false and r.result.epoch == 1 and r.result.bridgeVersion == "0.44.0" and r.result.module.version == feedbackModule.VERSION and r.result.identity.showFile == "mcp-test-disposable", J(r))
+  check("feedback.read answers with Lua disabled", r.ok and r.result.atomic == false and r.result.epoch == 1 and r.result.bridgeVersion == "0.51.0" and r.result.module.version == feedbackModule.VERSION and r.result.identity.showFile == "mcp-test-disposable", J(r))
   local by = {}
   if r.ok then for _, it in ipairs(r.result.items) do by[it.key] = it end end
   check("feedback.read: command text and last command are raw observations", by.commandText and by.commandText.value == "Store " and by.lastCommand.value == "Go+ Sequence 5 : OK" and by.lastCommand.note:find("not confirmation"), J(by.lastCommand))
@@ -1746,7 +1746,7 @@ do
   end
   local C = { id = 71 }
   r = request("feedback.context", { executors = { 201, 202 } }, nil, C)
-  check("feedback.context answers with Lua and input disabled", r.ok and r.result.bridgeVersion == "0.44.0" and r.result.module.version == feedbackModule.VERSION and r.result.atomic == false and r.result.generation == 1 and r.result.generationChanged == false and r.result.identity.showFile == "mcp-test-disposable" and r.result.identity.dataPool.name == "Default", J(r))
+  check("feedback.context answers with Lua and input disabled", r.ok and r.result.bridgeVersion == "0.51.0" and r.result.module.version == feedbackModule.VERSION and r.result.atomic == false and r.result.generation == 1 and r.result.generationChanged == false and r.result.identity.showFile == "mcp-test-disposable" and r.result.identity.dataPool.name == "Default", J(r))
   check("feedback.context: authoritative display, bank/page, slots with availability and value", r.ok and r.result.authoritativeDisplay.rule == "configured" and r.result.encoder.value.bank.name == "Color" and r.result.encoder.value.page.name == "RGB" and r.result.slots.value.slots[1].name == "ColorRGB_R" and r.result.slots.value.slots[1].availability == "available" and r.result.slots.value.slots[1].absolute == 50 and r.result.slots.value.slots[1].unit == "None" and r.result.slots.value.slots[2].valueState == "empty" and r.result.executorPage.no == 1, J(r.result.slots))
   check("feedback.context: executor targets with functions, level and playback-target status", r.ok and #r.result.executors == 2 and r.result.executors[1].value.functions.keyPress == "Temp" and r.result.executors[1].value.level.value == 100 and r.result.executors[1].value.playbackTarget == true and r.result.executors[2].value.empty == true and r.result.executors[2].value.reserved == nil, J(r.result.executors))
   check("feedback.context: nested fields survive the serialiser depth bound", r.ok and type(r.result.slots.value.slots[1].feature) == "string" and type(r.result.executors[1].value.assigned.name) == "string")
@@ -2435,6 +2435,72 @@ do
 end
 
 -------------------------------------------------------------------------------
+-- #99 (0.46.0): a preset range or list with a pool on the second number is expanded into single lookups.
+-- On onPC 2.5.1 ObjectList("Preset 4.1 Thru 4.3") and ("Preset 4.1 + 4.2") answer an empty list; "Preset 4.1
+-- Thru 3" and "Preset 4.2" resolve (live 2026-10-25).
+-------------------------------------------------------------------------------
+do
+  local function H(name) return { name = name, GetClass = function() return "Preset" end } end
+  local stored = { ["4.1"] = H("White"), ["4.2"] = H("CTO"), ["4.3"] = H("CTB"), ["21.2"] = H("Sine"), ["21.3"] = H("Linear") }
+  local calls = {}
+  local savedObjectList = ObjectList
+  ObjectList = function(ref)
+    calls[#calls + 1] = ref
+    local p, n = ref:match("^Preset (%d+)%.(%d+)$")
+    if p then local h = stored[p .. "." .. n]; return h and { h } or {} end
+    -- The console's own forms: an unqualified range end works, a qualified one or a + list gives nothing.
+    if ref == "Preset 4.1 Thru 3" then return { stored["4.1"], stored["4.2"], stored["4.3"] } end
+    return {}
+  end
+  local function names(res) local t = {}; for _, it in ipairs(res.items or {}) do t[#t + 1] = it.name end; return table.concat(t, ",") end
+  local function reset() calls = {} end
+
+  reset()
+  r = request("objects", { ref = "Preset 4.1 Thru 4.3", fields = { "No" } })
+  check("objects: 'Preset 4.1 Thru 4.3' is expanded into single lookups and finds the three presets", r.ok and r.result.total == 3 and names(r.result) == "White,CTO,CTB" and #calls == 3 and calls[1] == "Preset 4.1" and calls[3] == "Preset 4.3", J({ r, calls }))
+  reset()
+  r = request("objects", { ref = "Preset 4.1 + 4.3 + 21.2 Thru 21.4" })
+  check("objects: + lists across pools and a qualified range, empty slots skipped", r.ok and names(r.result) == "White,CTB,Sine,Linear" and #calls == 5, J({ r, calls }))
+  reset()
+  r = request("objects", { ref = "preset 4.3 thru 4.1 + 4.2" })
+  check("objects: a descending range keeps its order and a repeated preset comes once (lower-case keywords)", r.ok and names(r.result) == "CTB,CTO,White" and #calls == 3, J({ r, calls }))
+  reset()
+  r = request("objects", { ref = "Preset 4.1 + 3" })
+  check("objects: a bare number after + is not guessed: the reference goes to ObjectList unchanged", r.ok and #calls == 1 and calls[1] == "Preset 4.1 + 3", J({ r, calls }))
+  reset()
+  r = request("objects", { ref = "Preset 4.1 Thru 3" })
+  check("objects: the console's own form (unqualified end) goes to ObjectList unchanged", r.ok and names(r.result) == "White,CTO,CTB" and #calls == 1 and calls[1] == "Preset 4.1 Thru 3", J({ r, calls }))
+  reset()
+  r = request("objects", { ref = "Preset 4.2" })
+  check("objects: a single preset goes to ObjectList unchanged", r.ok and names(r.result) == "CTO" and #calls == 1, J({ r, calls }))
+  for _, ref in ipairs({ "Preset 4.*", 'Preset "White" + "CTO"', "Preset 4.1 Thru", "Preset Thru", "Sequence 1 Thru 3" }) do
+    reset()
+    r = request("objects", { ref = ref })
+    check("objects: a form the preset parser does not read goes to ObjectList unchanged (" .. ref .. ")", r.ok and #calls == 1 and calls[1] == ref, J({ r, calls }))
+  end
+  reset()
+  r = request("objects", { ref = "Preset 4.1 Thru 5.3" })
+  check("objects: a preset range across pools is refused before any lookup", r.ok == false and r.error:find("across pools", 1, true) ~= nil and #calls == 0, J({ r, calls }))
+  reset()
+  r = request("objects", { ref = "Preset 4.1 Thru 4.2000" })
+  check("objects: a preset range over 1000 presets is refused before any lookup", r.ok == false and r.error:find("more than 1000", 1, true) ~= nil and #calls == 0, J({ r, calls }))
+  reset()
+  r = request("objects", { ref = "Preset 4.1 Thru 2000" })
+  check("objects: a console-native range over 1000 presets (unqualified end) goes to ObjectList unchanged, not refused", r.ok and #calls == 1 and calls[1] == "Preset 4.1 Thru 2000", J({ r, calls }))
+  reset()
+  r = request("objects", { ref = "Preset 4.1 Thru 600 + 4.700 Thru 4.1300" })
+  check("objects: the 1000-preset bound counts every range of a list together", r.ok == false and r.error:find("more than 1000", 1, true) ~= nil and #calls == 0, J({ r, calls }))
+  reset()
+  r = request("objects", { ref = "Preset 1000.1 Thru 1000.3" })
+  check("objects: a pool number out of 1..999 is not expanded (ObjectList answers it)", r.ok and #calls == 1, J({ r, calls }))
+  reset()
+  r = request("object", { ref = "Preset 4.2 Thru 4.3", properties = false })
+  check("object: resolve() shares the expansion and returns the first preset found", r.ok and r.result.name == "CTO", J({ r, calls }))
+
+  ObjectList = savedObjectList
+end
+
+-------------------------------------------------------------------------------
 -- SU-16 (0.32.0): a sequence's current cue in object, children (playback) and executors reads
 -------------------------------------------------------------------------------
 do
@@ -2456,7 +2522,11 @@ do
     def.props = lowered
     def.children = def.children or {}
     def.methods = {
-      Get = function(self, k) return registry[self].props[tostring(k):lower()] end,
+      Get = function(self, k)
+        local d = registry[self]
+        if d.raise and d.raise[tostring(k):lower()] then error(d.raise[tostring(k):lower()]) end
+        return d.props[tostring(k):lower()]
+      end,
       GetClass = function(self) return registry[self].class end,
       Addr = function(self) return registry[self].addr or registry[self].name end,
       Index = function(self) return registry[self].index or 1 end,
@@ -2502,6 +2572,31 @@ do
   check("su16: executors carry the assigned sequence's current cue", r.ok and r.result.count == 1 and r.result.executors[1].assigned.currentCue.no == 2.5 and r.result.executors[1].assigned.hasActivePlayback == false, J(r))
   r = request("executor", { number = 201 })
   check("su16: executor carries the assigned sequence's current cue", r.ok and r.result.assigned.currentCue.name == "Half", J(r))
+
+  -- 0.47.0 (#96): a field read that raises is reported in fieldErrors, not dropped like an empty field.
+  local broken = H({ name = "202", class = "Exec", index = 202, props = { No = 202 }, raise = { object = "cannot read Object" } })
+  local plain = H({ name = "203", class = "Exec", index = 203, props = { No = 203 } })
+  local page = H({ name = "Page 1", class = "Page", children = { exec, broken, plain } })
+  local listed = ObjectList
+  ObjectList = function(ref) if ref == "ExecPage" then return { page } end return listed(ref) end
+  r = request("children", { ref = "ExecPage", fields = { "No", "Object" }, asText = false })
+  check("#96: children names a raising Object read in fieldErrors; a read field and an empty one have none",
+    r.ok and r.result.count == 3 and r.result.items[1].fields.Object.name == "Chase" and r.result.items[1].fieldErrors == nil
+      and r.result.items[2].fields.Object == nil and type(r.result.items[2].fieldErrors) == "table" and tostring(r.result.items[2].fieldErrors.Object):find("cannot read Object", 1, true) ~= nil
+      and r.result.items[2].fields.No == 202 and r.result.items[2].fieldErrors.No == nil
+      and r.result.items[3].fields.Object == nil and r.result.items[3].fieldErrors == nil, J(r))
+  -- 0.47.0 (#96): a Children() that raises is enumerationError, not an empty parent; a plain empty parent has none.
+  local unlistable = H({ name = "Macros", class = "Macros" })
+  registry[unlistable].methods.Children = function() error("Children failed") end
+  local emptyPool = H({ name = "Groups", class = "Groups" })
+  ObjectList = function(ref) if ref == "BadPool" then return { unlistable } elseif ref == "EmptyPool" then return { emptyPool } end return listed(ref) end
+  r = request("children", { ref = "BadPool" })
+  check("#96: children reports a raising Children() as enumerationError with the empty listing", r.ok and r.result.total == 0 and r.result.count == 0 and tostring(r.result.enumerationError):find("Children failed", 1, true) ~= nil, J(r))
+  r = request("children", { ref = "EmptyPool" })
+  check("#96: an empty parent has no enumerationError", r.ok and r.result.total == 0 and r.result.enumerationError == nil, J(r))
+  ObjectList = function(ref) if ref == "Page 1.202" then return { broken } end return listed(ref) end
+  r = request("objects", { ref = "Page 1.202", fields = { "Object" }, asText = false })
+  check("#96: objects reports the same fieldErrors", r.ok and r.result.count == 1 and tostring(r.result.items[1].fieldErrors and r.result.items[1].fieldErrors.Object):find("cannot read Object", 1, true) ~= nil, J(r))
 
   ObjectList, GetExecutor, CurrentExecPage = savedObjectList, savedGetExecutor, savedPage
 end

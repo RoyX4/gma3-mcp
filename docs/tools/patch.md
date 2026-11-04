@@ -8,6 +8,8 @@ the [SU-03 record](../probes/su-03-import-macos-2.5.1.md). `gma3_patch_library_a
 SU-22): bridge 0.38.0, [SU-22 record](../probes/su-22-library-add-macos-2.5.1.md). Imports name the library folder
 from bridge 0.41.0 ([record](../probes/import-library-listing-macos-2.5.1.md)). `gma3_patch_move` (fixtures under a
 grouping fixture) and `gma3_patch_retype` (fixtures to another type of the same mode): bridge 0.42.0 and 0.29.0.
+`gma3_patch_stages` (list, create, rename and remove stages, #97): bridge 0.48.0; 0.49.0 for the bridge's own
+re-check of a removal (unreadable lists, a name clash: review of #112).
 
 ## Common behaviour
 
@@ -47,7 +49,7 @@ required rather than implied.
 | `check_state` | read | `patch.state` | The command line is at Root, the copy is closed (nobody is in the Patch menu) and no modal is open |
 | `check_add` / `check_edits` / `check_fixtures` | read | `patch.check` | The tool's pre-flight (below) |
 | `enter` | mutation | `patch.enter` | Queues the two `ChangeDestination` commands into the copy and its stage's Fixtures |
-| `wait_copy` | read | `patch.state` | Polls (100 ms, up to 3 s) until the copy is open at that destination |
+| `wait_copy` | read | `patch.state` | Polls (100 ms, up to 3 s) until the copy is open at that destination. From bridge 0.45.0 the stage is compared by the destination object's address (`patch.enter`'s `stageIndex` against `patch.state`'s `destinationStage`), not its text: the console shows a named stage's Fixtures as `Stage 1 'Main Floor'.Fixtures` and only an unnamed one as `Stage 1.Fixtures` (#98). An older bridge is still compared by its exact `expectDestination`, which only an unnamed stage matches. A copy open at another destination fails the step with "the command line destination is X, expected Y" |
 | `add` / `set` / `remove` | mutation | `patch.add` / `patch.set` / `patch.remove` | The change, in the copy only |
 | `isolation_check` | read | `patch.collections`, `patch.fingerprint` | Fingerprints of copy and live per collection, touched FIDs left out |
 | `commit` | mutation | `patch.commit` | Queues `ChangeDestination Root` |
@@ -72,10 +74,18 @@ open on a display (someone is patching there), close it there with **Save and Ex
 | --- | --- |
 | `succeeded` | The change was committed and the copy closed. `committed: true`; `verification` reports the read-back |
 | `failed` | Nothing was committed (`committed: false`): a refusal before anything was sent, a refused change with the copy closed again, or a failed isolation check (`copyLeftOpen: true`) |
-| `unknown` | A step after `enter` got no reply, the copy never opened, or the commit was not confirmed; `committed` / `copyLeftOpen` say what is known |
+| `unknown` | A step after `enter` got no reply, the copy never opened (a copy open at the wrong destination is `failed`), or the commit was not confirmed; `committed` / `copyLeftOpen` say what is known |
+
+**Result size (#100).** On a clean success (`succeeded`, read-back `matched` or `not_requested`), `gma3_patch_set`,
+`gma3_patch_add` with `count` above 1, `gma3_patch_move` and `gma3_patch_retype` return `items`, one entry per fixture
+with its `fid` and `[before, after]` of what the call changed, the steps without their `detail` and the verification
+without `expected` and `actual`; the per-fixture rows (`before`, `after`, `fixtures`, the pre-check's and read-back's
+details) are left out. Anything else is returned whole, and `detail: true` returns the whole result on a success too.
+A clean rename of 88 fixtures returned 171 KB before (79 KB of it without the indentation), more than the client takes
+in one result; the compact form is about 6 KB.
 
 **Bridge-side safety net.** Each mutating op re-checks in the console:
-- `patch.add`: the copy, the destination, a free FID range, a free DMX range inside one universe, a validated per-break
+- `patch.add`: the copy, the destination (the Fixtures of the named stage, by address from bridge 0.45.0), a free FID range, a free DMX range inside one universe, a validated per-break
   mode. It calls `AddFixtures` once per fixture (amount 1, the fixture's own FID and address; bridge 0.25.2), stops
   at the first call that fails, checks that exactly the requested fixtures exist where requested, and deletes them
   again on any problem. A single call for a whole block crashed onPC 2.5.1 for a mode with cells (see
@@ -87,6 +97,7 @@ open on a display (someone is patching there), close it there with **Save and Ex
   copy. Such a fixture has an unreadable break, a break that is not an address, a DMX mode that cannot be read, or a
   break the mode does not have. A rename or an unpatch adds no range and is not affected.
 - `patch.remove`: grouping fixtures require explicit includeChildren plus a checked complete subtree.
+- `patch.stageEdit` (bridge 0.48.0): see [gma3_patch_stages](#gma3_patch_stages); it is on the same guard and needs `exclusive = true` too.
 - All five mutating ops are on the bridge's input-ownership guard (refused with `[busy]` while someone owns console
   input) and need `exclusive = true`.
 
@@ -120,9 +131,10 @@ paginate.
 | `name` | Optional; the console names the fixtures otherwise |
 | `address` | DMX start `"U.AAA"`; fixtures are patched consecutively by the mode's footprint |
 | `findFreeFrom` | Instead of `address`: the first free block from this `"U.AAA"` (`FindBestDMXPatchAddr`, re-checked) |
-| `stage` | Default: the first stage. Fixtures are added at the stage's top level |
+| `stage` | Default: the first stage. Fixtures are added at the stage's top level. A stage with a Name needs bridge 0.45.0; a name with `"` in it cannot be entered (the command quotes the name), one with `'` can (compared by address; its display text is ambiguous) |
 | `exclusive` | Must be `true` |
 | `verify` | Default `true` |
+| `detail` | Default `false`: with `count` above 1 a clean success lists `items` (`{fid, name, address}` per new fixture) and `check` as just the type and mode; `true` returns the rows (`fixtures`) and the full pre-check. With `verify: false` there is no read-back: `name` is the one asked for (every fixture of the block gets that same name), else the console's own name as `patch.add` reported it right after adding (left out when the reply has none), and `address` is the block address the bridge checked in the copy |
 
 With neither `address` nor `findFreeFrom` the fixtures are added unpatched.
 
@@ -154,7 +166,10 @@ Pre-flight (`patch.check` `edits`), nothing sent on failure:
 - the new ranges overlap no other patched fixture. The moving fixtures' own current ranges are ignored, so swaps and
   moves across a fixture's own range pass.
 
-The change is `patch.set`. Read-back compares each fixture's patch address and/or name.
+The change is `patch.set`. Read-back compares each fixture's patch address and/or name. A clean success has
+`target: {edits: <count>}` and per edit `{fid, address?: [before, after], name?: [before, after]}` in `items` (an
+unpatch reads `address: ["2.009", ""]`); `detail: true` returns the edits, `before` (the fixtures as they were),
+`after` (the read-back rows) and every step's detail.
 
 ## gma3_patch_remove
 
@@ -175,6 +190,7 @@ synthetic mouse clicks included (live, onPC 2.5.1, 2026-10-23). FIDs, addresses,
 | `position` | `"absolute"` (default) or `"relative"`: the answer to the console's question below |
 | `exclusive` | Must be `true` |
 | `verify` | Default `true` |
+| `detail` | Default `false`: a clean success lists `{fid, parent: [before, after]}` per fixture in `items` (`"root"` is the top level); `true` returns `fixtures` and every step's detail |
 
 **The question.** Pasting fixtures under another parent opens the console's own dialog "Move Fixtures": *keep the
 absolute position and rotation in 3D space, or the offset relative to the parent?* (Absolute / Relative / Cancel).
@@ -204,7 +220,7 @@ Any other dialog stops the move and is left alone, and so does a poll that canno
 still open, the tool clicks Cancel (`cancel_dialog`), which moves nothing, so the copy can be closed unchanged. When
 it cannot read whether that dialog is open (or cannot see it close after Cancel), it leaves the copy open (`copyLeftOpen: true`, outcome
 `unknown`). A paste without a reply may still have been queued: its dialog, or a completed paste (every fixture under
-the target and `OK: Paste …`), confirms it, and the move goes on (`move_paste` detail `replyLost`). If the
+the target and `OK: Paste …`), confirms it, and the move goes on (`move_paste` detail `replyLost`, with `detail: true`). If the
 console pastes without asking, the result says `dialog: "not_shown"` and the read-back still checks the pose.
 
 The isolation check leaves out the moved FIDs and compares fixtures without their number in their list
@@ -218,7 +234,7 @@ resolves to no (sub)fixture is reported unreadable, never as not holding them), 
 `absolute` compares the world pose (the parent's position and rotation applied; mesh mirroring and scale are not
 considered), `relative` the pose relative to the parent, within 1 mm and by quaternion. A part that cannot be read
 makes the verification `unavailable` and names it; the result's `fixtures` lists each fixture's parent, address,
-groups and poses.
+groups and poses (on anything but a clean success, or with `detail: true`).
 
 **Live** (onPC 2.5.1, this bridge as 0.40.0 (bb5afd4), 2026-10-23, `test/live/patch-move.live.ts` 1/1 in 71 s on a disposable show):
 two fixtures moved into a grouping fixture placed at x = 1 m (absolute), then back to the top level (relative), every
@@ -230,6 +246,71 @@ step succeeded and both read-backs matched. What the run established:
 - The isolation check (with `fixturePositions: false`) passed on both moves. Whether a move would have failed it
   without that option was not tried.
 
+## gma3_patch_stages
+
+Stages are the areas of a venue ("Main Floor", "Basement", "Outdoors"); `gma3_patch_add` adds fixtures to one by name.
+In the Halloween 2026 build no tool made them, and a subagent used `gma3_lua` inside the patch copy (#97; 10 calls,
+about 35 s). What worked there (live, onPC 2.5.1, 2026-10-25) is what the bridge does now:
+`Stages:Ptr(1):Set('Name', ...)` renames, `Stages:Acquire('Stage')` appends "Stage <n>" with its `Spaces` and
+`Fixtures` children (`Stages:Create(2)` silently did nothing), and `ChangeDestination Root` commits.
+
+| Parameter | |
+| --- | --- |
+| `action` | `list` (read-only), `create`, `rename` or `remove` |
+| `name` | `create`: the new stage's name; `rename`: the new name |
+| `names` | `create`: several new stages at once (1-32), appended in order |
+| `stage` | `rename` / `remove`: the stage's `index` (position, from `list`) or its name (exact, else the one name that matches ignoring case) |
+| `exclusive` | Must be `true` for a change |
+| `verify` | Default `true` |
+
+**list** (`patch.stages`, the live patch): per stage its `index`, `no`, `name`, `nameKind`, `fixtures` (every
+fixture under its Fixtures, sub-fixtures included; absent when the list cannot be read), `topLevel`, `spacesList`
+(whether it has a Spaces child) and `spaces` (how many), and `children`. From bridge 0.49.0 a read that raised is
+kept apart from an absent child: `childrenError`, `fixturesError` or `spacesError` says what could not be read, and
+the list flag is then left out rather than false. Lua reads an empty Name as "Stage <no>" (#98),
+so a name of that form is `nameKind: "default"` (empty, or set to that text: the two cannot be told apart) and any other
+is `"explicit"`.
+
+**Names** are validated like other object names: no characters the console strips (`"`, `.`, `,` and the others in
+the validation message), trimmed, at most 128 characters, and unique among the stages ignoring case. A stage may
+change the case of its own name; renaming to the same name is refused as changing nothing.
+
+**Pre-flight** (`patch.stages`), nothing sent on failure: a new name is not taken; the stage exists; a removal is not
+of the first or only stage, and the stage holds no fixtures and no other objects, has no spaces and no children
+besides Fixtures and Spaces. Anything unreadable is a refusal too: the children, the fixtures, the Spaces (an error,
+or a child named Spaces that is not reported as the Spaces list, which is how a bridge before 0.49.0 reports a Spaces
+read that raised). A removal is also refused when a stage after it with a default name would move up onto a name
+another stage has: with "Stage 2" (explicit), "Basement" and an unnamed stage 3, removing Basement would leave two
+"Stage 2", and `gma3_patch_add` on "Stage 2" would find the first (review of #112). The names after the removal are
+projected as the stages renumbering, a default name following its new number; unnamed stages moving up together do
+not clash.
+
+**The session.** Every change runs the common session, entered at the first stage's Fixtures like every other patch
+session; the step is `create_stage(s)`, `rename_stage` or `remove_stage` (`patch.stageEdit`). The bridge re-checks in
+the copy: the stage at the position still has the name the pre-check saw (`[stage-changed]` otherwise), the names,
+emptiness (from 0.49.0 with the same refusals for unreadable lists), first and last stage, and from 0.49.0 the name
+clash a removal would cause (`[name-clash]`). A create calls `Acquire('Stage')` and sets the Name per stage, checks the new
+object and the name it reads, and deletes every stage it appended on any problem; a rename puts the old name back
+(an empty Name for a default one) when the console does not keep the new one.
+
+The isolation check leaves out only what the change touches, by stage position (`patch.fingerprint`'s
+`excludeStages` and `bareStages`): after a create the appended stages on the copy side; after a rename the stage's
+Name and number on both sides; after a removal the removed stage on the live side, and the Name and number of the
+stages after it, which move up a place, on both sides. Everything inside every stage, the renamed one included, is
+still compared. If the console derives other texts from a stage's name or number (not seen; not checked live), the
+check fails and the copy is left open, as for any mismatch.
+
+**Read-back** (`patch.stages`, live): the names in order (a default name may read a new number after a removal), no
+two stages with one name (ignoring case), every stage's fixture count against the state before, and none in a new
+stage. A count that cannot be read, before the session or in the read-back, is not checked and says so: the
+verification is then `unavailable` ("not checked: the fixture count of stage N ..."), never `matched`. The result has `before`, the bridge's `edit` reply (created,
+renamed or removed stages, `renumbered` after a removal) and `stages`.
+
+**Unverified.** Removal uses `Delete` on Stages, the call that deletes fixtures and fixture types; it has not been
+run on a console for a stage, which is why it is limited to empty stages after the first. Nothing of this tool has
+run live yet: the evidence is the Lua session quoted above and the harness in `test/lua/patch_ops_test.lua`. A
+stage with a Name needs bridge 0.45.0 for every later session on it (#98).
+
 ## gma3_patch_retype
 
 Moves fixtures to another fixture type in the show whose DMX mode of the same name has the same expanded DMX
@@ -239,7 +320,8 @@ preset values are kept. The case it is for: a GDTF fixed and imported again (`gm
 import, and `gma3_patch_remove_type` then removes the old one by number. It is the same session as
 `gma3_assign_cell_layout` (`patch.retype`, [positions.md](positions.md#gma3_assign_cell_layout)) under a patch-centred
 name. Give `type` by number when two types share a name. The read-back checks each fixture's type by number and name
-and every DMX break against the state before.
+and every DMX break against the state before. A clean success lists `{fid, type: [before, after]}` per fixture in
+`items` (`detail: true` for the read-back rows).
 
 ## gma3_patch_library
 
