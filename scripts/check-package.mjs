@@ -136,9 +136,13 @@ try {
       cursors.add(cursor);
     }
   } while (cursor);
-  assert.equal(names.length, 152, "packaged server tool inventory changed");
+  assert.equal(names.length, 155, "packaged server tool inventory changed");
   for (const name of ["gma3_cue_settings", "gma3_configure_cue", "gma3_edit_cue_values", "gma3_cue_tracking_action"]) {
     assert.ok(names.includes(name), `missing cue workflow tool ${name}`);
+  }
+  // Upstream #97, #96 and #101 (merged with bdstark/main 2efb70e).
+  for (const name of ["gma3_patch_stages", "gma3_pool_usage", "gma3_store_recipe_cues"]) {
+    assert.ok(names.includes(name), `missing upstream tool ${name}`);
   }
   assert.equal(new Set(names).size, names.length, "packaged server has duplicate tool names");
   for (const name of criticalTools) assert.ok(names.includes(name), `missing critical tool ${name}`);
