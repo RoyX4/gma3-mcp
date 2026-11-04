@@ -47,6 +47,10 @@ class Console {
   unreadable = new Set<string>();
   /** "<ref> <Property>=<value>" set requests whose reply carries no value. */
   noValueSets = new Set<string>();
+  /** Native aliases observed on fader executors: both names address one function. */
+  faderEncoderAliases = new Set<string>();
+  /** A native side effect or concurrent edit occurring after a confirmed property write. */
+  afterSet?: (ref: string, property: string) => void;
 
   seq(n: number, name = `Seq ${n}`, props: Record<string, string> = {}, pool = 1): this {
     if (pool !== 1 && !this.pools.has(pool)) this.pools.set(pool, new Map());
@@ -159,9 +163,14 @@ class Console {
       if (r.kind === "exec") {
         const pageLocked = this.pages.get(r.p)!.lock !== "";
         accept(r.x.props, pageLocked || (property !== "Lock" && r.x.props.Lock !== ""));
+        if (this.faderEncoderAliases.has(ref) && (property === "Fader" || property === "Encoder")) {
+          r.x.props[property === "Fader" ? "Encoder" : "Fader"] = r.x.props[property];
+        }
+        this.afterSet?.(ref, property);
         return noValue ? { ref, property } : { ref, property, value: r.x.props[property] };
       }
       accept(r.s.props, property !== "Lock" && r.s.props.Lock !== "");
+      this.afterSet?.(ref, property);
       return noValue ? { ref, property } : { ref, property, value: r.s.props[property] };
     });
     h.fake.on("cmd", () => {
@@ -785,4 +794,44 @@ test("configure_executor refuses conflicting fader-row aliases before any reques
       assert.deepEqual(h.fake.requests, []);
     }
   }
+});
+
+test("configure_executor accepts equal fader-row aliases and verifies both final names", async () => {
+  con.faderEncoderAliases.add("Page 1.201");
+  const { result, isError } = await h.callJson("gma3_configure_executor", { page: 1, executor: 201, fader: "rate", encoder: "Rate" });
+  assert.equal(isError, false, JSON.stringify(result));
+  assert.equal(result.verification.status, "matched");
+  assert.equal(result.resulting.Fader, "Rate");
+  assert.equal(result.resulting.Encoder, "Rate");
+});
+
+test("configure_executor retains distinct fader and encoder assignments outside guarded rows", async () => {
+  const { result, isError } = await h.callJson("gma3_configure_executor", { page: 2, executor: 305, fader: "Temp", encoder: "Master" });
+  assert.equal(isError, false, JSON.stringify(result));
+  assert.equal(result.verification.status, "matched");
+  assert.deepEqual(sets(), ["Page 2.305 Fader=Temp"]);
+  assert.equal(result.resulting.Fader, "Temp");
+  assert.equal(result.resulting.Encoder, "Master");
+});
+
+test("configure_executor checks an initially unchanged Fix after another requested property changes", async () => {
+  con.afterSet = (ref, property) => {
+    if (ref === "Page 1.201" && property === "KeyPress") con.pages.get(1)!.execs.get(201)!.props.Fix = "Yes";
+  };
+  const { result, isError } = await h.callJson("gma3_configure_executor", { page: 1, executor: 201, key_press: "Temp", fix: false });
+  assert.equal(isError, true, JSON.stringify(result));
+  assert.equal(result.verification.status, "mismatched");
+  assert.equal(result.resulting.Fix, "Yes");
+  assert.deepEqual(sets(), ["Page 1.201 KeyPress=Temp"]);
+});
+
+test("configure_sequence catches drift in an initially unchanged requested setting after writes", async () => {
+  con.afterSet = (ref, property) => {
+    if (ref === "Sequence 5" && property === "Tracking") con.seqs.get(5)!.props.WrapAround = "No";
+  };
+  const { result, isError } = await h.callJson("gma3_configure_sequence", { sequence: 5, wrap_around: true, tracking: false });
+  assert.equal(isError, true, JSON.stringify(result));
+  assert.equal(result.verification.status, "mismatched");
+  assert.equal(result.resulting.WrapAround, "No");
+  assert.deepEqual(sets(), ["Sequence 5 Tracking=No"]);
 });

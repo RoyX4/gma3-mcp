@@ -116,6 +116,15 @@ Names match case-insensitively and are sent in the console's spelling; `Empty` c
 empty). The executor must exist on an existing page and hold a sequence; anything else is refused before
 anything is sent. Executor settings belong to this executor only.
 
+**Fader/Encoder aliases.** Conflicting `fader` and `encoder` values in one request are refused before any bridge
+request on the documented fader row, executors **201–290**, including `preview: true` and `verify: false`.
+Give one field, or the same canonical function in both. This is a conservative row-based validation policy:
+native evidence observed shared Fader/Encoder behaviour on fader-row executors **201–204** in onPC
+2.5.1.1 under Wine. It does not establish that every slot, layout or platform has been tested. Other executor
+rows retain their existing assignments; with verification enabled, their final readback still compares every
+requested field, so an unexpected alias cannot silently overwrite an initially unchanged request. Encoder
+left/right and key functions remain separate settings.
+
 Requests in order: `objects Page <p>` (Lock), `objects Page <p>.<e>` (Object), `objects Page <p>.<e>` (current
 values), `object <sequence address>` (playback before; the sequence the executor holds, also from another data
 pool), then `set Page <p> Lock No` / `set Page <p>.<e> Lock No` (only

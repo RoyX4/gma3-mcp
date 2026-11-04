@@ -96,6 +96,32 @@ local function request(op, args, secondsPerFrame, client)
   return json.decode(res), frames
 end
 
+do
+  -- Exercise the actual serializer captured by the dispatcher, without exporting a
+  -- new production API or weakening the default for other response types.
+  local serializer
+  for i = 1, 100 do
+    local name, value = debug.getupvalue(state._handleLine, i)
+    if not name then break end
+    if name == "toJsonSafe" then serializer = value; break end
+  end
+  check("serializer: dispatcher keeps the bounded shared serializer", type(serializer) == "function")
+  if serializer then
+    local deep = {}; local cursor = deep
+    for _ = 1, 8 do cursor.next = {}; cursor = cursor.next end
+    deep.self = deep
+    local standard = serializer(deep)
+    cursor = standard
+    for _ = 1, 5 do cursor = cursor.next end
+    check("serializer: default depth stays six", cursor.next == "<table: max depth>", json.encode(standard))
+    check("serializer: default cycle guard stays active", standard.self == "<cycle>", json.encode(standard))
+    local extended = serializer(deep, nil, nil, nil, 8)
+    cursor = extended
+    for _ = 1, 7 do cursor = cursor.next end
+    check("serializer: opt-in depth eight remains bounded and cycle-safe", cursor.next == "<table: max depth>" and extended.self == "<cycle>", json.encode(extended))
+  end
+end
+
 local function resetBudget()
   state.lua.maxMs = 5000
   state.lua.maxSteps = 20000000

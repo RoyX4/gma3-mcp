@@ -924,7 +924,7 @@ const COMMON =
   "preview: true performs only the reads and returns the planned changes (from -> to); values already set are reported as unchanged and never sent. " +
   "Each value is written with one 'set' request whose reply must read back the requested value, because the console silently keeps the previous value for anything it does not accept; the first failure stops the remaining changes. " +
   "A value that could not be read is unknown, never a default: the call is refused when a value the plan depends on (requested property, Lock, page Lock) is missing, and a set reply without a value is an unknown step. " +
-  "verify (default true) reads every changed property and the lock back. Mutations from this server are serialised, but not isolated from other operators or clients.";
+  "verify (default true) reads every requested property and the lock after all writes, including properties initially unchanged. Mutations from this server are serialised, but not isolated from other operators or clients.";
 
 const fnSchema = (k: FunctionKey) => z.string().optional().describe(`${EXECUTOR_FUNCTIONS[k].property} function: ${EXECUTOR_FUNCTIONS[k].allowed.join(", ")} (Empty clears it).`);
 
@@ -978,7 +978,7 @@ export const registerPlaybackTools: RegisterTools = (server, ctx) => {
         lock: z.boolean().optional().describe("Final state of the executor's own Lock; lock: false on a locked executor removes the lock (explicit unlock)."),
         unlock: z.boolean().optional().describe("Allow unlocking a locked executor and/or page for this call; the locks are restored afterwards (default false: refuse)."),
         preview: z.boolean().optional().describe("Only read and report the planned changes (default false)."),
-        verify: z.boolean().optional().describe("Read the changed properties back and compare (default true)."),
+        verify: z.boolean().optional().describe("Read every requested property after all writes and compare, including initially unchanged values (default true)."),
       },
     },
     async (args) => operation(() => configureExecutor(ctx, args as ConfigureExecutorArgs)),
@@ -1018,7 +1018,7 @@ export const registerPlaybackTools: RegisterTools = (server, ctx) => {
         lock: z.boolean().optional().describe("Final state of the sequence's Lock; lock: false on a locked sequence removes the lock (explicit unlock)."),
         unlock: z.boolean().optional().describe("Allow unlocking a locked sequence for this call; the lock is restored afterwards (default false: refuse)."),
         preview: z.boolean().optional().describe("Only read and report the planned changes and sharing executors (default false)."),
-        verify: z.boolean().optional().describe("Read the changed settings back and compare (default true)."),
+        verify: z.boolean().optional().describe("Read every requested setting after all writes and compare, including initially unchanged values (default true)."),
         ...batchOptionShape,
       },
     },
