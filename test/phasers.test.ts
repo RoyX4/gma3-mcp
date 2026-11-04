@@ -101,8 +101,19 @@ test("physical values convert through the range, relative values through its siz
   const row = (from: number, to: number, rel: number, abs: number): Row => ({ subfixtureIndex: 2, fid: "601", attribute: "Pan", stepCount: 2, physicalFrom: from, physicalTo: to, steps: [{ relative: rel }, { absolute: abs }], phaser: { gridPos: 0 } });
   const s = new Map([[2, "601"]]);
   assert.deepEqual(verifyBuild({ effect: e, rows: [row(-225, 225, 6.667, 40)], scope: s, implied: new Set(), stepPresets: [] }).problems, []);
-  assert.deepEqual(verifyBuild({ effect: e, rows: [row(270, -270, 5.556, 58.333)], scope: s, implied: new Set(), stepPresets: [] }).problems, [], "reversed range: relative stays positive");
+  assert.deepEqual(verifyBuild({ effect: e, rows: [row(270, -270, 5.556, 41.667)], scope: s, implied: new Set(), stepPresets: [] }).problems, [], "reversed DMX range: absolute follows ascending UI range, relative stays positive");
   assert.match(verifyBuild({ effect: e, rows: [{ ...row(-225, 225, 6.667, 40), physicalFrom: undefined }], scope: s, implied: new Set(), stepPresets: [] }).problems.join(), /physical range of Pan is unknown/);
+});
+
+test("physical phaser absolute steps use ascending UI range when DMX Zoom runs backwards", () => {
+  const effect: Effect = { unit: "physical", steps: [{ values: { Zoom: { absolute: 25 } } }], phaser: {} };
+  const input: Row = { subfixtureIndex: 1111, fid: "2037", attribute: "Zoom", physicalFrom: 50.2, physicalTo: 6.6,
+    stepCount: 1, steps: [{ absolute: 42.201834917068 }], phaser: { gridPos: 0 } };
+  const scope = new Map([[1111, "2037"]]);
+  const check = (value: Row) => verifyBuild({ effect, rows: [value], scope, implied: new Set(), stepPresets: [] });
+  assert.deepEqual(check(input).problems, []);
+  assert.ok(check({ ...input, steps: [{ absolute: 57.798165082932 }] }).problems.length > 0,
+    "the former DMX-directed fraction must not falsely verify");
 });
 
 test("step presets must be referenced by their step", () => {
@@ -822,4 +833,26 @@ test("#102 review of #108: with verify off, a store whose name nobody read makes
   const { result } = await build({ verify: false, effects: [{ preset: "23.40", name: "A", fixtures: [401, 402], template: { type: "alternate" } }, { preset: "23.41", name: "B", fixtures: [401, 402], template: { type: "runner" } }] });
   assert.deepEqual(result.items.map((i: any) => i.outcome), ["partial", "partial"], JSON.stringify(result.items).slice(0, 1500));
   assert.deepEqual(con.listed, ["Preset 23", "Preset 23"], "once for the inspection and the first store, again for the second store");
+});
+
+// Night Shift native witness: Zoom natural readout and Decimal24 transition readout must not change API percent units.
+test("percent phaser emitter pins attribute, step timing and BPM units", () => {
+ const e: Effect={unit:"percent",steps:[{values:{Dimmer:{absolute:4},Zoom:{absolute:5.5046,relative:-2}},width:50,transition:100,accel:-100,decel:-100},{values:{Dimmer:{absolute:28},Zoom:{absolute:7.7982}},transition:0}],phaser:{speedBpm:36}};
+ const cmds=effectCommands(e);
+ for(const want of ['Attribute "Dimmer" At Absolute Percent 4','Attribute "Zoom" At Absolute Percent 5.5046','Attribute "Zoom" At Relative Percent -2','At Width Percent 50','At Transition Percent 100','At Transition Percent 0','At Acceleration Percent -100','At Deceleration Percent -100','At Speed BPM 36']) assert(cmds.includes(want),want);
+});
+
+// Native Night Shift 9-Aura failure: the middle fixture belongs to both mirrored halves only once.
+test("native nine-fixture two-wing phase is symmetric across the actual centre", async () => {
+ const {readFileSync}=await import("node:fs");
+ const native=JSON.parse(readFileSync(new URL("./fixtures/nightshift-odd-two-wings-native.json",import.meta.url),"utf8"));
+ const q=native.arguments,actual=native.result.phases.phases;
+ assert.deepEqual(actual,[300,225,150,75,0,75,150,225,300]);
+ const effect: Effect={unit:q.unit,steps:q.steps.map((s:unknown,i:number)=>parseStep(`steps[${i}]`,s,q.unit)),phaser:parsePhaser(q.phaser)};
+ const expected=q.fixtures.map((_:number,k:number)=>expectedPhase(effect.phaser.phase!,k,q.fixtures.length,effect.phaser.repeat));
+ assert.deepEqual(expected,actual);
+ const rows=q.fixtures.flatMap((fid:number,k:number)=>["Dimmer","Zoom"].map(attribute=>({subfixtureIndex:fid,fid:String(fid),attribute,stepCount:q.steps.length,steps:q.steps.map((s:any)=>({absolute:s.values[attribute],width:s.width,trans:s.transition,accel:s.accel,decel:s.decel})),phaser:{phase:actual[k],gridPos:k,speed:q.phaser.speed_bpm/60,measure:q.phaser.measure*100}})));
+ const checked=verifyBuild({effect,rows,scope:new Map(q.fixtures.map((fid:number)=>[fid,String(fid)])),implied:new Set(),stepPresets:q.steps.map(()=>undefined)});
+ assert.deepEqual(checked.problems,[]);
+ rows[0].phaser.phase+=10;assert(verifyBuild({effect,rows,scope:new Map(q.fixtures.map((fid:number)=>[fid,String(fid)])),implied:new Set(),stepPresets:q.steps.map(()=>undefined)}).problems.length>0,"genuine phase mismatch must still fail");
 });

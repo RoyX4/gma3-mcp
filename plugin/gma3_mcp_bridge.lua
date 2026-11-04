@@ -4552,6 +4552,20 @@ local function patchFingerprint(p, only, exclude, opts)
     -- 2026-10-26). Hash verified raw self-identity instead; every other reference remains hashed.
     return "self"
   end
+  -- onPC 2.5.1.1 (2026-10-30): a Fixture's raw FIXTURE handle is self,
+  -- while its Display text can name the next sibling (empty on the last one).
+  -- Adding a touched fixture changes that text on an untouched tail fixture.
+  -- Canonicalize only proven raw-self identity; non-self/unreadable references
+  -- keep the normal Display comparison, and a changed GUID remains visible.
+  local function fixtureSelfIdentity(h)
+    local ok, f = pcall(function() return h:Get("FIXTURE") end)
+    if not (ok and (isHandle(f) or (type(f) == "table" and type(f.Get) == "function"))) then return nil end
+    local address = safeCall(h, "Addr")
+    if address == nil or address == "" or safeCall(f, "Addr") ~= address then return nil end
+    local g = guidOf(h)
+    if g == "" or guidOf(f) ~= g then return nil end
+    return "self#" .. g
+  end
   local function add(h, depth, renumbered, isType, bare)
     if r.objects >= PATCH_FP_LIMIT then r.complete = false; r.reason = "more than " .. PATCH_FP_LIMIT .. " objects"; return false end
     local okc, n = pcall(function() return h:PropertyCount() end)
@@ -4577,7 +4591,7 @@ local function patchFingerprint(p, only, exclude, opts)
       if not PATCH_FP_PROP_SKIP[k] and not (unnumbered and k == "INDEX") and not (bare and k == "NAME")
         and not (copyNamingPolicy and k == "IGNOREENFORCEUNIQUECHILDNAMES") then
         local v = (k == "FIXTURETYPE" and typeIdentity(h)) or (k == "MODEDIRECT" and modeIdentity(h))
-          or (k == "FIXTURE" and class == "Fixture" and environmentalSelfReference(h, i - 1))
+          or (k == "FIXTURE" and class == "Fixture" and (environmentalSelfReference(h, i - 1) or fixtureSelfIdentity(h)))
           or ((isType and k == "NAME") and tostring(safeProp(h, "name"))) or nil
         if v == nil then
           local okv, dv = pcall(function() return h:Get(k, Enums.Roles.Display) end)
