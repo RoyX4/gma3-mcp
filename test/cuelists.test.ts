@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { registerCueListTools, expectedOrder, judgeCycle, planObservation } from "../src/tools/cuelists.ts";
+import { buildCueBatch, registerCueListTools, expectedOrder, judgeCycle, planObservation } from "../src/tools/cuelists.ts";
+import { registerCueRangeEditTools } from "../src/tools/cue-range-edits.ts";
 import { SILENT } from "./helpers/fake-bridge.ts";
 import { startHarness, type Harness } from "./helpers/tool-harness.ts";
 
@@ -28,6 +29,8 @@ type Env = "Normal" | "Preview";
 interface Value {
   value: number;
   preset?: string;
+  fade?: number;
+  delay?: number;
   /** SU-14: a phaser's step values (step 1 first), and its layers. */
   steps?: number[];
   phase?: number;
@@ -128,7 +131,7 @@ class Console {
       ids.forEach((f, k) => {
         for (const v of this.prog[this.env].get(f)?.values() ?? []) if (v.steps && v.steps.length > 1) v.phase = ids.length > 1 ? +m![1] + ((+m![2] - +m![1]) * k) / (ids.length - 1) : +m![1];
       });
-    } else if ((m = cmd.match(/^At Speed ([\d.]+)$/))) {
+    } else if ((m = cmd.match(/^At Speed BPM ([\d.]+)$/))) {
       for (const f of sel) for (const v of this.prog[this.env].get(f)?.values() ?? []) if (v.steps && v.steps.length > 1) v.speed = +m[1] / 60;
     } else if ((m = cmd.match(/^Fixture (.+)$/))) {
       for (const part of m[1].split("+").map((x) => x.trim())) {
@@ -137,7 +140,7 @@ class Console {
       }
     } else if ((m = cmd.match(/^At ([\d.]+)$/))) {
       for (const f of sel) if (this.fixtures[f].includes("Dimmer")) this.set(f, "Dimmer", { value: +m[1] });
-    } else if ((m = cmd.match(/^Attribute "(.+)" At Absolute(?: Percent)? (-?[\d.]+)$/))) {
+    } else if ((m = cmd.match(/^Attribute "(.+)" At Absolute(?: Percent)? (-?[\d.]+)(?: Fade ([\d.]+))?(?: Delay ([\d.]+))?$/))) {
       for (const f of sel) {
         if (!this.fixtures[f].includes(m[1])) continue;
         const old = this.prog[this.env].get(f)?.get(m[1]);
@@ -145,7 +148,11 @@ class Console {
           const steps = [...(old?.steps ?? [old?.value ?? 0])];
           steps[this.step - 1] = +m[2];
           this.set(f, m[1], { value: steps[0], steps });
-        } else this.set(f, m[1], { value: +m[2] });
+        } else this.set(f, m[1], {
+          value: +m[2],
+          ...(m[3] === undefined ? {} : { fade: +m[3] }),
+          ...(m[4] === undefined ? {} : { delay: +m[4] }),
+        });
       }
     } else if ((m = cmd.match(/^At Preset (\d+)\.(\d+)$/))) {
       const key = `${m[1]}.${m[2]}`;
@@ -203,6 +210,13 @@ class Console {
         subfixtureIndex: +fid,
         attribute,
         ...(v.steps && v.steps.length > 1 ? { steps: v.steps.map((x) => ({ absolute: x })), phaser: { gridPos: order.indexOf(fid), phase: v.phase ?? 0, speed: v.speed ?? 1 } } : { value: v.value }),
+        ...(v.fade !== undefined || v.delay !== undefined ? {
+          phaser: { fade: v.fade, delay: v.delay },
+          masks: {
+            activePhaser: 64 + (v.fade === undefined ? 0 : 4) + (v.delay === undefined ? 0 : 8),
+            individual: 64 + (v.fade === undefined ? 0 : 4) + (v.delay === undefined ? 0 : 8),
+          },
+        } : {}),
         stepCount: v.steps?.length ?? 1,
         physicalFrom: 0,
         physicalTo: 1,
@@ -334,14 +348,210 @@ class Console {
   }
 }
 
-async function setup() {
-  const h = await startHarness(registerCueListTools);
+async function setup(register = registerCueListTools) {
+  const h = await startHarness(register);
   const c = new Console();
   c.install(h);
   // The operator's own work in the Normal programmer: it must survive every build.
   c.prog.Normal.set("301", new Map([["Dimmer", { value: 33 }]]));
   return { h, c };
 }
+
+test("static look series still checks the programmer before storing a cue", async () => {
+  const { h, c } = await setup();
+  try {
+    h.fake.on("fast.context", () => ({ contextKey: "lab", environment: c.env, identityUncertain: [], previewCommandSeries: 1 }));
+    h.fake.on("fast.previewCommands", args => {
+      assert.equal(c.env, "Preview");
+      const commands = args.commands as string[];
+      const steps = commands.map(command => ({ command, status: "succeeded", feedback: c.apply(command) }));
+      return { status: "succeeded", steps };
+    });
+    const r = await h.callJson("gma3_store_cues", { sequence: 969, mode: "create", exclusive: true,
+      cues: [{ cue: 1, fixtures: "101", intensity: 55, values: [{ attribute: "ColorRGB_B", value: 90, unit: "percent" }] }] });
+    assert.equal(r.isError, false, r.text);
+    assert(h.fake.requests.some(r => r.op === "fast.previewCommands"));
+    assert.equal(c.seqs.get(969)?.cues[0].data["101"].Dimmer, 55);
+    assert.equal(c.env, "Normal");
+  } finally { await h.close(); }
+});
+
+test("uncertain static look series is not replayed or stored", async () => {
+  const { h, c } = await setup();
+  try {
+    h.fake.on("fast.context", () => ({ contextKey: "lab", environment: c.env, identityUncertain: [], previewCommandSeries: 1 }));
+    h.fake.on("fast.previewCommands", args => {
+      const commands = args.commands as string[];
+      c.apply(commands[0]);
+      return { status: "unknown", steps: [{ command: commands[0], status: "unknown", feedback: "uncertain" }] };
+    });
+    const r = await h.callJson("gma3_store_cues", { sequence: 969, mode: "create", exclusive: true,
+      cues: [{ cue: 1, fixtures: "101", intensity: 55 }] });
+    assert.equal(r.isError, true);
+    assert.equal(h.fake.requests.filter(r => r.op === "fast.previewCommands").length, 1);
+    assert.equal(c.seqs.has(969), false);
+    assert.equal(h.fake.commands.some(command => command === "At 55"), false);
+    assert.equal(c.env, "Normal");
+  } finally { await h.close(); }
+});
+
+test("timed looks use individual commands and verify timing before Store", async () => {
+  const { h, c } = await setup();
+  try {
+    h.fake.on("fast.context", () => ({ contextKey: "lab", environment: c.env, identityUncertain: [], previewCommandSeries: 1 }));
+    h.fake.on("fast.previewCommands", () => assert.fail("timed look must use individual commands"));
+    const timedCommand = 'Attribute "Dimmer" At Absolute Percent 40 Fade 1.25 Delay 0';
+    const args = {
+      sequence: 969, mode: "create", exclusive: true,
+      cues: [{ cue: 1, fixtures: "101", values: [{ attribute: "Dimmer", value: 40, unit: "percent", fade: 1.25, delay: 0 }] }],
+    };
+    const stored = await h.callJson("gma3_store_cues", args);
+    assert.equal(stored.isError, false, stored.text);
+    assert(h.fake.commands.includes(timedCommand));
+    assert.equal(c.seqs.get(969)?.cues[0].data["101"].Dimmer, 40);
+    h.fake.onCommand(command => c.apply(command === timedCommand ? command.replace("Fade 1.25", "Fade 2") : command));
+    const mismatch = await h.callJson("gma3_store_cues", { ...args, sequence: 970 });
+    assert.equal(mismatch.isError, true, mismatch.text);
+    assert.match(mismatch.text, /fade reads 2 s, expected 1\.25 s/);
+    assert.equal(c.seqs.has(970), false);
+    assert.equal(c.env, "Normal");
+  } finally { await h.close(); }
+});
+
+test("scoped Store addresses the requested part and stops after native readback failure", async () => {
+  const { h, c } = await setup();
+  try {
+    c.addCue(980, 1); c.addCue(980, 2);
+    const result = await buildCueBatch(h.ctx, {
+      sequence: 980, mode: "merge", cue_only: "off", verify: true,
+      cues: ["1", "2"].map(cue => ({ cue, part: 2, looks: [], timing: {} })),
+      storeScope: { fixtures: "Fixture 101", attributes: ["Dimmer"] },
+      verifyStored: async () => ({ status: "mismatched", detail: "Scoped native data did not match" }),
+    });
+    assert.deepEqual(h.fake.commands.filter(c => c.startsWith("Store")), [
+      'Store Sequence 980 Cue 1 Part 2 If Fixture 101 Attribute "Dimmer" EndIf /Merge /CueOnly "Off" /NoConfirmation',
+    ]);
+    assert.equal(result.cues[0].status, "failed");
+    assert.equal(result.cues[0].verification.status, "mismatched");
+    assert.equal(result.cues[1].status, "not_attempted");
+    assert.equal(result.normalProgrammer, "untouched");
+  } finally { await h.close(); }
+});
+
+test("scoped Store refuses malformed filter attributes before reading the console", async () => {
+  const { h } = await setup();
+  try {
+    await assert.rejects(buildCueBatch(h.ctx, {
+      sequence: 980, mode: "merge", cues: [], verify: true,
+      storeScope: { fixtures: "Fixture 101", attributes: ['Dimmer" ; Go'] },
+    }), /attribute name/i);
+    assert.equal(h.fake.requests.length, 0);
+  } finally { await h.close(); }
+});
+
+const rangeInput = { sequence: 981, fixtures: "101", from: 1, to: 2, tracking: "cue_only", values: [{ attribute: "ColorRGB_B", value: 100 }] };
+
+async function rangeSetup(options: { locked?: string; ignoreStore?: boolean; restore?: boolean; preset?: boolean } = {}) {
+  const { h, c } = await setup(registerCueRangeEditTools);
+  const seq = 981, storeOptions = { StoreLook: "No", StoreSource: "Programmer", ChannelFilter: "Active", TrackingShield: "Off" };
+  c.addCue(seq, 1, { "101": { Dimmer: 45, ColorRGB_B: 20 } });
+  c.addCue(seq, 2, { "101": { Dimmer: 65 } });
+  c.addCue(seq, 3, {});
+  h.fake.on("fast.context", () => ({ contextKey: "range-test-context", environment: c.env, identityUncertain: [] }));
+  h.fake.on("preset.context", () => ({ preferences: storeOptions }));
+  h.fake.on("objects", (args) => {
+    const result = c.objects(String(args.ref), (args.fields ?? []) as string[]);
+    if ((args.fields as string[] | undefined)?.includes("Lock")) for (const item of result.items) {
+      Object.assign(item.fields, { Lock: args.ref === options.locked ? "UL" : "" });
+    }
+    return result;
+  });
+  h.fake.on("cue.content", args => {
+    const m = String(args.ref).match(/ Cue ([\d.]+)$/);
+    const cues = c.seqs.get(seq)!.cues.filter(x => !m || x.no === +m[1]).map(x => ({ no: x.no * 1000, name: x.name, fields: {}, parts: [{ no: 0, fields: {},
+      contentJson: JSON.stringify({ byFixtures: true, truncated: false, rows: Object.entries(x.data).flatMap(([fixture, attrs]) => Object.entries(attrs).map(([attribute, value]) => ({ fixture, attribute, hasAbsolute: true, hasRelative: false, value }))) }),
+    }] }));
+    return { complete: true, sequence: { fields: { Tracking: "Yes" } }, cues };
+  });
+  if (options.preset) h.fake.on("preset.read", () => ({ truncated: false, byFixtures: true, count: 2, pool: { no: 4 }, no: 902,
+    rows: [{ fixture: "101", attribute: "ColorRGB_B", hasAbsolute: true }, { fixture: "101", attribute: "Dimmer", hasAbsolute: true }] }));
+  h.fake.onCommand(cmd => {
+    const store = cmd.match(/^Store Sequence 981 Cue (\d+) Part 0 If Fixture 101 Attribute "ColorRGB_B" EndIf \/Merge \/CueOnly "(On|Off)" \/NoConfirmation$/);
+    if (!store) return c.apply(cmd);
+    if (options.ignoreStore) return "OK";
+    const cue = c.cue(seq, +store[1])!;
+    const following = c.seqs.get(seq)!.cues.find(x => x.no > cue.no);
+    if (options.restore !== false && store[2] === "On" && following && following.data["101"]?.ColorRGB_B === undefined) {
+      let prior;
+      for (const x of c.seqs.get(seq)!.cues) {
+        if (x.no > cue.no) break;
+        if (x.data["101"]?.ColorRGB_B !== undefined) prior = x.data["101"].ColorRGB_B;
+      }
+      if (prior !== undefined) (following.data["101"] ??= {}).ColorRGB_B = prior;
+    }
+    (cue.data["101"] ??= {}).ColorRGB_B = c.prog.Preview.get("101")!.get("ColorRGB_B")!.value;
+    return "OK";
+  });
+  return { h, c, storeOptions };
+}
+
+test("range edit previews only existing targets, then keeps Dimmer and restores later color", async () => {
+  const { h, c } = await rangeSetup();
+  try {
+    const { result: preview, isError: previewError } = await h.callJson("gma3_edit_cue_values", rangeInput);
+    assert.equal(previewError, false, preview.summary);
+    assert.deepEqual(preview.plan.selectedCues, [1, 2]);
+    assert.deepEqual(preview.plan.restorationCandidates, [2, 3]);
+    assert.equal(preview.plan.preservesIntensity, true);
+    assert.deepEqual(h.fake.commands, []);
+    const { result, isError } = await h.callJson("gma3_edit_cue_values", { ...rangeInput, preview: false, exclusive: true, expected_fingerprint: preview.fingerprint });
+    assert.equal(isError, false, result.summary);
+    assert.equal(result.verification.status, "matched");
+    assert.deepEqual(c.cue(981, 1)?.data, { "101": { Dimmer: 45, ColorRGB_B: 100 } });
+    assert.deepEqual(c.cue(981, 2)?.data, { "101": { Dimmer: 65, ColorRGB_B: 100 } });
+    assert.deepEqual(c.cue(981, 3)?.data, { "101": { ColorRGB_B: 20 } });
+    assert.equal(c.prog.Normal.get("301")?.get("Dimmer")?.value, 33);
+  } finally { await h.close(); }
+});
+
+test("range apply refuses missing/locked targets, stale preview, or unsafe Store preferences before commands", async () => {
+  const { h, c, storeOptions } = await rangeSetup({ locked: "Sequence 981 Cue 2 Part 0" });
+  try {
+    const apply = { ...rangeInput, preview: false, exclusive: true };
+    for (const args of [{ ...apply, from: undefined, to: undefined, cues: [1, 999] }, { ...apply, part: 2 }, apply]) {
+      const { isError } = await h.callJson("gma3_edit_cue_values", args);
+      assert.equal(isError, true);
+    }
+    const { result: preview } = await h.callJson("gma3_edit_cue_values", rangeInput);
+    c.cue(981, 1)!.data["101"].Dimmer = 77;
+    assert.equal((await h.callJson("gma3_edit_cue_values", { ...apply, expected_fingerprint: preview.fingerprint })).isError, true);
+    storeOptions.StoreLook = "Yes";
+    assert.match((await h.callJson("gma3_edit_cue_values", apply)).result.summary, /Store preferences/);
+    assert.deepEqual(h.fake.commands, []);
+  } finally { await h.close(); }
+});
+
+test("range stops after an acknowledged Store that did not change native cue data", async () => {
+  const { h } = await rangeSetup({ ignoreStore: true });
+  try {
+    const { result, isError } = await h.callJson("gma3_edit_cue_values", { ...rangeInput, preview: false, exclusive: true });
+    assert.equal(isError, true);
+    assert.equal(result.cues[0].status, "failed");
+    assert.equal(result.cues[1].status, "not_attempted");
+    assert.equal(h.fake.commands.filter(cmd => cmd.startsWith("Store")).length, 1);
+  } finally { await h.close(); }
+});
+
+test("range preview uses native preset coverage and excludes implicit preset Dimmer", async () => {
+  const { h } = await rangeSetup({ preset: true });
+  try {
+    const { result, isError } = await h.callJson("gma3_edit_cue_values", { ...rangeInput, values: undefined, presets: [{ pool: 4, preset: 902 }] });
+    assert.equal(isError, false, result.summary);
+    assert.deepEqual(result.plan.attributes, [{ attribute: "ColorRGB_B", layer: "absolute" }]);
+    assert.equal(result.plan.preservesIntensity, true);
+    assert.deepEqual(h.fake.commands, []);
+  } finally { await h.close(); }
+});
 
 /** Every step error of a result, for matching. */
 const errors = (r: { result: any }): string => (r.result.steps ?? []).map((s: any) => s.error ?? "").join(" | ");
@@ -355,6 +565,89 @@ const normalUntouched = (c: Console) => {
 // ---------------------------------------------------------------------------
 // gma3_store_cues
 // ---------------------------------------------------------------------------
+
+test("store_cues: all CueOnly options reach explicit-look create/merge/overwrite commands", async () => {
+  const { h, c } = await setup();
+  try {
+    h.fake.onCommand((cmd) => c.apply(cmd.replace(/ \/CueOnly "\w+"/g, "")));
+    const modes = { off: "Off", on: "On", on_default_new: "OnDefaultNew", dimmer_only: "DimmerOnly", dimmer_only_default_new: "DimmerOnlyDefaultNew" };
+    for (const [cue_only, native] of Object.entries(modes)) for (const mode of ["create", "merge", "overwrite"]) {
+      const sequence = 920 + Object.keys(modes).indexOf(cue_only);
+      if (mode !== "create") c.addCue(sequence, 1);
+      const { result, isError } = await h.callJson("gma3_store_cues", { sequence, mode, cue_only, exclusive: true, cues: [{ cue: 1, fixtures: "101", intensity: 50 }] });
+      assert.equal(isError, false, JSON.stringify(result));
+      const modeOption = mode === "create" ? "" : mode === "merge" ? " /Merge" : " /Overwrite";
+      assert.equal(h.fake.commands.findLast((cmd) => cmd.startsWith("Store ")), `Store Sequence ${sequence} Cue 1${modeOption} /CueOnly "${native}" /NoConfirmation`);
+      assert.match(result.notVerified, /restoration.*not verified/i);
+      assert.equal(c.env, "Normal");
+    }
+  } finally { await h.close(); }
+});
+
+test("store_cues: TrackingShield options combine with CueOnly and remain metadata-only verification", async () => {
+  const { h, c } = await setup();
+  try {
+    h.fake.onCommand((cmd) => c.apply(cmd.replace(/ \/CueOnly "\w+"/g, "").replace(/ \/TrackingShield "\w+"/g, "")));
+    c.addCue(925, 1);
+    for (const [tracking_shield, native] of Object.entries({ dimmer_rising_from_zero: "DRZ", dimmer_above_zero: "DAZ" })) {
+      const { result, isError } = await h.callJson("gma3_store_cues", { sequence: 925, mode: "merge", cue_only: "on", tracking_shield, exclusive: true, cues: [{ cue: 1, fixtures: "101", intensity: 50 }] });
+      assert.equal(isError, false);
+      assert.equal(h.fake.commands.findLast((cmd) => cmd.startsWith("Store ")), `Store Sequence 925 Cue 1 /Merge /CueOnly "On" /TrackingShield "${native}" /NoConfirmation`);
+      assert.match(result.notVerified, /following.cue.*not verified/i);
+      assert.match(result.summary, /restoration.*not verified/i);
+    }
+  } finally { await h.close(); }
+});
+
+test("store_cues: sequence batches inherit and override typed Store options", async () => {
+  const { h, c } = await setup();
+  try {
+    h.fake.onCommand((cmd) => c.apply(cmd.replace(/ \/CueOnly "\w+"/g, "").replace(/ \/TrackingShield "\w+"/g, "")));
+    const { isError, result } = await h.callJson("gma3_store_cues", { mode: "create", cue_only: "on", tracking_shield: "dimmer_rising_from_zero", exclusive: true, sequences: [
+      { sequence: 926, cues: [{ cue: 1, fixtures: "101", intensity: 30 }] },
+      { sequence: 927, cue_only: "off", tracking_shield: "dimmer_above_zero", cues: [{ cue: 1, fixtures: "101", intensity: 40 }] },
+    ] });
+    assert.equal(isError, false, JSON.stringify(result));
+    assert.deepEqual(h.fake.commands.filter((cmd) => cmd.startsWith("Store ")), [
+      'Store Sequence 926 Cue 1 /CueOnly "On" /TrackingShield "DRZ" /NoConfirmation',
+      'Store Sequence 927 Cue 1 /CueOnly "Off" /TrackingShield "DAZ" /NoConfirmation',
+    ]);
+    assert.match(result.notVerified, /restoration.*not verified/i, "compact sequence-batch results must retain the unverified following-cue boundary");
+  } finally { await h.close(); }
+});
+
+test("store_cues: invalid direct Store options, including later batch items, refuse before bridge work", async () => {
+  const { h } = await setup();
+  try {
+    const handler = h.tools.get("gma3_store_cues")!.handler;
+    for (const options of [{ cue_only: "yes" }, { cue_only: null }, { tracking_shield: "off" }, { tracking_shield: false }]) {
+      const before = h.fake.requests.length;
+      const one = await handler({ sequence: 928, mode: "create", exclusive: true, cues: [{ cue: 1, fixtures: "101", intensity: 30 }], ...options });
+      assert.equal(one.isError, true, JSON.stringify(options));
+      assert.equal(h.fake.requests.length, before);
+      const batch = await handler({ mode: "create", exclusive: true, sequences: [
+        { sequence: 928, cues: [{ cue: 1, fixtures: "101", intensity: 30 }] },
+        { sequence: 929, cues: [{ cue: 1, fixtures: "101", intensity: 40 }], ...options },
+      ] });
+      assert.equal(batch.isError, true, JSON.stringify(options));
+      assert.equal(h.fake.requests.length, before, "an invalid later item's option must not partially build an earlier sequence");
+    }
+  } finally { await h.close(); }
+});
+
+test("build_chase does not expose or apply the new Store tracking options", async () => {
+  const { h } = await setup();
+  try {
+    const schema = h.tools.get("gma3_build_chase")!.inputSchema!;
+    assert.equal("cue_only" in schema, false); assert.equal("tracking_shield" in schema, false);
+    const { isError, result } = await h.callJson("gma3_build_chase", { sequence: 930, fixtures: "101", exclusive: true, steps: [{ intensity: 20 }, { intensity: 40 }], step_seconds: 1, observe: false });
+    assert.equal(isError, false, JSON.stringify(result));
+    assert.deepEqual(h.fake.commands.filter((cmd) => cmd.startsWith("Store ")), [
+      "Store Sequence 930 Cue 1 /NoConfirmation", "Store Sequence 930 Cue 2 /NoConfirmation",
+    ]);
+    assert.doesNotMatch(result.notVerified, /CueOnly|TrackingShield/);
+  } finally { await h.close(); }
+});
 
 test("store_cues: three cues built in Preview, each from its looks, named, timed and triggered; Normal untouched", async () => {
   const { h, c } = await setup();
@@ -516,6 +809,61 @@ test("edit_cues: trigger, timing and names on a range, read back per cue; refusa
 // ---------------------------------------------------------------------------
 // gma3_build_chase
 // ---------------------------------------------------------------------------
+
+for (const verification of ["mismatched", "unavailable"] as const) {
+  test(`edit_cues stops before cue 2 when cue 1 read-back is ${verification}`, async () => {
+    const { h, c } = await setup();
+    try {
+      c.addCue(961, 1); c.addCue(961, 2);
+      if (verification === "mismatched") c.ignoreSet = /^Sequence 961 Cue 1 Part 0 Name$/;
+      else h.fake.on("objects", (args) => {
+        if (args.ref === "Sequence 961 Cue 1") throw new Error("read-back unavailable");
+        return c.objects(String(args.ref), args.fields as string[]);
+      });
+      const { result, isError } = await h.callJson("gma3_edit_cues", { sequence: 961, cues: [1, 2], names: ["One", "Two"] });
+      assert.equal(c.cue(961, 2)?.name, "", "an unverified first cue must prevent later cue edits");
+      assert.equal(h.fake.requests.some((r) => r.op === "set" && r.args.ref === "Sequence 961 Cue 2 Part 0"), false);
+      assert.equal(result.cues[0].verification.status, verification);
+      assert.equal(result.cues[0].status, "failed");
+      assert.equal(result.cues[1].status, "not_attempted");
+      assert.equal(result.outcome, "partial");
+      assert.equal(isError, true);
+    } finally { await h.close(); }
+  });
+}
+
+test("edit_cues verify false keeps editing with explicit not_requested receipts", async () => {
+  const { h, c } = await setup();
+  try {
+    c.addCue(962, 1); c.addCue(962, 2);
+    c.ignoreSet = /^Sequence 962 Cue 1 Part 0 Name$/;
+    const { result, isError } = await h.callJson("gma3_edit_cues", { sequence: 962, cues: [1, 2], names: ["One", "Two"], verify: false });
+    assert.equal(isError, false);
+    assert.equal(c.cue(962, 2)?.name, "Two");
+    assert.deepEqual(result.cues.map((cue: any) => cue.verification.status), ["not_requested", "not_requested"]);
+    assert.equal(result.verification.status, "not_requested");
+  } finally { await h.close(); }
+});
+
+for (const field of ["Name", "Command"] as const) {
+  test(`edit_cues rejects a case-only ${field} mismatch before editing the next cue`, async () => {
+    const { h, c } = await setup();
+    try {
+      c.addCue(963, 1); c.addCue(963, 2);
+      c.cue(963, 1)!.name = "Opening";
+      c.cue(963, 1)!.part0.Command = 'Echo "Warm"';
+      c.ignoreSet = new RegExp(`^Sequence 963 Cue 1 Part 0 ${field}$`);
+      const edit = field === "Name" ? { names: ["OPENING", "Second"] }
+        : { commands: ['Echo "warm"', 'Echo "second"'] };
+      const { result, isError } = await h.callJson("gma3_edit_cues", { sequence: 963, cues: [1, 2], ...edit });
+      assert.equal(isError, true, "case-sensitive text that did not change must not verify");
+      assert.equal(result.cues[0].verification.status, "mismatched");
+      assert.equal(result.cues[0].status, "failed");
+      assert.equal(result.cues[1].status, "not_attempted");
+      assert.equal(h.fake.requests.some(r => r.op === "set" && r.args.ref === "Sequence 963 Cue 2 Part 0"), false);
+    } finally { await h.close(); }
+  });
+}
 
 test("build_chase: one cue per preset, every cue Time-triggered, Wrap Around on, one cycle observed through the wrap, then off", async () => {
   const { h, c } = await setup();
@@ -773,7 +1121,7 @@ test("SU-14 a look with a phaser: built in Preview after the look's values, chec
     assert.equal(isError, false, JSON.stringify(result).slice(0, 3000));
     assert.equal(result.cues[0].verification, "matched");
     const pre = c.commands.slice(c.commands.indexOf("[P] At 100") + 1);
-    assert.deepEqual(pre.slice(0, 6), ["[P] Step 1", '[P] Attribute "ColorRGB_R" At Absolute 100', "[P] Step 2", '[P] Attribute "ColorRGB_R" At Absolute 0', "[P] At Speed 120", "[P] At Phase 0 Thru 180"]);
+    assert.deepEqual(pre.slice(0, 6), ["[P] Step 1", '[P] Attribute "ColorRGB_R" At Absolute Percent 100', "[P] Step 2", '[P] Attribute "ColorRGB_R" At Absolute Percent 0', "[P] At Speed BPM 120", "[P] At Phase 0 Thru 180"]);
     // A phaser that does not take (the console refuses the phase) is a mismatch and the cue is not stored.
     c.reject = /^At Phase/;
     const bad = await h.callJson("gma3_store_cues", { sequence: 967, mode: "create", exclusive: true, cues: [{ cue: 1, fixtures: "101 + 102", phaser: { steps: [{ values: { ColorRGB_R: 100 } }, { values: { ColorRGB_R: 0 } }], phaser: { phase: { from: 0, to: 180 } } } }] });
@@ -1084,6 +1432,86 @@ test("SU-15: cue commands' $variables must exist or be set by an earlier cue com
   }
 });
 
+test("phaser cost: repeated fixture/attribute coverage uses one preflight and one snapshot per cue", async () => {
+  const { h, c } = await setup();
+  try {
+    const effect = (reverse: boolean) => ({ steps: [
+      { values: reverse ? { ColorRGB_G: 0, ColorRGB_R: 100 } : { ColorRGB_R: 100, ColorRGB_G: 0 } },
+      { values: reverse ? { ColorRGB_G: 100, ColorRGB_R: 0 } : { ColorRGB_R: 0, ColorRGB_G: 100 } },
+    ] });
+    const { result, isError } = await h.callJson("gma3_store_cues", {
+      sequence: 910, mode: "create", exclusive: true,
+      cues: [1, 2, 3].map(cue => ({ cue, fixtures: "101 + 102", phaser: effect(cue % 2 === 0) })),
+    });
+    assert.equal(isError, false, JSON.stringify(result).slice(0, 1800));
+    const scans = h.fake.requests.filter(r => r.op === "programmer" && r.args.scope === "fixtures");
+    assert.equal(scans.length, 4, "one deduplicated preflight plus one complete phaser snapshot per cue");
+    assert.deepEqual(scans.map(r => r.args.limit), [1, 5000, 5000, 5000]);
+    assert.deepEqual(new Set(scans[0].args.attributes as string[]), new Set(["ColorRGB_R", "ColorRGB_G"]), "metadata preflight skips unrelated native phaser reads");
+    assert.ok(scans.slice(1).every(r => r.args.attributes === undefined), "full look read-back still sees activation siblings and unexpected values");
+    assert.equal(c.seqs.get(910)?.cues.length, 3);
+    normalUntouched(c);
+  } finally { await h.close(); }
+});
+
+test("phaser cost: a compound fixture's cell coverage comes from the same snapshot as its phaser rows", async () => {
+  const { h, c } = await setup();
+  const original = h.fake.handlerFor("programmer")!;
+  h.fake.on("programmer", async (args, req) => {
+    const reply = await original(args, req) as any;
+    if (args.scope === "fixtures") {
+      reply.scannedFixtures = [
+        { subfixtureIndex: 101, fid: "101", rootFid: "101", name: "Parent", attributes: ["Dimmer"] },
+        { subfixtureIndex: 1001, fid: "None", rootFid: "101", name: "Cell", attributes: ["ColorRGB_R"] },
+      ];
+      reply.rows = reply.rows.map((r: any) => ({ ...r, subfixtureIndex: 1001, fid: "None" }));
+    }
+    return reply;
+  });
+  try {
+    const r = await h.callJson("gma3_store_cues", { sequence: 911, mode: "create", exclusive: true, cues: [{ cue: 1, fixtures: "101", phaser: { steps: [{ values: { ColorRGB_R: 100 } }, { values: { ColorRGB_R: 0 } }] } }] });
+    assert.equal(r.isError, false, JSON.stringify(r.result).slice(0, 1800));
+    assert.equal(r.result.cues[0].verification, "matched");
+    assert.equal(h.fake.requests.filter(r => r.op === "programmer" && r.args.scope === "fixtures").length, 2);
+    assert.ok(c.cue(911, 1));
+  } finally { await h.close(); }
+});
+
+test("phaser cost: truncated preflight metadata refuses all programming", async () => {
+  const { h, c } = await setup();
+  const original = h.fake.handlerFor("programmer")!;
+  h.fake.on("programmer", async (args, req) => {
+    const reply = await original(args, req) as any;
+    return args.scope === "fixtures" ? { ...reply, fixturesTruncated: true } : reply;
+  });
+  try {
+    const r = await h.callJson("gma3_store_cues", { sequence: 912, mode: "create", exclusive: true, cues: [{ cue: 1, fixtures: "101", phaser: { steps: [{ values: { ColorRGB_R: 100 } }, { values: { ColorRGB_R: 0 } }] } }] });
+    assert.equal(r.isError, true);
+    assert.deepEqual(c.commands, []);
+    assert.equal(c.cue(912, 1), undefined);
+  } finally { await h.close(); }
+});
+
+test("phaser cost: incomplete, truncated or partially paged phaser snapshots never store the cue", async () => {
+  for (const mode of ["incomplete", "truncated", "paged"] as const) {
+    const { h, c } = await setup();
+    const original = h.fake.handlerFor("programmer")!;
+    h.fake.on("programmer", async (args, req) => {
+      const reply = await original(args, req) as any;
+      if (args.scope !== "fixtures" || args.limit !== 5000) return reply;
+      if (mode === "incomplete") return { ...reply, coverage: { ...reply.coverage, complete: false } };
+      if (mode === "truncated") return { ...reply, fixturesTruncated: true };
+      return { ...reply, total: reply.rows.length + 1 };
+    });
+    try {
+      const r = await h.callJson("gma3_store_cues", { sequence: 913, mode: "create", exclusive: true, cues: [{ cue: 1, fixtures: "101", phaser: { steps: [{ values: { ColorRGB_R: 100 } }, { values: { ColorRGB_R: 0 } }] } }] });
+      assert.equal(r.isError, true, `${mode}: unavailable verification must stop the build`);
+      assert.equal(c.cue(913, 1), undefined, `${mode}: no Store after an incomplete phaser read`);
+      normalUntouched(c);
+    } finally { await h.close(); }
+  }
+});
+
 test("store_cues (#101): a note per cue is written on the cue and read back exactly", async () => {
   const { h, c } = await setup();
   try {
@@ -1237,6 +1665,134 @@ test("#102 store_cues batch: a rejected rename keeps the holder's real name, an 
     assert.match(result.items[4].summary, /"Sequence 953" is Sequence 953/, "the unnamed sequence's default name was read again");
     assert.deepEqual([5, 951, 952, 953, 954].map((n) => c.seqs.get(n)?.name ?? null), ["Looks", null, "Blue", "Sequence 953", null]);
     assert.deepEqual(c.listed, ["DataPool.Sequences", "DataPool.Sequences", "DataPool.Sequences"]);
+  } finally {
+    await h.close();
+  }
+});
+
+// Live 2026-11-03 (onPC 2.5.1, "Festoon Demo"): `trigger: "follow", time: 0.25, fade: 0` given for the call with a
+// 72-cue list reached no cue (the call-level keys were read only for a preset range), and the read-back still said
+// "matched". The call's keys are defaults for every cue now, and each cue's TrigType/TrigTime is read back.
+test("store_cues: the call's trigger, time and fade are defaults for every cue and are read back; a cue's own keys win", async () => {
+  const { h, c } = await setup();
+  try {
+    const { result, isError } = await h.callJson("gma3_store_cues", {
+      sequence: 954,
+      mode: "create",
+      fixtures: "101",
+      exclusive: true,
+      trigger: "follow",
+      time: 0.25,
+      fade: 0,
+      cues: [
+        { cue: 1, presets: [{ pool: 4, preset: 1 }] },
+        { cue: 2, presets: [{ pool: 4, preset: 2 }], time: 0.5 },
+        { cue: 3, presets: [{ pool: 4, preset: 3 }], trigger: "time", time: 2, fade: 1 },
+        { cue: 4, presets: [{ pool: 4, preset: 1 }], trigger: "go" },
+      ],
+    });
+    assert.equal(isError, false, JSON.stringify(result, null, 2));
+    assert.equal(result.verification.status, "matched");
+    assert.deepEqual(result.cues.map((x: any) => [x.cue, x.status, x.verification]), [["1", "stored", "matched"], ["2", "stored", "matched"], ["3", "stored", "matched"], ["4", "stored", "matched"]]);
+    const seq = c.seqs.get(954)!;
+    assert.deepEqual(
+      seq.cues.map((x) => [x.no, x.trigType, x.trigTime, x.part0.CueInFade]),
+      [
+        [1, "Follow", 0.25, "0.00"], // the call's trigger, time and fade
+        [2, "Follow", 0.5, "0.00"], // the call's trigger, its own time
+        [3, "Time", 2, "1.00"], // its own trigger, time and fade
+        [4, "Go", 0, "0.00"], // its own trigger: the call's time does not apply to Go
+      ],
+    );
+    const sets = h.fake.requests.filter((r) => r.op === "set" && /^Sequence 954 Cue \d( Part 0)?$/.test(String(r.args.ref))).map((r) => `${r.args.ref} ${r.args.property}=${r.args.value}`);
+    assert.deepEqual(
+      sets.filter((s) => /TrigType|TrigTime|CueInFade/.test(s)),
+      [
+        "Sequence 954 Cue 1 Part 0 CueInFade=0",
+        "Sequence 954 Cue 1 TrigType=Follow",
+        "Sequence 954 Cue 1 TrigTime=0.25",
+        "Sequence 954 Cue 2 Part 0 CueInFade=0",
+        "Sequence 954 Cue 2 TrigType=Follow",
+        "Sequence 954 Cue 2 TrigTime=0.5",
+        "Sequence 954 Cue 3 Part 0 CueInFade=1",
+        "Sequence 954 Cue 3 TrigType=Time",
+        "Sequence 954 Cue 3 TrigTime=2",
+        "Sequence 954 Cue 4 Part 0 CueInFade=0",
+        "Sequence 954 Cue 4 TrigType=Go",
+      ],
+      "every cue gets the call's fade and trigger written, except where its own keys replace them",
+    );
+    const reads = h.fake.requests.filter((r) => r.op === "objects" && /^Sequence 954 Cue \d$/.test(String(r.args.ref)));
+    assert.equal(reads.length, 4, "every cue's TrigType and TrigTime are read back");
+    assert.ok(reads.every((r) => (r.args.fields as string[]).includes("TrigType") && (r.args.fields as string[]).includes("TrigTime")));
+
+    // The batch form: the call's keys are defaults for every sequence's cues too.
+    const batch = await h.callJson("gma3_store_cues", {
+      mode: "create",
+      fixtures: "101",
+      exclusive: true,
+      trigger: "follow",
+      time: 0.25,
+      sequences: [
+        { sequence: 956, cues: [{ cue: 1, presets: [{ pool: 4, preset: 1 }] }] },
+        { sequence: 957, cues: [{ cue: 1, presets: [{ pool: 4, preset: 2 }] }, { cue: 2, presets: [{ pool: 4, preset: 3 }], trigger: "go" }] },
+      ],
+    });
+    assert.equal(batch.isError, false, JSON.stringify(batch.result, null, 2));
+    assert.deepEqual([c.cue(956, 1)!.trigType, c.cue(956, 1)!.trigTime], ["Follow", 0.25]);
+    assert.deepEqual(c.seqs.get(957)!.cues.map((x) => [x.trigType, x.trigTime]), [["Follow", 0.25], ["Go", 0]]);
+
+    // A per-cue time under a call-level trigger it does not apply to, and a call-level time without a trigger, are refused.
+    let bad = await h.callJson("gma3_store_cues", { sequence: 955, mode: "create", fixtures: "101", exclusive: true, trigger: "go", cues: [{ cue: 1, presets: [{ pool: 4, preset: 1 }], time: 1 }] });
+    assert.equal(bad.isError, true);
+    assert.match(bad.text, /cues\[0\]\.time is not applicable to trigger/);
+    bad = await h.callJson("gma3_store_cues", { sequence: 955, mode: "create", fixtures: "101", exclusive: true, time: 1, cues: [{ cue: 1, presets: [{ pool: 4, preset: 1 }] }] });
+    assert.equal(bad.isError, true);
+    assert.match(bad.text, /time needs a trigger/);
+    // A call-level Time trigger may leave the time to each cue (Codex review 1); a cue that then has none is refused by name.
+    bad = await h.callJson("gma3_store_cues", { sequence: 955, mode: "create", fixtures: "101", exclusive: true, trigger: "time", cues: [{ cue: 1, presets: [{ pool: 4, preset: 1 }], time: 2 }, { cue: 2, presets: [{ pool: 4, preset: 2 }] }] });
+    assert.equal(bad.isError, true);
+    assert.match(bad.text, /cues\[1\]\.time \(seconds\) is required for trigger \\"time\\" \(the call's trigger; give time for the call or for this cue\)/);
+    assert.doesNotMatch(bad.text, /restore_times/);
+    assert.equal(c.seqs.has(955), false, "nothing was sent for the refused calls");
+    const perCue = await h.callJson("gma3_store_cues", { sequence: 955, mode: "create", fixtures: "101", exclusive: true, trigger: "time", cues: [{ cue: 1, presets: [{ pool: 4, preset: 1 }], time: 2 }, { cue: 2, presets: [{ pool: 4, preset: 2 }], trigger: "follow" }] });
+    assert.equal(perCue.isError, false, JSON.stringify(perCue.result, null, 2));
+    assert.deepEqual(c.seqs.get(955)!.cues.map((x) => [x.trigType, x.trigTime]), [["Time", 2], ["Follow", 0]], "the call's Time trigger with each cue's own time, and a cue's own trigger");
+    // The preset-range form still needs a complete call-level trigger (nothing per preset could supply the time).
+    bad = await h.callJson("gma3_store_cues", { sequence: 962, mode: "create", fixtures: "101", exclusive: true, trigger: "time", presets: { pool: 4, from: 1, to: 3 } });
+    assert.equal(bad.isError, true);
+    assert.match(bad.text, /time \(seconds\) is required for trigger/);
+  } finally {
+    await h.close();
+  }
+});
+
+test("store_cues: a trigger the console accepts but does not apply is reported as mismatched, never as matched", async () => {
+  const { h, c } = await setup();
+  try {
+    // The console replies to the TrigType set as if it took it, but the cue stays on Go (live 2026-11-03).
+    c.ignoreSet = /^Sequence 958 Cue \d+ TrigType$/;
+    const { result } = await h.callJson("gma3_store_cues", {
+      sequence: 958,
+      mode: "create",
+      fixtures: "101",
+      exclusive: true,
+      trigger: "follow",
+      time: 0.25,
+      cues: [{ cue: 1, presets: [{ pool: 4, preset: 1 }] }, { cue: 2, presets: [{ pool: 4, preset: 2 }] }],
+    });
+    assert.equal(result.verification.status, "mismatched", JSON.stringify(result, null, 2));
+    assert.match(result.verification.detail, /cue 1: .*TrigType: expected "Follow", read "Go"/);
+    assert.match(result.verification.detail, /cue 2: .*TrigType: expected "Follow", read "Go"/);
+    assert.deepEqual(result.cues.map((x: any) => [x.cue, x.status, x.verification]), [["1", "stored", "mismatched"], ["2", "stored", "mismatched"]]);
+    assert.deepEqual(c.seqs.get(958)!.cues.map((x) => x.trigType), ["Go", "Go"]);
+    c.ignoreSet = undefined;
+
+    // A trigger time the console does not take is a mismatch too.
+    c.ignoreSet = /^Sequence 959 Cue 1 TrigTime$/;
+    const r2 = await h.callJson("gma3_store_cues", { sequence: 959, mode: "create", fixtures: "101", exclusive: true, cues: [{ cue: 1, presets: [{ pool: 4, preset: 1 }], trigger: "follow", time: 0.25 }] });
+    assert.equal(r2.result.verification.status, "mismatched");
+    assert.match(r2.result.verification.detail, /TrigTime: expected 0\.25, read /);
   } finally {
     await h.close();
   }

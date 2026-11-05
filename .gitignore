@@ -22,3 +22,10 @@ coverage/
 
 # Generated per clone by scripts/mcp-config.sh / .ps1 (contains an absolute local path)
 .mcp.json
+
+# Local qualification and machine setup artifacts
+.test-tools
+.npm-cache/
+__pycache__/
+*.pyc
+LOCAL-SETUP-REVIEW.md

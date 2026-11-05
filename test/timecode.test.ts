@@ -289,7 +289,7 @@ test("read lists the pool and one show; a deleted target is a problem", async ()
   assert.equal(one.result.tracks[0].events[1].time, "0:00:00:18");
   assert.match(one.result.problems.join(), /group 1 track 2 has no target .*its 2 event\(s\) do nothing/);
   assert.deepEqual(one.result.source.tcSlot, { source: "internal" });
-  assert.match(one.result.recording.armed, /never record/);
+  assert.match(one.result.recording.armed, /native IsRecording/);
 });
 
 test("play checks the crossed events against the observed cue changes in order; stop, rewind and seek are verified", async () => {

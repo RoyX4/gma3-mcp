@@ -85,6 +85,11 @@ function Obj:Addr() return self.addr or ("obj " .. tostring(self.name)) end
 function Obj:PropertyCount() return #self.pn end
 function Obj:PropertyName(i) return self.pn[i + 1] end
 function Obj:Get(k, role)
+  -- onPC2.5.1.1: FIXTURE is raw-self, but Display can name the next sibling.
+  if k:upper() == "FIXTURE" and rawget(self, "FixtureReference") then
+    if role == nil then return rawget(self, "FixtureReference") end
+    return self.pv.FIXTURE
+  end
   -- A fixture's FixtureType is a reference: the type object raw, "<no> <name>" in the display role (SU-03).
   if k:upper() == "FIXTURETYPE" and rawget(self, "TypeRef") then
     local t = rawget(self, "TypeRef")
@@ -439,6 +444,7 @@ AddFixtures = function(spec)
     -- "unpatched": AddFixtures leaves the fixture without an address (amount > 1 did that live for all but the first).
     if console.addMode == "unpatched" and #console.addCalls > 1 then addr = "" end
     stage.Fixtures.kids[#stage.Fixtures.kids + 1] = fixture(spec.name or ("Added " .. (fid + i)), fid + i, spec.mode, addr)
+    if spec.patch then for b = 2, #spec.patch do stage.Fixtures.kids[#stage.Fixtures.kids]:Set("Break" .. b, spec.patch[b]) end end
   end
   return true
 end
@@ -480,12 +486,55 @@ local function fpOf(side, exclude)
   return table.concat(parts, ",")
 end
 
+-- FIXTURE display alias regression (private onPC2.5.1.1,2026-10-30): the last
+-- existing scenery object reports raw self but Display changes from empty to the
+-- first newly appended light. Normalize only proven raw-self identity, not the field.
+do
+  local original = console.live.Stages.kids[1].Fixtures.kids[2]
+  original.addr = "14.9.7.1.2.2"
+  original:Set("GUID", "fixture-self-guid")
+  original:Set("FIXTURE", "")
+  original.FixtureReference = original
+  enter()
+  local copied = console.copy.Stages.kids[1].Fixtures.kids[2]
+  copied.addr = "14.10.7.1.2.2"
+  copied:Set("FIXTURE", "Stage 1.Fixtures.New Light")
+  check("FIXTURE raw self with matching GUID/address ignores its next-sibling Display alias", fpOf("copy") == fpOf("live"))
+  copied:Set("CID", "99")
+  check("FIXTURE self normalization does not hide another fixture property change", fpOf("copy") ~= fpOf("live"))
+  copied:Set("CID", "None")
+  copied:Set("GUID", "changed-self-guid")
+  check("FIXTURE self normalization still detects a changed fixture GUID", fpOf("copy") ~= fpOf("live"))
+  copied:Set("GUID", "fixture-self-guid")
+  local other = obj("Fixture", "Other", 999, { { "GUID", "fixture-self-guid" } })
+  other.addr = "14.10.7.1.2.999"
+  copied.FixtureReference = other
+  check("FIXTURE raw non-self with the same GUID retains Display fallback", fpOf("copy") ~= fpOf("live"))
+  other.addr = copied.addr; other:Set("GUID", "other-guid")
+  check("FIXTURE raw handle with same address but another GUID retains Display fallback", fpOf("copy") ~= fpOf("live"))
+  copied.FixtureReference = nil
+  check("FIXTURE without a raw handle retains Display fallback", fpOf("copy") ~= fpOf("live"))
+  copied.FixtureReference = copied
+  copied.Get = function(self, k, role) if k:upper() == "FIXTURE" and role == nil then error("raw FIXTURE unavailable") end return Obj.Get(self, k, role) end
+  check("FIXTURE with an unreadable raw reference retains Display fallback", fpOf("copy") ~= fpOf("live"))
+  copied.Get = nil
+  original:Set("GUID", ""); copied:Set("GUID", "")
+  check("FIXTURE without a nonempty GUID retains Display fallback", fpOf("copy") ~= fpOf("live"))
+  original:Set("GUID", "fixture-self-guid"); copied:Set("GUID", "fixture-self-guid")
+  local ls,cs = console.live.Stages.kids[1],console.copy.Stages.kids[1]
+  ls:Set("GUID", "stage-guid"); cs:Set("GUID", "stage-guid")
+  ls:Set("FIXTURE", "one"); cs:Set("FIXTURE", "two")
+  ls.FixtureReference = ls; cs.FixtureReference = cs
+  check("FIXTURE on a non-Fixture class remains fully compared", fpOf("copy") ~= fpOf("live"))
+  reset()
+end
+
 -------------------------------------------------------------------------------
 -- Reads
 -------------------------------------------------------------------------------
 
 local r = request("ping")
-check("ping reports bridge 0.30.0", r.ok and r.result.bridgeVersion == "0.49.0", J(r))
+check("ping reports bridge 0.30.0", r.ok and r.result.bridgeVersion == "0.51.0", J(r))
 
 r = request("patch.state")
 check("patch.state at Root: copy closed, stages listed", r.ok and r.result.destination == "Root" and r.result.copyOpen == false and r.result.atRoot == true and r.result.stages[1] == "Stage 1" and r.result.modal == false, J(r))
@@ -564,8 +613,14 @@ console.dest = "ShowData.Patch"; console.destObj = console.copy
 r = request("patch.add", with({ stage = "Stage 1", type = 6, mode = 3, fid = 901, count = 2, address = "2.001" }))
 check("patch.add at the wrong destination is refused, naming both", r.ok == false and r.code == "wrong-destination" and r.error:find("the command line destination is ShowData.Patch, expected Stage 1.Fixtures", 1, true) and not r.error:find("CmdIndirect"), J(r))
 console.dest = "Stage 1.Fixtures"; console.destObj = atFixtures
-r = request("patch.add", with({ stage = "Stage 1", type = 8, mode = 1, fid = 901 }))
-check("patch.add refuses a multi-break mode", r.ok == false and r.code == "multi-break", J(r))
+r = request("patch.add", with({ stage = "Stage 1", type = 8, mode = 1, fid = 901, address = "2.001" }))
+check("patch.add requires explicit addresses for a multi-break mode", r.ok == false and r.code == "multi-break", J(r))
+r = request("patch.add", with({ stage = "Stage 1", type = 8, mode = 1, fid = 991, breaks = { { ["break"] = 1, address = "10.001" }, { ["break"] = 2, address = "11.001" } } }))
+check("patch.add accepts and verifies explicit multiple breaks", r.ok and #r.result.created[1].breaks == 2 and r.result.created[1].breaks[2].address == "11.001", J(r))
+r = request("patch.set", with({ edits = { { fid = 991, breaks = { { ["break"] = 2, address = "12.001" } } } } }))
+check("patch.set changes one DMX break while preserving the other", r.ok and r.result.edits[1].after.breaks[1].address == "10.001" and r.result.edits[1].after.breaks[2].address == "12.001", J(r))
+r = request("patch.remove", with({ fids = { 991 } }))
+check("multi-break test fixture is removed from the copy", r.ok, J(r))
 r = request("patch.add", with({ stage = "Stage 1", type = 6, mode = 3, fid = 403 }))
 check("patch.add refuses a taken FID", r.ok == false and r.code == "fid-taken", J(r))
 r = request("patch.add", with({ stage = "Stage 1", type = 6, mode = 3, fid = 901, address = "1.020" }))
@@ -1136,6 +1191,24 @@ r = request("patch.groupsOf", { fids = { 401, 501 } })
 check("patch.groupsOf: a selected cell whose Parent cannot be read makes the group unreadable (PR #89 review)", r.ok and J(r.result.unreadable) == '["1.11"]', J(r))
 ShowData = liveShowData
 
+-- Compound removal: exact native tree inventory, stale descendant rejection, and one parent deletion.
+console.modal = false
+r = request("patch.enter", with({})); frame()
+check("compound removal test enters a separate patch copy", r.ok and console.copyOpen, J(r))
+r = request("patch.check", { fids = { 4 } })
+local compound = r.ok and r.result.fixtures[1]
+if compound then compound.descendants = r.result.descendants end
+check("compound preflight includes every descendant and full DMX breaks", compound and #compound.descendants > 0 and type(compound.descendants[1].breaks) == "table" and type(compound.descendants[1].breaks[1]) == "table", J(r))
+local oldName, child
+for _, f in ipairs(allFixtures(console.copy)) do if f.FID == compound.descendants[1].fid then child = f; oldName = f.name end end
+child:Set("Name", "Changed since preflight")
+r = request("patch.remove", with({ fids = { 4 }, includeChildren = true, expected = { ["4"] = { current = compound.current, descendants = compound.descendants } } }))
+check("compound removal refuses a stale descendant before Delete", not r.ok and r.code == "stale-fixture" and #allFixtures(console.copy) > 1, J(r))
+child:Set("Name", oldName)
+r = request("patch.remove", with({ fids = { 4, compound.descendants[1].fid }, includeChildren = true, expected = { ["4"] = { current = compound.current, descendants = compound.descendants } } }))
+local remains, outside = false, false
+for _, f in ipairs(allFixtures(console.copy)) do if f.FID == 4 or f.FID == compound.descendants[1].fid then remains = true elseif f.FID == 501 then outside = true end end
+check("compound removal deletes parent plus children once and preserves outside fixture", r.ok and #r.result.removed == 1 and not remains and outside, J(r))
 -------------------------------------------------------------------------------
 -- Named stages (#98). The console shows a named stage's Fixtures as "Stage <no> '<name>'.Fixtures" (live 2026-10-25),
 -- so the destination is compared by its address; the text is the fallback when the address cannot be read.

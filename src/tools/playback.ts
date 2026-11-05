@@ -114,6 +114,11 @@ export const SEQUENCE_SETTINGS: Record<string, SettingDef> = {
   auto_fix: { property: "AutoFix", kind: "bool" },
   auto_stomp: { property: "AutoStomp", kind: "bool" },
   tracking: { property: "Tracking", kind: "bool" },
+  cue_command: { property: "CUECOMMAND", kind: "enum", values: { enabled: "Enabled", force_no: "Force No", force_yes: "Force Yes" } },
+  mib_policy: { property: "SEQUMIB", kind: "enum", values: { enabled: "Enabled", never: "Never", force_early: "Force Early", force_upon_go: "Force UponGo", force_late: "Force Late" } },
+  mib_default_mode: { property: "SEQUMIBMODE", kind: "enum", values: { none: "None", early: "Early", upon_go: "UponGo", late: "Late" } },
+  prefer_cue_appearance: { property: "PREFERCUEAPPEARANCE", kind: "bool" },
+  cue_zero_mode: { property: "CUEZEROMODE", kind: "enum", values: { off: "Off", all_used_attributes: "All Used Attributes", only_used_dimmers: "Only Used Dimmers" } },
   soft_ltp: { property: "SoftLTP", kind: "bool" },
   off_when_overridden: { property: "OffWhenOverridden", kind: "bool" },
   kill_protect: { property: "KillProtect", kind: "bool" },
@@ -568,6 +573,11 @@ export async function configureExecutor(ctx: ToolContext, raw: ConfigureExecutor
   const preview = raw.preview === true;
   const verify = raw.verify !== false;
   const target: Record<string, unknown> = { page: raw.page, executor: raw.executor };
+  // Fader and Encoder can be aliases on native fader-row executors.
+  if (executor !== undefined && executor >= 201 && executor <= 290
+      && wanted.fader !== undefined && wanted.encoder !== undefined && wanted.fader !== wanted.encoder) {
+    v.errors.push("fader and encoder must request the same function on fader-row executors 201–290");
+  }
   if (v.ok && Object.keys(wanted).length === 0 && fix === undefined && lock === undefined) v.errors.push("nothing to configure: give at least one function, fix or lock");
   if (!v.ok || page === undefined || executor === undefined) return validationFailure(op, target, v.errors);
   const ref = executorRef(page, executor);
@@ -696,7 +706,10 @@ export async function configureExecutor(ctx: ToolContext, raw: ConfigureExecutor
     let resulting: Record<string, unknown> | null = null;
     if (verify) {
       const expected: Record<string, string> = {};
-      for (const c of changes) expected[c.property] = c.to;
+      // A setter may couple properties (e.g. Encoder also changes Fader). Verify the complete
+      // requested postcondition, including values that matched before any setter ran.
+      for (const k of Object.keys(wanted) as FunctionKey[]) expected[EXECUTOR_FUNCTIONS[k].property] = wanted[k]!;
+      if (fix !== undefined) expected.Fix = fix ? "Yes" : "No";
       const finalExecLock = lock !== undefined ? lock : execLocked;
       const rb = await readBackObject(bridge, ref, expected, finalExecLock);
       readBackSteps.push(rb.step);
@@ -862,8 +875,19 @@ export async function configureSequence(ctx: ToolContext, raw: ConfigureSequence
 
     const activeBefore = await playbackActive(bridge, ref, t);
     if (preview || (changes.length === 0 && !lockChange)) {
-      const what = preview ? "Preview only; nothing was sent." : `Every requested setting is already set on ${ref}; nothing was sent.`;
-      return buildResult({ operation: op, target, steps: inspect.steps, verification: notRequested(), summary: what, warnings, extra: { ...extra, preview, noop: !preview, playback: { activeBefore } } });
+      let what = preview ? "Preview only; nothing was sent." : `Every requested setting is already set on ${ref}; nothing was sent.`;
+      let verification = notRequested();
+      let resulting: Record<string, unknown> | null = null;
+      const steps = [...inspect.steps];
+      // A no-op is a verified postcondition when verify:true. Callers such as cue jobs must not downgrade an
+      // already-correct Tracking setting to unavailable, and a fresh read catches drift since planning.
+      if (!preview && verify) {
+        const expected = Object.fromEntries(Object.entries(wanted).map(([k, to]) => [SEQUENCE_SETTINGS[k].property, to]));
+        const rb = await readBackObject(bridge, ref, expected, lock !== undefined ? lock : seqLocked);
+        steps.push(rb.step); verification = rb.verification; resulting = rb.values;
+        if (verification.status !== "matched") what = `No write was needed at preflight; the final settings of ${ref} ${verification.status === "mismatched" ? "changed" : "could not be verified"}.`;
+      }
+      return buildResult({ operation: op, target, steps, verification, summary: what, warnings, extra: { ...extra, preview, noop: !preview, resulting, playback: { activeBefore } } });
     }
 
     const { steps: mut, relockFailed } = await executePlan(ctx, plan);
@@ -874,7 +898,7 @@ export async function configureSequence(ctx: ToolContext, raw: ConfigureSequence
     let resulting: Record<string, unknown> | null = null;
     if (verify) {
       const expected: Record<string, string> = {};
-      for (const c of changes) expected[c.property] = c.to;
+      for (const [k, to] of Object.entries(wanted)) expected[SEQUENCE_SETTINGS[k].property] = to;
       const rb = await readBackObject(bridge, ref, expected, lock !== undefined ? lock : seqLocked);
       readBackSteps.push(rb.step);
       verification = rb.verification;
@@ -900,7 +924,7 @@ const COMMON =
   "preview: true performs only the reads and returns the planned changes (from -> to); values already set are reported as unchanged and never sent. " +
   "Each value is written with one 'set' request whose reply must read back the requested value, because the console silently keeps the previous value for anything it does not accept; the first failure stops the remaining changes. " +
   "A value that could not be read is unknown, never a default: the call is refused when a value the plan depends on (requested property, Lock, page Lock) is missing, and a set reply without a value is an unknown step. " +
-  "verify (default true) reads every changed property and the lock back. Mutations from this server are serialised, but not isolated from other operators or clients.";
+  "verify (default true) reads every requested property and the lock after all writes, including properties initially unchanged. Mutations from this server are serialised, but not isolated from other operators or clients.";
 
 const fnSchema = (k: FunctionKey) => z.string().optional().describe(`${EXECUTOR_FUNCTIONS[k].property} function: ${EXECUTOR_FUNCTIONS[k].allowed.join(", ")} (Empty clears it).`);
 
@@ -935,6 +959,7 @@ export const registerPlaybackTools: RegisterTools = (server, ctx) => {
       title: "Configure a sequence executor's functions",
       description:
         "Set the key, MA-key, fader and encoder functions and Fix of the sequence executor at Page <p>.<e> by writing its properties (KeyPress, KeyUnpress, MAKeyPress, MAKeyUnpress, Fader, Encoder, EncoderLeft, EncoderRight, Fix; " +
+        "On fader-row executors 201–290, Fader and Encoder can alias. When both are supplied they must request the same function. " +
         "unlike 'Assign <function> At', this never clears the unpress function). The executor must hold a sequence; functions are validated against the sequence lists before anything is sent (keys: Flash, Temp, Swap, Black and Time are key-only). " +
         "Executor settings belong to this executor only; sequence settings (Wrap Around, priority, ...) are configured with gma3_configure_sequence. lock: true/false sets the executor's own Lock. A page lock also blocks executor changes. " +
         COMMON,
@@ -953,7 +978,7 @@ export const registerPlaybackTools: RegisterTools = (server, ctx) => {
         lock: z.boolean().optional().describe("Final state of the executor's own Lock; lock: false on a locked executor removes the lock (explicit unlock)."),
         unlock: z.boolean().optional().describe("Allow unlocking a locked executor and/or page for this call; the locks are restored afterwards (default false: refuse)."),
         preview: z.boolean().optional().describe("Only read and report the planned changes (default false)."),
-        verify: z.boolean().optional().describe("Read the changed properties back and compare (default true)."),
+        verify: z.boolean().optional().describe("Read every requested property after all writes and compare, including initially unchanged values (default true)."),
       },
     },
     async (args) => operation(() => configureExecutor(ctx, args as ConfigureExecutorArgs)),
@@ -977,6 +1002,7 @@ export const registerPlaybackTools: RegisterTools = (server, ctx) => {
       description:
         "Set a sequence's playback settings by writing its properties: wrap_around (a chase loops only with Wrap Around on and a trigger on its first cue), priority, restart_mode, release_first_cue, auto_start, auto_stop, master_go_mode, auto_fix, auto_stomp, tracking, soft_ltp, " +
         "off_when_overridden, kill_protect, swap_protect (protection from the Kill/Swap playback actions, not from editing), use_executor_time, include_link_last_go, xfade_mode, xfade_reload. lock: true/false sets the sequence's own Lock. " +
+        "cue_command follows or overrides per-cue command enable settings; mib_policy enables, disables or forces sequence-wide MIB, while mib_default_mode supplies the default cue-part MIB mode. prefer_cue_appearance chooses cue appearance, and cue_zero_mode controls which used attributes are populated in Cue Zero. " +
         "Tempo links (SB-06): rate_master (a speed master 1-16 or \"none\": the cue timing (fades, delays, trigger times) runs at its effective BPM / 60, so 60 BPM is 1:1), speed_master (the phasers in the cues follow it), rate_scale and speed_scale (One, Mul2..Mul256, Div2..Div256), speed_from_rate. Masters are linked by name; a master without a unique name is refused. While a rate master is linked, moving the sequence's rate fader moves the shared master. " +
         "Settings belong to the sequence, so they apply to EVERY executor that references it: the tool scans all pages and lists them (references) and warns when other executors share the sequence. Cue triggers and timing are set with gma3_set_cue_trigger / gma3_set_cue_timing. " +
         COMMON +
@@ -992,7 +1018,7 @@ export const registerPlaybackTools: RegisterTools = (server, ctx) => {
         lock: z.boolean().optional().describe("Final state of the sequence's Lock; lock: false on a locked sequence removes the lock (explicit unlock)."),
         unlock: z.boolean().optional().describe("Allow unlocking a locked sequence for this call; the lock is restored afterwards (default false: refuse)."),
         preview: z.boolean().optional().describe("Only read and report the planned changes and sharing executors (default false)."),
-        verify: z.boolean().optional().describe("Read the changed settings back and compare (default true)."),
+        verify: z.boolean().optional().describe("Read every requested setting after all writes and compare, including initially unchanged values (default true)."),
         ...batchOptionShape,
       },
     },

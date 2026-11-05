@@ -19,6 +19,8 @@
 import { z } from "zod";
 import type { Gma3Bridge } from "../bridge.js";
 import { BridgeError } from "../bridge.js";
+import { readNativeCueContent } from "../native-cue-reader.js";
+import { nativePartIdentity } from "../native-cues.js";
 import { json, type RegisterTools, type ToolContext } from "./context.js";
 import type { ToolResult } from "../results.js";
 import { Validator, ValidationError, cueNumber, describe, finiteNumber, objectNumber, oneOf, partNumber, safeRef } from "../validate.js";
@@ -32,11 +34,33 @@ const WORKS_WITHOUT_LUA = "Works with gma3_lua disabled (structured bridge op, p
 
 const NULL_NOTE = "fields that are null were not supplied by the console API (explicitly unavailable, not inferred)";
 
+function nativePartNumber(value: unknown): number | undefined {
+  if (typeof value !== "number" && !(typeof value === "string" && /^\d{1,3}$/.test(value.trim()))) return undefined;
+  const number = Number(value);
+  return Number.isInteger(number) && number >= 0 && number <= 999 ? number : undefined;
+}
+
 /** Keys every attribute row carries (null when the console did not supply them). */
 export const ATTRIBUTE_ROW_KEYS = [
   "uiChannel", "attribute", "attributeIndex", "pretty", "feature", "featureGroup", "activationGroup", "physicalUnit", "readout", "color",
   "channelFunction", "channelFunctions", "dmxFrom", "dmxTo", "default", "physicalFrom", "physicalTo", "realFade", "dmx", "dmxChannel",
 ] as const;
+
+const FUNCTION_DETAIL_KEYS = ["name", "channelFunction", "attribute", "attributeIndex", "dmxFrom", "dmxTo", "default", "physicalFrom", "physicalTo", "physicalUnit", "realFade", "realAcceleration", "channelSets"] as const;
+const CHANNEL_SET_KEYS = ["name", "dmxFrom", "dmxTo", "physicalFrom", "physicalTo", "wheelSlotIndex"] as const;
+
+function isRecord(value: unknown): value is Row {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function functionDetails(value: unknown): Row[] | null {
+  if (!Array.isArray(value) || !value.every(isRecord)) return null;
+  return value.map((item) => {
+    const detail = withNulls(item, FUNCTION_DETAIL_KEYS);
+    const sets = detail.channelSets;
+    return { ...detail, channelSets: Array.isArray(sets) && sets.every(isRecord) ? sets.map(set => withNulls(set, CHANNEL_SET_KEYS)) : null };
+  });
+}
 
 export const PROGRAMMER_ROW_KEYS = [
   "fixture", "fid", "subfixtureIndex", "uiChannel", "attribute", "attributeIndex", "present", "value", "valueRaw", "relative", "masks", "stepCount", "steps", "phaser", "absPreset", "relPreset",
@@ -201,7 +225,8 @@ export const registerInspectionTools: RegisterTools = (server, ctx: ToolContext)
       title: "Discover a fixture's attributes",
       description:
         "List the attributes of one fixture or subfixture with stable identifiers (attribute name, attributeIndex, uiChannel), pretty name, feature/feature group, activation group, " +
-        "physical unit, natural readout, the channel function's DMX and physical ranges, defaults, optional channel sets, and the DMX address mapping (coarse/fine/ultra as universe.address) from the RT channels. " +
+        "physical unit, natural readout, the selected/default channel function's DMX and physical ranges, defaults, optional channel sets, and the DMX address mapping (coarse/fine/ultra as universe.address) from the RT channels. " +
+        "include_channel_functions:true adds per-function attributes, units, ranges and channel sets for the logical channels on this page. Unavailable detail lists and metadata are null. " +
         "Subfixtures of a compound fixture are listed explicitly (`subfixtures[]`, with their patch index); pass `Fixture 501.3` to inspect one. " +
         WORKS_WITHOUT_LUA +
         "The fixture is resolved by fixture ID through the console (patch index is reported separately as subfixtureIndex, never assumed equal). " +
@@ -209,7 +234,8 @@ export const registerInspectionTools: RegisterTools = (server, ctx: ToolContext)
         "Null fields were not supplied by the console (explicitly unavailable, never inferred). Results are paginated. Not available: current values (use gma3_programmer / gma3_fixture_output).",
       inputSchema: {
         fixture: z.union([z.number(), z.string()]).describe('Fixture ID (101), subfixture ("501.3") or command reference ("Fixture 501.3"). One (sub)fixture only.'),
-        include_channel_sets: z.boolean().optional().describe("Include each channel function's ChannelSets (named ranges such as gobo slots). Default false."),
+        include_channel_sets: z.boolean().optional().describe("Include the selected/default function's channelSets (named ranges such as gobo slots). Default false."),
+        include_channel_functions: z.boolean().optional().describe("Include each logical channel function's own metadata and channel sets in channelFunctionDetails. Default false."),
         ...pageShape(100, 500),
       },
     },
@@ -220,17 +246,22 @@ export const registerInspectionTools: RegisterTools = (server, ctx: ToolContext)
         const { limit, offset } = pageArgs(v, args, 100, 500);
         if (!v.ok || !ref) return validationError("gma3_fixture_attributes", v.errors);
         const includeSets = args.include_channel_sets === true;
-        const res = await op(bridge, "fixtureAttributes", { ref, limit, offset, includeChannelSets: includeSets }, timeoutMs);
+        const includeFunctions = args.include_channel_functions === true;
+        const res = await op(bridge, "fixtureAttributes", { ref, limit, offset, includeChannelSets: includeSets, ...(includeFunctions ? { includeChannelFunctions: true } : {}) }, timeoutMs);
         const keys = includeSets ? [...ATTRIBUTE_ROW_KEYS, "channelSets"] : [...ATTRIBUTE_ROW_KEYS];
         return {
           tool: "gma3_fixture_attributes",
           ref,
           ...res,
-          attributes: asArray(res.attributes).map((row) => withNulls(row, keys)),
+          attributes: asArray(res.attributes).map((value) => {
+            const row = withNulls(value, keys);
+            if (includeFunctions) row.channelFunctionDetails = functionDetails(row.channelFunctionDetails);
+            return row;
+          }),
           subfixtures: asArray(res.subfixtures),
           channels: asArray(res.channels),
           source: res.source ?? null,
-          limitations: stringList(res.limitations),
+          limitations: [...stringList(res.limitations), ...(includeFunctions && res.includeChannelFunctions !== true ? ["Detailed channel functions were requested but not provided by this bridge version. Update the console plugin to expose them."] : [])],
           notes: [NULL_NOTE, "programmer and output values are not part of discovery; use gma3_programmer and gma3_fixture_output", "selection and programmer were not changed"],
         };
       }),
@@ -254,6 +285,7 @@ export const registerInspectionTools: RegisterTools = (server, ctx: ToolContext)
         scope: z.enum(["all", "selection", "fixtures"]).describe("all = every patched (sub)fixture; selection = current selection; fixtures = the `fixtures` range."),
         fixtures: z.string().optional().describe('Required for scope "fixtures": fixture IDs/ranges such as "1 Thru 5", "101 + 103", "Fixture 501.3". Groups are not expanded.'),
         max_channels: z.number().int().min(1).max(50000).optional().describe("Scan budget in UI channels per request (default 5000). The scan stops when reached and coverage.complete is false."),
+        attributes: z.array(z.string().min(1).max(128).regex(/^[^\x00-\x1f\x7f]+$/)).min(1).max(128).optional().describe("Read only these attribute names (case-insensitive); unrelated GetProgPhaser calls are skipped. coverage then covers only these attributes; an empty result does not prove the whole programmer empty."),
         fields: z.array(z.enum(PROGRAMMER_ROW_KEYS)).optional().describe("Compact form: keep only these row keys (fid, subfixtureIndex and attribute are always kept)."),
         by_fixture: z.boolean().optional().describe("Compact form: perFixture, one entry per (sub)fixture with attribute -> value (or -> the chosen fields), instead of rows (one per channel). Folds the rows of this page."),
         ...pageShape(200, 5000),
@@ -276,7 +308,7 @@ export const registerInspectionTools: RegisterTools = (server, ctx: ToolContext)
         // The fixture summary folds one page: by default a whole scan's worth, so a fixture is not split across pages.
         const { limit, offset } = pageArgs(v, { ...args, limit: args.limit ?? (byFixture ? 5000 : undefined) }, 200, 5000);
         if (!v.ok || !scope) return validationError("gma3_programmer", v.errors);
-        const res = await op(bridge, "programmer", { scope, fixtures, limit, offset, maxChannels }, timeoutMs);
+        const res = await op(bridge, "programmer", { scope, fixtures, limit, offset, maxChannels, ...(args.attributes ? { attributes: args.attributes } : {}) }, timeoutMs);
         const coverage = (res.coverage && typeof res.coverage === "object" ? res.coverage : { complete: false }) as Row;
         const limitations = stringList(res.limitations);
         if (coverage.complete !== true && !limitations.some((l) => /coverage|budget|enumerat|failed/i.test(l))) {
@@ -358,12 +390,14 @@ export const registerInspectionTools: RegisterTools = (server, ctx: ToolContext)
         "Raw DMX output for an explicit universe and channel range (channels 1..512; universe 1..1024, further bounded by the console's universe count). `unit` is explicit: \"raw8\" (0..255 per address) or \"percent\" (0..100 as the console converts it). " +
         WORKS_WITHOUT_LUA +
         "Source is \"dmx output\": output levels, NOT programmer values. A universe that is not granted on this onPC returns no values with `granted: false`, a limitation (never zeros) and outputState explaining why (gma3_dmx_output has the whole picture). " +
-        "`nonzero_only` is an explicit filter. `patched: true` additionally maps each returned address to its fixture/channel through the RT channels (bounded; stated in limitations when skipped). 16-bit attributes appear as two separate 8-bit addresses.",
+        "The range is from..to, or from plus count addresses (one of to or count; neither reads the one address from). `nonzero_only` (also accepted as `nonzeroOnly`, the result's spelling) is an explicit filter. `patched: true` additionally maps each returned address to its fixture/channel through the RT channels (bounded; stated in limitations when skipped). 16-bit attributes appear as two separate 8-bit addresses.",
       inputSchema: {
         universe: z.number().int().describe("DMX universe number (1..1024)."),
         from: z.number().int().describe("First channel (1..512)."),
-        to: z.number().int().optional().describe("Last channel (1..512, >= from). Default: same as from."),
+        to: z.number().int().optional().describe("Last channel (1..512, >= from). Default: same as from. Not with count."),
+        count: z.number().int().optional().describe("Number of addresses from `from` (1..512; from + count - 1 <= 512), instead of to."),
         nonzero_only: z.boolean().optional().describe("Only return addresses whose value is not zero (default false)."),
+        nonzeroOnly: z.boolean().optional().describe("Same as nonzero_only (the spelling the result uses)."),
         unit: z.enum(["raw8", "percent"]).optional().describe("raw8 (default): 0..255 per address. percent: 0..100 as converted by the console."),
         patched: z.boolean().optional().describe("Map each returned address to fixture ID / channel name via the RT channels (default false)."),
       },
@@ -373,11 +407,19 @@ export const registerInspectionTools: RegisterTools = (server, ctx: ToolContext)
         const v = new Validator();
         const universe = v.check(() => finiteNumber("universe", args.universe, { integer: true, min: 1, max: 1024 }));
         const from = v.check(() => finiteNumber("from", args.from, { integer: true, min: 1, max: 512 }));
-        const to = v.check(() => finiteNumber("to", args.to, { integer: true, min: 1, max: 512, optional: true })) ?? from;
+        // Live 2026-11-03: `count` (addresses from `from`) is an alternative to `to`; both at once is refused (a conflict would be
+        // silently resolved otherwise), and a range past 512 is refused rather than clipped.
+        if (args.to !== undefined && args.count !== undefined) v.fail("give to or count, not both");
+        const count = v.check(() => finiteNumber("count", args.count, { integer: true, min: 1, max: 512, optional: true }));
+        const toGiven = v.check(() => finiteNumber("to", args.to, { integer: true, min: 1, max: 512, optional: true }));
+        const to = toGiven ?? (from !== undefined && count !== undefined ? from + count - 1 : from);
         if (from !== undefined && to !== undefined && to < from) v.fail(`to must be >= from (got from ${from}, to ${to})`);
+        if (from !== undefined && count !== undefined && from + count - 1 > 512) v.fail(`from ${from} plus count ${count} reaches address ${from + count - 1}; the last address is 512`);
         const unit = v.check(() => oneOf("unit", args.unit, ["raw8", "percent"] as const, { optional: true })) ?? "raw8";
+        // Live 2026-11-03: the result spells the filter nonzeroOnly, so that spelling is accepted on input too; the two must agree.
+        if (typeof args.nonzero_only === "boolean" && typeof args.nonzeroOnly === "boolean" && args.nonzero_only !== args.nonzeroOnly) v.fail("nonzero_only and nonzeroOnly disagree; give one of them");
         if (!v.ok || universe === undefined || from === undefined || to === undefined) return validationError("gma3_dmx", v.errors);
-        const nonzeroOnly = args.nonzero_only === true;
+        const nonzeroOnly = args.nonzero_only === true || args.nonzeroOnly === true;
         const patched = args.patched === true;
         const res = await op(bridge, "dmx", { universe, from, to, nonzeroOnly, percent: unit === "percent", patched }, timeoutMs);
         const outputState = res.granted === false ? await explainUniverses(bridge, [universe], timeoutMs) : undefined;
@@ -410,7 +452,7 @@ export const registerInspectionTools: RegisterTools = (server, ctx: ToolContext)
         "Read what a cue stores without playing it back or loading it: cue properties (No, Name, TrigType, TrigTime, TrigSound, Release, Assert, Note), per part the timing (CueFade, CueDelay, CueInFade, CueInDelay, CueOutFade, CueOutDelay, SnapDelay), command, MIB settings, " +
         "OwnDataPresent, and the recipes (selection, preset text plus the resolved preset reference or an explicit unresolved marker, values, FadeX/DelayX/SpeedX/PhaseX, enabled). `expand_presets: true` adds the referenced presets' data (GetPresetData) keyed by preset address. " +
         WORKS_WITHOUT_LUA +
-        "SUPPORTED MODE (onPC 2.5.1): recipe- and preset-based content only. NOT AVAILABLE: hard (non-recipe) fixture values stored in a part (`storedValues` is always null; a limitation is added when OwnDataPresent is Yes) and tracked/effective values (`trackedValues: \"not_reconstructed\"`; a part lists only what it stores). " +
+        "The new cue.content bridge reader adds actual hard (non-recipe) fixture values through GetPresetData(CuePart). Older plugins retain explicit unavailable storedValues. This single-cue read does not reconstruct tracked values; use gma3_native_cue_data for sequence-owned inheritance and its completeness limits. " +
         "The `fixtures` filter applies to expanded preset data only (stated in limitations). Never sends Goto, Load or any playback command.",
       inputSchema: {
         sequence: z.union([z.number(), z.string()]).describe("Sequence number (or exact name)."),
@@ -433,6 +475,15 @@ export const registerInspectionTools: RegisterTools = (server, ctx: ToolContext)
         if (!v.ok || sequence === undefined || cue === undefined) return validationError("gma3_cue_contents", v.errors);
         const expandPresets = args.expand_presets === true;
         const res = await op(bridge, "cueContents", { sequence, cue, part, fixtures, expandPresets }, timeoutMs);
+        let native: Row | null = null, nativeError: string | null = null;
+        const nativeRef = typeof res.ref === "string" ? res.ref : typeof sequence === "number" ? `Sequence ${sequence} Cue ${cue}` : null;
+        if (nativeRef) {
+          try { native = await readNativeCueContent(bridge, nativeRef, timeoutMs); }
+          catch (err) { nativeError = err instanceof Error ? err.message : String(err); }
+        }
+        const nativeCues = asArray(native?.cues);
+        const nativeCue = nativeCues.length === 1 && isRecord(nativeCues[0]) ? nativeCues[0] : undefined;
+        const nativeParts = asArray(nativeCue?.parts).filter(isRecord);
         const parts = asArray(res.parts).map((p) => {
           const row = withNulls(p, PART_KEYS);
           row.timing = withNulls(row.timing, PART_TIMING_KEYS);
@@ -441,21 +492,35 @@ export const registerInspectionTools: RegisterTools = (server, ctx: ToolContext)
           row.recipes = asArray(row.recipes).map((r) => withNulls(r, RECIPE_KEYS));
           row.otherChildren = asArray(row.otherChildren);
           row.storedValues = null;
+          const partNo = nativePartNumber(row.part);
+          const matches = partNo === undefined || !nativeCue ? [] : nativeParts.filter(item => nativePartIdentity(nativeCue, item) === partNo);
+          const actual = matches.length === 1 ? matches[0] : undefined;
+          if (actual && typeof actual.contentJson === "string") {
+            try {
+              const parsed = JSON.parse(actual.contentJson) as Row;
+              if (parsed.byFixtures === true && parsed.truncated === false && Array.isArray(parsed.rows)) row.storedValues = { ...parsed, complete: native?.complete === true };
+            } catch { nativeError = "Malformed encoded native cue-part content"; }
+          }
           return row;
         });
+        const nativeContentComplete = native?.complete === true && parts.length > 0 && parts.every(row =>
+          row.storedValues !== null && typeof row.storedValues === "object"
+          && "complete" in row.storedValues && row.storedValues.complete === true);
         return {
+          ...res,
           tool: "gma3_cue_contents",
           target: { sequence, cue, part: part ?? null, fixtures: fixtures ?? null },
-          supportedMode: "recipes and preset references (onPC 2.5.1); hard stored values and tracked values are not readable",
-          ...res,
+          supportedMode: nativeContentComplete ? "recipes and preset references plus actual hard cue-part channels (GetPresetData); sequence tracking uses gma3_native_cue_data" : "recipes and preset references; native hard-channel coverage is unavailable or incomplete",
+          nativeContentComplete,
+          nativeContentError: nativeError,
           source: res.source ?? "cue object tree",
           cue: withNulls(res.cue, CUE_KEYS),
           parts,
           presets: expandPresets ? (res.presets && typeof res.presets === "object" ? res.presets : {}) : null,
           trackedValues: "not_reconstructed",
-          limitations: stringList(res.limitations),
+          limitations: nativeContentComplete ? stringList(res.limitations).filter(item => !/hard \(non-recipe\)|no GetCueData/i.test(item)) : stringList(res.limitations),
           notes: [
-            "storedValues is always null: hard (non-recipe) values in a cue part are not exposed by the 2.5.1 Lua API",
+            "storedValues contains actual native channels when available; null means unreadable. complete:false is partial coverage, never a complete cue.",
             "trackedValues is not_reconstructed: a part lists only what it stores; tracked values from earlier cues are absent",
             NULL_NOTE,
             "no Goto, Load or playback command was sent; selection and programmer were not changed",

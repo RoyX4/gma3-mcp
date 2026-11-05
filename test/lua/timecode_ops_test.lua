@@ -64,7 +64,7 @@ end
 
 
 local frame = 0
-local TOKENS = { ["Go+"] = 3, ["Go-"] = 4, Goto = 16, Load = 17, On = 7, Off = 8, Toggle = 14, Top = 15, Pause = 18, Kill = 29, Flash = 1, Temp = 13, Swap = 2, Select = 24 }
+local TOKENS = { ["Go+"] = 3, ["Go-"] = 4, Goto = 16, Load = 17, On = 7, Off = 8, Toggle = 14, Top = 15, Pause = 18, Kill = 29, Flash = 1, Temp = 13, Swap = 2, Select = 24, FaderMaster = 35 }
 local function node(class, name, extra)
   local def = { name = name, class = class, kids = {}, props = {} }
   for k, v in pairs(extra or {}) do def[k] = v end
@@ -78,9 +78,11 @@ end
 function methods.Count(u) return #registry[u].kids end
 function methods.Ptr(u, i) return registry[u].kids[i] end
 function methods.HasActivePlayback(u) return registry[u].playing == true end
+function methods.IsRecording() return false end
 function methods.Set(u, name, v)
   local def = registry[u]
   local k = tostring(name):lower()
+  if k == "fadervalue" or k == "fadeoverride" then assert(type(v)=="number","native fader values must be typed numbers") end
   if k == "token" then
     if TOKENS[v] then def.props.token = TOKENS[v]; def.name = v; def.tokenName = v end
   elseif k == "status" then
@@ -111,10 +113,12 @@ function methods.Append(u, class)
     local t = add(u, "Track", "Track " .. #def.kids)
     add(t, "TimeRange", "TimeRange 1", { props = { rawstart = 0 } })
     return t
-  elseif def.class == "TimeRange" and class == "CmdSubTrack" then
+  elseif def.class == "TimeRange" and (class == "CmdSubTrack" or class == "FaderSubTrack") then
     local track = registry[def.parent]
     if not track.props.target or track.targetFrame >= frame then return nil end
-    return add(u, "CmdSubTrack", "CmdSubTrack " .. (#def.kids + 1))
+    return add(u, class, class .. " " .. (#def.kids + 1))
+  elseif def.class == "FaderSubTrack" and class == "FaderEvent" then
+    return add(u,"FaderEvent","Fader(Master)",{props={token=35,rawtime=0,fadervalue=0,fadeoverride=0}})
   elseif def.class == "CmdSubTrack" and class == "CmdEvent" then
     return add(u, "CmdEvent", "Go+", { props = { token = 3, rawtime = 0, executecommand = "Yes" }, tokenName = "Go+" })
   end
@@ -160,7 +164,7 @@ end
 
 
 local r = request("ping")
-check("ping reports bridge 0.30.0", r.ok and r.result.bridgeVersion == "0.49.0", J(r))
+check("ping reports bridge 0.30.0", r.ok and r.result.bridgeVersion == "0.51.0", J(r))
 
 r = request("timecode.read", { timecode = 902 })
 check("a missing show is not found", not r.ok and r.code == "not-found", J(r))
@@ -235,6 +239,40 @@ check("a wildcard executor target is refused unsafe-range", not r.ok and r.code 
 
 r = request("timecode.edit", { timecode = 901, action = "play" })
 check("there is no play action", not r.ok and r.code == "bad-args", J(r))
+
+-- Exact create-only native fader authoring, with typed numeric setters and no recording/playback.
+local createdCommands={}
+Cmd=function(command)
+  createdCommands[#createdCommands+1]=command
+  local n=tonumber(command:match("^Store Timecode (%d+) /NoConfirmation$"))
+  assert(n,"unexpected command in direct fader authoring")
+  objects["Timecode "..n]=handle(node("Timecode","Timecode "..n,{no=n,addr="14.14.1.15."..n,props={Lock="",TCSlot="-1"}}))
+  return "OK"
+end
+r=request("timecode.create",{timecode=901,sequence=908,expectedTargetAddr="14.14.1.7.908"})
+check("timecode.create never overwrites an existing show",not r.ok and r.code=="already-exists" and #createdCommands==0,J(r))
+r=request("timecode.create",{timecode=903,sequence=908,expectedTargetAddr="wrong"})
+check("timecode.create rejects changed exact target before any Store",not r.ok and r.code=="target-changed" and #createdCommands==0,J(r))
+r=request("timecode.create",{timecode=903,sequence=908,expectedTargetAddr="14.14.1.7.908"})
+check("timecode.create creates one new show through a checked Store",r.ok and r.result.created and r.result.addr=="14.14.1.15.903" and #createdCommands==1,J(r))
+r=request("timecode.edit",{timecode=903,action="add_group",expectedTimecodeAddr="wrong"})
+check("timecode.edit rejects an unexpected timecode identity before Append",not r.ok and r.code=="timecode-changed",J(r))
+r=request("timecode.edit",{timecode=903,action="add_group",expectedTimecodeAddr="14.14.1.15.903"})
+check("new fader target group created",r.ok,J(r))
+r=request("timecode.edit",{timecode=903,action="set_target",group=1,track=1,target="Sequence 908",expectedTimecodeAddr="14.14.1.15.903",expectedTargetAddr="14.14.1.7.908"})
+check("new fader track exact sequence assigned",r.ok,J(r))
+r=request("timecode.edit",{timecode=903,action="add_fader_events",group=1,track=1,expectedTargetAddr="14.14.1.7.908",events={{raw=0,value=0,fadeSeconds=0},{raw=1,value=101,fadeSeconds=0}}})
+check("all fader inputs validated before any subtrack is appended",not r.ok and r.code=="bad-args",J(r))
+r=request("timecode.read",{timecode=903})
+check("invalid fader plan left no event or subtrack",r.ok and #r.result.events==0 and #r.result.subtracks==0,J(r))
+local points={{raw=0,value=0,fadeSeconds=0},{raw=16777216,value=25,fadeSeconds=.25},{raw=33554432,value=50,fadeSeconds=.5},{raw=50331648,value=100,fadeSeconds=0}}
+r=request("timecode.edit",{timecode=903,action="add_fader_events",group=1,track=1,expectedTimecodeAddr="14.14.1.15.903",expectedTargetAddr="14.14.1.7.908",events=points})
+check("typed native fader events preserve0/25/50/100 and explicit fade seconds",r.ok and #r.result.added==4 and r.result.added[2].faderValue==25 and r.result.added[3].fadeOverrideSeconds==.5 and r.result.added[4].faderValue==100,J(r))
+r=request("timecode.read",{timecode=903})
+check("fader read exposes normalized time/value/fade and FaderSubTrack class",r.ok and r.result.subtracks[1].class=="FaderSubTrack" and r.result.events[4].raw==50331648 and r.result.events[4].faderValue==100,J(r))
+r=request("timecode.edit",{timecode=903,action="add_fader_events",group=1,track=1,expectedTargetAddr="14.14.1.7.908",events=points})
+check("fader authoring refuses to append into nonempty ranges",not r.ok and r.code=="not-empty",J(r))
+check("direct authoring issued no Go Record or live-fader command",#createdCommands==1 and createdCommands[1]=="Store Timecode 903 /NoConfirmation",J(createdCommands))
 
 print(string.format("\n%d passed, %d failed", passes, failures))
 if failures > 0 then os.exit(1) end

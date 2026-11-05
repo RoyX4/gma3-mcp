@@ -106,6 +106,66 @@ test("gma3_fixture_attributes uses defaults and refuses a group or a range", asy
   assert.equal(range.isError, true);
 });
 
+test("gma3_fixture_attributes opts into every function's own ranges, attributes and sets", async () => {
+  h.fake.on("fixtureAttributes", () => ({
+    source: "uiChannels", includeChannelFunctions: true, attributes: [{
+      attribute: "Shutter1", channelFunction: "Shutter", dmxFrom: "000000", dmxTo: "0F0F0F",
+      channelFunctions: ["Shutter", "Strobe"],
+      channelFunctionDetails: [
+        { name: "Shutter", attribute: "Shutter1", dmxFrom: "000000", dmxTo: "0F0F0F", physicalFrom: 0, physicalTo: 0, physicalUnit: "None", channelSets: [{ name: "Closed", dmxFrom: "000000", dmxTo: "0F0F0F" }] },
+        { name: "Strobe", attribute: "Strobe1", attributeIndex: 150, dmxFrom: "101010", dmxTo: "FFFFFF", physicalFrom: 1, physicalTo: 20, physicalUnit: "Frequency", channelSets: [] },
+      ],
+    }], limitations: [],
+  }));
+  const { result, isError } = await h.callJson("gma3_fixture_attributes", { fixture: 601, include_channel_functions: true });
+  assert.equal(isError, false, JSON.stringify(result));
+  assert.deepEqual(lastArgs("fixtureAttributes"), { ref: "Fixture 601", limit: 100, offset: 0, includeChannelSets: false, includeChannelFunctions: true });
+  const row = result.attributes[0];
+  assert.equal(row.dmxTo, "0F0F0F", "legacy selected-function metadata stays intact");
+  assert.equal(row.channelSets, undefined, "new option does not opt into legacy channelSets");
+  assert.deepEqual(row.channelFunctions, ["Shutter", "Strobe"]);
+  assert.equal(row.channelFunctionDetails[1].attribute, "Strobe1");
+  assert.equal(row.channelFunctionDetails[1].dmxFrom, "101010");
+  assert.equal(row.channelFunctionDetails[1].physicalUnit, "Frequency");
+  assert.equal(row.channelFunctionDetails[0].physicalFrom, 0);
+  assert.equal(row.channelFunctionDetails[0].default, null);
+  assert.equal(row.channelFunctionDetails[0].channelSets[0].physicalFrom, null);
+  assert.deepEqual(row.channelFunctionDetails[1].channelSets, []);
+});
+
+test("gma3_fixture_attributes reports unavailable detailed functions from an older bridge", async () => {
+  h.fake.on("fixtureAttributes", () => ({ attributes: [{ attribute: "Shutter1", channelFunctions: ["Shutter", "Strobe"] }], limitations: [] }));
+  const { result, isError } = await h.callJson("gma3_fixture_attributes", { fixture: 601, include_channel_functions: true });
+  assert.equal(isError, false);
+  assert.equal(result.attributes[0].channelFunctionDetails, null);
+  assert.ok(result.limitations.some((n: string) => /detailed channel functions.*not.*provided/i.test(n)), JSON.stringify(result));
+});
+
+test("gma3_fixture_attributes preserves unavailable function metadata and sets as null", async () => {
+  h.fake.on("fixtureAttributes", () => ({ includeChannelFunctions: true, attributes: [{ attribute: "Shutter1", channelFunctionDetails: [{ name: "Unspecified" }] }] }));
+  const { result, isError } = await h.callJson("gma3_fixture_attributes", { fixture: 601, include_channel_functions: true, include_channel_sets: true });
+  assert.equal(isError, false);
+  const detail = result.attributes[0].channelFunctionDetails[0];
+  assert.equal(detail.attribute, null);
+  assert.equal(detail.physicalFrom, null);
+  assert.equal(detail.physicalTo, null);
+  assert.equal(detail.physicalUnit, null);
+  assert.equal(detail.dmxFrom, null);
+  assert.equal(detail.dmxTo, null);
+  assert.equal(detail.channelSets, null);
+});
+
+test("gma3_fixture_attributes keeps incomplete serialized function details unavailable", async () => {
+  h.fake.on("fixtureAttributes", () => ({ includeChannelFunctions: true, attributes: [
+    { attribute: "Shutter1", channelFunctionDetails: ["<table: max depth>"] },
+    { attribute: "Strobe1", channelFunctionDetails: [{ name: "Strobe", channelSets: ["<table: max depth>"] }] },
+  ] }));
+  const { result, isError } = await h.callJson("gma3_fixture_attributes", { fixture: 601, include_channel_functions: true });
+  assert.equal(isError, false);
+  assert.equal(result.attributes[0].channelFunctionDetails, null);
+  assert.equal(result.attributes[1].channelFunctionDetails[0].channelSets, null);
+});
+
 test("an op error becomes a tool error with the bridge message", async () => {
   h.fake.on("fixtureAttributes", () => {
     throw new Error("'Fixture 999' resolved to a nil, not a Fixture or SubFixture");
@@ -338,7 +398,119 @@ test("inspection tools never send commands or take the mutation lock", async () 
   assert.deepEqual(h.fake.commands, []);
   assert.deepEqual(
     h.fake.requests.map((r) => r.op),
-    ["fixtureAttributes", "programmer", "fixtureOutput", "dmx", "cueContents"],
+    ["fixtureAttributes", "programmer", "fixtureOutput", "dmx", "cueContents", "cue.content"],
   );
   assert.equal(h.ctx.mutations.busy, false);
+});
+
+
+test("cue inspection reads actual hard native values when the new bridge exposes them", async () => {
+  h.fake.on("cueContents", () => ({ ref: "Sequence 900 Cue 1", cue: {}, parts: [{ part: 0 }], limitations: ["hard (non-recipe) values are not exposed (no GetCueData)"] }));
+  h.fake.on("cue.content", () => ({ complete: true, cues: [{ parts: [{ no: 0, contentJson: JSON.stringify({ rows: [{ fixture: "1", attribute: "Dimmer", value: 0 }], byFixtures: true, truncated: false }) }] }] }));
+  const { result, isError } = await h.callJson("gma3_cue_contents", { sequence: 900, cue: 1 });
+  assert.equal(isError, false);
+  assert.equal(result.parts[0].storedValues.rows[0].value, 0);
+  assert.equal(result.nativeContentComplete, true);
+  assert.equal(result.limitations.some((s: string) => s.includes("no GetCueData")), false);
+});
+
+test("cue inspection uses the paged bridge's actual native Part 2 identity", async () => {
+  h.fake.on("cueContents", () => ({ ref: "Sequence 900 Cue 1", cue: {}, parts: [{ part: 2 }] }));
+  h.fake.on("cue.content", args => {
+    if (args.action === "release") return { released: true };
+    if (args.action !== "create") return { complete: true, cues: [{ parts: [{ addr: "C1.1" }] }] };
+    return { protocol: "gma3-cue-snapshot-v1", snapshotId: "cue:1", contextKey: "context", environment: "Normal",
+      frozen: true, atomic: false, capturedAt: 1, expiresAt: 61, total: 1, capturedCount: 1, offset: 0, count: 1, cueOrder: ["C1"],
+      complete: true, limitations: [], cues: [{ addr: "C1", parts: [{ addr: "C1.1", no: 2,
+        contentJson: JSON.stringify({ rows: [{ fixture: "1", attribute: "Dimmer", value: 45 }], byFixtures: true, truncated: false }),
+      }] }],
+    };
+  });
+  const { result } = await h.callJson("gma3_cue_contents", { sequence: 900, cue: 1, part: 2 });
+  assert.equal(result.nativeContentComplete, true);
+  assert.equal(result.parts[0].storedValues.rows[0].value, 45);
+});
+
+test("cue inspection recovers a verified legacy singleton Part 0 from its native parent address", async () => {
+  h.fake.on("cueContents", () => ({ ref: "Sequence 900 Cue 1", cue: {}, parts: [{ part: 0 }] }));
+  h.fake.on("cue.content", () => ({ complete: true, cues: [{ addr: "14.14.1.7.900.1000", parts: [{
+    addr: "14.14.1.7.900.1000.0",
+    contentJson: JSON.stringify({ rows: [{ fixture: "1", attribute: "Dimmer", value: 45 }], byFixtures: true, truncated: false }),
+  }] }] }));
+  const { result } = await h.callJson("gma3_cue_contents", { sequence: 900, cue: 1, part: 0 });
+  assert.equal(result.nativeContentComplete, true);
+  assert.equal(result.parts[0].storedValues.rows[0].value, 45);
+});
+
+test("cue inspection refuses ambiguous duplicate native parts", async () => {
+  h.fake.on("cueContents", () => ({ ref: "Sequence 900 Cue 1", cue: {}, parts: [{ part: 0 }] }));
+  const contentJson = JSON.stringify({ rows: [{ fixture: "1", attribute: "Dimmer", value: 45 }], byFixtures: true, truncated: false });
+  h.fake.on("cue.content", () => ({ complete: true, cues: [{ parts: [{ no: 0, contentJson }, { no: 0, contentJson }] }] }));
+  const { result } = await h.callJson("gma3_cue_contents", { sequence: 900, cue: 1, part: 0 });
+  assert.equal(result.nativeContentComplete, false);
+  assert.equal(result.parts[0].storedValues, null);
+});
+
+test("unreadable native part numbers never masquerade as Part 0", async () => {
+  h.fake.on("cueContents", () => ({ ref: "Sequence 900 Cue 1", cue: {}, parts: [{ part: 0 }] }));
+  for (const no of [null, "", false, []]) {
+    h.fake.on("cue.content", () => ({ complete: true, cues: [{ parts: [{ no,
+      contentJson: JSON.stringify({ rows: [{ fixture: "1", attribute: "Dimmer", value: 90 }], byFixtures: true, truncated: false }),
+    }] }] }));
+    const { result } = await h.callJson("gma3_cue_contents", { sequence: 900, cue: 1 });
+    assert.equal(result.parts[0].storedValues, null, `unreadable native part ${JSON.stringify(no)} was adopted as Part 0`);
+    assert.equal(result.nativeContentComplete, false);
+  }
+});
+
+test("malformed native part content cannot retain a complete inspection claim", async () => {
+  h.fake.on("cueContents", () => ({ ref: "Sequence 900 Cue 1", cue: {}, parts: [{ part: 0 }] }));
+  h.fake.on("cue.content", () => ({ complete: true, cues: [{ parts: [{ no: 0, contentJson: "invalid" }] }] }));
+  const { result } = await h.callJson("gma3_cue_contents", { sequence: 900, cue: 1 });
+  assert.equal(result.parts[0].storedValues, null);
+  assert.equal(result.nativeContentComplete, false);
+  assert.match(result.nativeContentError, /malformed/i);
+});
+
+test("an empty legacy part inventory is not proof of mapped native channel coverage", async () => {
+  h.fake.on("cueContents", () => ({ ref: "Sequence 900 Cue 1", cue: {}, parts: [] }));
+  h.fake.on("cue.content", () => ({ complete: true, cues: [{ parts: [{ no: 0,
+    contentJson: JSON.stringify({ rows: [], byFixtures: true, truncated: false }),
+  }] }] }));
+  const { result } = await h.callJson("gma3_cue_contents", { sequence: 900, cue: 1 });
+  assert.equal(result.nativeContentComplete, false);
+});
+
+// Live 2026-11-03: {universe: 1, from: 120, count: 240} read one address, and {from: 1, to: 512, nonzeroOnly: true}
+// returned all 512 with nonzeroOnly false: neither key was in the schema, so both were dropped without a word.
+test("gma3_dmx: count reads from..from+count-1, nonzeroOnly (the result's spelling) filters like nonzero_only", async () => {
+  h.fake.on("dmx", (args) => ({
+    universe: args.universe, granted: true, from: args.from, to: args.to, unit: "raw8", nonzeroOnly: args.nonzeroOnly, readVia: "GetDMXUniverse",
+    count: 1, values: [{ channel: 130, value: 255 }], source: "dmx output", limitations: [],
+  }));
+  let res = await h.callJson("gma3_dmx", { universe: 1, from: 120, count: 240 });
+  assert.equal(res.isError, false, res.text);
+  assert.deepEqual(lastArgs("dmx"), { universe: 1, from: 120, to: 359, nonzeroOnly: false, percent: false, patched: false });
+  assert.equal(res.result.to, 359);
+
+  res = await h.callJson("gma3_dmx", { universe: 1, from: 1, to: 512, nonzeroOnly: true });
+  assert.equal(res.isError, false, res.text);
+  assert.deepEqual(lastArgs("dmx"), { universe: 1, from: 1, to: 512, nonzeroOnly: true, percent: false, patched: false });
+  assert.equal(res.result.nonzeroOnly, true);
+
+  res = await h.callJson("gma3_dmx", { universe: 1, from: 1, count: 512, nonzero_only: true, nonzeroOnly: true });
+  assert.equal(res.isError, false, res.text);
+  assert.deepEqual(lastArgs("dmx"), { universe: 1, from: 1, to: 512, nonzeroOnly: true, percent: false, patched: false });
+
+  const sent = h.fake.requests.length;
+  const bad = async (args: Record<string, unknown>, re: RegExp) => {
+    const r = await h.callJson("gma3_dmx", args);
+    assert.equal(r.isError, true, JSON.stringify(args));
+    assert.match(r.text, re);
+  };
+  await bad({ universe: 1, from: 120, to: 200, count: 240 }, /give to or count, not both/);
+  await bad({ universe: 1, from: 300, count: 240 }, /from 300 plus count 240 reaches address 539; the last address is 512/);
+  await bad({ universe: 1, from: 1, count: 0 }, /count must be >= 1/);
+  await bad({ universe: 1, from: 1, nonzero_only: false, nonzeroOnly: true }, /nonzero_only and nonzeroOnly disagree/);
+  assert.equal(h.fake.requests.length, sent, "nothing sent for the refused calls");
 });

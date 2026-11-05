@@ -1,0 +1,344 @@
+{
+  "id": "2026-10-28T04-06-02-756Z-033-night-advanced-phaser-21-502-aura",
+  "tool": "gma3_build_phaser",
+  "arguments": {
+    "preset": "21.502",
+    "name": "NSX motion counter",
+    "fixtures": [
+      201,
+      202,
+      203,
+      204,
+      205,
+      206,
+      207,
+      208,
+      209
+    ],
+    "mode": "selective",
+    "existing": "merge",
+    "exclusive": true,
+    "unit": "percent",
+    "steps": [
+      {
+        "values": {
+          "Dimmer": 8,
+          "Zoom": 3.0581039755351678
+        },
+        "width": 50,
+        "transition": 100,
+        "accel": -100,
+        "decel": -100
+      },
+      {
+        "values": {
+          "Dimmer": 18,
+          "Zoom": 6.1162079510703355
+        },
+        "width": 50,
+        "transition": 100,
+        "accel": -100,
+        "decel": -100
+      },
+      {
+        "values": {
+          "Dimmer": 44,
+          "Zoom": 12.232415902140671
+        },
+        "width": 50,
+        "transition": 100,
+        "accel": -100,
+        "decel": -100
+      },
+      {
+        "values": {
+          "Dimmer": 70,
+          "Zoom": 15.29051987767584
+        },
+        "width": 50,
+        "transition": 100,
+        "accel": -100,
+        "decel": -100
+      },
+      {
+        "values": {
+          "Dimmer": 54,
+          "Zoom": 12.232415902140671
+        },
+        "width": 50,
+        "transition": 100,
+        "accel": -100,
+        "decel": -100
+      },
+      {
+        "values": {
+          "Dimmer": 26,
+          "Zoom": 9.174311926605503
+        },
+        "width": 50,
+        "transition": 100,
+        "accel": -100,
+        "decel": -100
+      },
+      {
+        "values": {
+          "Dimmer": 10,
+          "Zoom": 3.0581039755351678
+        },
+        "width": 50,
+        "transition": 100,
+        "accel": -100,
+        "decel": -100
+      },
+      {
+        "values": {
+          "Dimmer": 4,
+          "Zoom": 3.0581039755351678
+        },
+        "width": 50,
+        "transition": 100,
+        "accel": -100,
+        "decel": -100
+      }
+    ],
+    "phaser": {
+      "speed_bpm": 36,
+      "measure": 4,
+      "phase": {
+        "from": 300,
+        "to": 0
+      },
+      "repeat": {
+        "wings": 2
+      }
+    }
+  },
+  "state": "tool_error",
+  "started": "2026-10-28T04:06:18.556Z",
+  "completed": "2026-10-28T04:06:25.261Z",
+  "result": {
+    "operation": "build_phaser",
+    "target": {
+      "preset": "21.502",
+      "presetRef": "Preset 21.502"
+    },
+    "outcome": "partial",
+    "verification": {
+      "status": "not_requested"
+    },
+    "steps": [
+      {
+        "name": "check_build",
+        "status": "failed",
+        "error": "the built phaser does not match the request: 206 Dimmer: phase 0° expected (grid position 5 of 9, wings 2), 74.999992847443 read; 206 Zoom: phase 0° expected (grid position 5 of 9, wings 2), 74.999992847443 read; 207 Dimmer: phase 75° expected (grid position 6 of 9, wings 2), 150.00000715256 read; 207 Zoom: phase 75° expected (grid position 6 of 9, wings 2), 150.00000715256 read; 208 Dimmer: phase 150° expected (grid position 7 of 9, wings 2), 225 read; 208 Zoom: phase 150° expected (grid position 7 of 9, wings 2), 225 read; 209 Dimmer: phase 225° expected (grid position 8 of 9, wings 2), 299.99999284744 read; 209 Zoom: phase 225° expected (grid position 8 of 9, wings 2), 299.99999284744 read",
+        "kind": "read"
+      },
+      {
+        "name": "store",
+        "status": "skipped",
+        "error": "not attempted: an earlier step was failed"
+      }
+    ],
+    "summary": "build_phaser partially completed: read_context, resolve_fixtures, check_step_presets, read_normal_programmer, preview_on, check_preview, select, build, confirm_preview, release_preview_programmer, preview_off, check_normal_programmer done; step 'check_build' failed (the built phaser does not match the request: 206 Dimmer: phase 0° expected (grid position 5 of 9, wings 2), 74.999992847443 read; 206 Zoom: phase 0° expected (grid position 5 of 9, wings 2), 74.999992847443 read; 207 Dimmer: phase 75° expected (grid position 6 of 9, wings 2), 150.00000715256 read; 207 Zoom: phase 75° expected (grid position 6 of 9, wings 2), 150.00000715256 read; 208 Dimmer: phase 150° expected (grid position 7 of 9, wings 2), 225 read; 208 Zoom: phase 150° expected (grid position 7 of 9, wings 2), 225 read; 209 Dimmer: phase 225° expected (grid position 8 of 9, wings 2), 299.99999284744 read; 209 Zoom: phase 225° expected (grid position 8 of 9, wings 2), 299.99999284744 read). not attempted: store.",
+    "plan": {
+      "steps": [
+        {
+          "step": 1,
+          "values": {
+            "Dimmer": {
+              "absolute": 8
+            },
+            "Zoom": {
+              "absolute": 3.0581039755351678
+            }
+          },
+          "stepTiming": {
+            "width": 50,
+            "transition": 100,
+            "accel": -100,
+            "decel": -100
+          }
+        },
+        {
+          "step": 2,
+          "values": {
+            "Dimmer": {
+              "absolute": 18
+            },
+            "Zoom": {
+              "absolute": 6.1162079510703355
+            }
+          },
+          "stepTiming": {
+            "width": 50,
+            "transition": 100,
+            "accel": -100,
+            "decel": -100
+          }
+        },
+        {
+          "step": 3,
+          "values": {
+            "Dimmer": {
+              "absolute": 44
+            },
+            "Zoom": {
+              "absolute": 12.232415902140671
+            }
+          },
+          "stepTiming": {
+            "width": 50,
+            "transition": 100,
+            "accel": -100,
+            "decel": -100
+          }
+        },
+        {
+          "step": 4,
+          "values": {
+            "Dimmer": {
+              "absolute": 70
+            },
+            "Zoom": {
+              "absolute": 15.29051987767584
+            }
+          },
+          "stepTiming": {
+            "width": 50,
+            "transition": 100,
+            "accel": -100,
+            "decel": -100
+          }
+        },
+        {
+          "step": 5,
+          "values": {
+            "Dimmer": {
+              "absolute": 54
+            },
+            "Zoom": {
+              "absolute": 12.232415902140671
+            }
+          },
+          "stepTiming": {
+            "width": 50,
+            "transition": 100,
+            "accel": -100,
+            "decel": -100
+          }
+        },
+        {
+          "step": 6,
+          "values": {
+            "Dimmer": {
+              "absolute": 26
+            },
+            "Zoom": {
+              "absolute": 9.174311926605503
+            }
+          },
+          "stepTiming": {
+            "width": 50,
+            "transition": 100,
+            "accel": -100,
+            "decel": -100
+          }
+        },
+        {
+          "step": 7,
+          "values": {
+            "Dimmer": {
+              "absolute": 10
+            },
+            "Zoom": {
+              "absolute": 3.0581039755351678
+            }
+          },
+          "stepTiming": {
+            "width": 50,
+            "transition": 100,
+            "accel": -100,
+            "decel": -100
+          }
+        },
+        {
+          "step": 8,
+          "values": {
+            "Dimmer": {
+              "absolute": 4
+            },
+            "Zoom": {
+              "absolute": 3.0581039755351678
+            }
+          },
+          "stepTiming": {
+            "width": 50,
+            "transition": 100,
+            "accel": -100,
+            "decel": -100
+          }
+        }
+      ],
+      "distribution": {
+        "phase": {
+          "from": 300,
+          "to": 0
+        },
+        "direction": "reverse",
+        "repeat": {
+          "kind": "wings",
+          "count": 2
+        }
+      },
+      "playbackSpeed": {
+        "speedBpm": 36,
+        "measure": 4,
+        "speedMaster": null
+      },
+      "unit": "percent",
+      "commandCount": 70
+    },
+    "fixtures": [
+      "201",
+      "202",
+      "203",
+      "204",
+      "205",
+      "206",
+      "207",
+      "208",
+      "209"
+    ],
+    "phases": {
+      "fixtures": 9,
+      "first": "201",
+      "last": "209",
+      "phases": [
+        300,
+        225,
+        150,
+        75,
+        0,
+        75,
+        150,
+        225,
+        300
+      ]
+    },
+    "normalProgrammerUntouched": true,
+    "stored": null,
+    "audition": null,
+    "stepCounts": {
+      "succeeded": 12,
+      "failed": 1,
+      "skipped": 1
+    },
+    "detailHint": "detail: true returns every step, the console commands and the stored rows"
+  },
+  "content": [
+    {
+      "type": "text",
+      "text": "{\n  \"operation\": \"build_phaser\",\n  \"target\": {\n    \"preset\": \"21.502\",\n    \"presetRef\": \"Preset 21.502\"\n  },\n  \"outcome\": \"partial\",\n  \"verification\": {\n    \"status\": \"not_requested\"\n  },\n  \"steps\": [\n    {\n      \"name\": \"check_build\",\n      \"status\": \"failed\",\n      \"error\": \"the built phaser does not match the request: 206 Dimmer: phase 0° expected (grid position 5 of 9, wings 2), 74.999992847443 read; 206 Zoom: phase 0° expected (grid position 5 of 9, wings 2), 74.999992847443 read; 207 Dimmer: phase 75° expected (grid position 6 of 9, wings 2), 150.00000715256 read; 207 Zoom: phase 75° expected (grid position 6 of 9, wings 2), 150.00000715256 read; 208 Dimmer: phase 150° expected (grid position 7 of 9, wings 2), 225 read; 208 Zoom: phase 150° expected (grid position 7 of 9, wings 2), 225 read; 209 Dimmer: phase 225° expected (grid position 8 of 9, wings 2), 299.99999284744 read; 209 Zoom: phase 225° expected (grid position 8 of 9, wings 2), 299.99999284744 read\",\n      \"kind\": \"read\"\n    },\n    {\n      \"name\": \"store\",\n      \"status\": \"skipped\",\n      \"error\": \"not attempted: an earlier step was failed\"\n    }\n  ],\n  \"summary\": \"build_phaser partially completed: read_context, resolve_fixtures, check_step_presets, read_normal_programmer, preview_on, check_preview, select, build, confirm_preview, release_preview_programmer, preview_off, check_normal_programmer done; step 'check_build' failed (the built phaser does not match the request: 206 Dimmer: phase 0° expected (grid position 5 of 9, wings 2), 74.999992847443 read; 206 Zoom: phase 0° expected (grid position 5 of 9, wings 2), 74.999992847443 read; 207 Dimmer: phase 75° expected (grid position 6 of 9, wings 2), 150.00000715256 read; 207 Zoom: phase 75° expected (grid position 6 of 9, wings 2), 150.00000715256 read; 208 Dimmer: phase 150° expected (grid position 7 of 9, wings 2), 225 read; 208 Zoom: phase 150° expected (grid position 7 of 9, wings 2), 225 read; 209 Dimmer: phase 225° expected (grid position 8 of 9, wings 2), 299.99999284744 read; 209 Zoom: phase 225° expected (grid position 8 of 9, wings 2), 299.99999284744 read). not attempted: store.\",\n  \"plan\": {\n    \"steps\": [\n      {\n        \"step\": 1,\n        \"values\": {\n          \"Dimmer\": {\n            \"absolute\": 8\n          },\n          \"Zoom\": {\n            \"absolute\": 3.0581039755351678\n          }\n        },\n        \"stepTiming\": {\n          \"width\": 50,\n          \"transition\": 100,\n          \"accel\": -100,\n          \"decel\": -100\n        }\n      },\n      {\n        \"step\": 2,\n        \"values\": {\n          \"Dimmer\": {\n            \"absolute\": 18\n          },\n          \"Zoom\": {\n            \"absolute\": 6.1162079510703355\n          }\n        },\n        \"stepTiming\": {\n          \"width\": 50,\n          \"transition\": 100,\n          \"accel\": -100,\n          \"decel\": -100\n        }\n      },\n      {\n        \"step\": 3,\n        \"values\": {\n          \"Dimmer\": {\n            \"absolute\": 44\n          },\n          \"Zoom\": {\n            \"absolute\": 12.232415902140671\n          }\n        },\n        \"stepTiming\": {\n          \"width\": 50,\n          \"transition\": 100,\n          \"accel\": -100,\n          \"decel\": -100\n        }\n      },\n      {\n        \"step\": 4,\n        \"values\": {\n          \"Dimmer\": {\n            \"absolute\": 70\n          },\n          \"Zoom\": {\n            \"absolute\": 15.29051987767584\n          }\n        },\n        \"stepTiming\": {\n          \"width\": 50,\n          \"transition\": 100,\n          \"accel\": -100,\n          \"decel\": -100\n        }\n      },\n      {\n        \"step\": 5,\n        \"values\": {\n          \"Dimmer\": {\n            \"absolute\": 54\n          },\n          \"Zoom\": {\n            \"absolute\": 12.232415902140671\n          }\n        },\n        \"stepTiming\": {\n          \"width\": 50,\n          \"transition\": 100,\n          \"accel\": -100,\n          \"decel\": -100\n        }\n      },\n      {\n        \"step\": 6,\n        \"values\": {\n          \"Dimmer\": {\n            \"absolute\": 26\n          },\n          \"Zoom\": {\n            \"absolute\": 9.174311926605503\n          }\n        },\n        \"stepTiming\": {\n          \"width\": 50,\n          \"transition\": 100,\n          \"accel\": -100,\n          \"decel\": -100\n        }\n      },\n      {\n        \"step\": 7,\n        \"values\": {\n          \"Dimmer\": {\n            \"absolute\": 10\n          },\n          \"Zoom\": {\n            \"absolute\": 3.0581039755351678\n          }\n        },\n        \"stepTiming\": {\n          \"width\": 50,\n          \"transition\": 100,\n          \"accel\": -100,\n          \"decel\": -100\n        }\n      },\n      {\n        \"step\": 8,\n        \"values\": {\n          \"Dimmer\": {\n            \"absolute\": 4\n          },\n          \"Zoom\": {\n            \"absolute\": 3.0581039755351678\n          }\n        },\n        \"stepTiming\": {\n          \"width\": 50,\n          \"transition\": 100,\n          \"accel\": -100,\n          \"decel\": -100\n        }\n      }\n    ],\n    \"distribution\": {\n      \"phase\": {\n        \"from\": 300,\n        \"to\": 0\n      },\n      \"direction\": \"reverse\",\n      \"repeat\": {\n        \"kind\": \"wings\",\n        \"count\": 2\n      }\n    },\n    \"playbackSpeed\": {\n      \"speedBpm\": 36,\n      \"measure\": 4,\n      \"speedMaster\": null\n    },\n    \"unit\": \"percent\",\n    \"commandCount\": 70\n  },\n  \"fixtures\": [\n    \"201\",\n    \"202\",\n    \"203\",\n    \"204\",\n    \"205\",\n    \"206\",\n    \"207\",\n    \"208\",\n    \"209\"\n  ],\n  \"phases\": {\n    \"fixtures\": 9,\n    \"first\": \"201\",\n    \"last\": \"209\",\n    \"phases\": [\n      300,\n      225,\n      150,\n      75,\n      0,\n      75,\n      150,\n      225,\n      300\n    ]\n  },\n  \"normalProgrammerUntouched\": true,\n  \"stored\": null,\n  \"audition\": null,\n  \"stepCounts\": {\n    \"succeeded\": 12,\n    \"failed\": 1,\n    \"skipped\": 1\n  },\n  \"detailHint\": \"detail: true returns every step, the console commands and the stored rows\"\n}"
+    }
+  ]
+}

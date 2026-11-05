@@ -58,6 +58,8 @@ export interface OscOptions {
   port: number;
   /** Optional prefix configured in the grandMA3 OSC settings (without slashes). */
   prefix?: string;
+  /** Named bridge routes disable unverified OSC command routing. */
+  disabled?: boolean;
 }
 
 export class OscSender {
@@ -74,6 +76,7 @@ export class OscSender {
   }
 
   send(path: string, args: OscArg[] = []): Promise<void> {
+    if (this.opts.disabled) return Promise.reject(new Error("OSC is disabled for this named instance: use its verified bridge route, or start the plugin in the identified console."));
     const msg = encodeOscMessage(this.address(path), args);
     return new Promise((resolve, reject) => {
       const sock = dgram.createSocket("udp4");

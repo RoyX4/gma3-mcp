@@ -282,8 +282,8 @@ test("gma3_patch_add: refused before anything is sent without exclusive, with an
     assert.match(r.result.summary, /FID 402 is not free/);
     r = await h.callJson("gma3_patch_add", { type: 6, mode: 3, fid: 901, address: "1.005", exclusive: true });
     assert.match(r.result.summary, /1\.005 for 1 fixture\(s\) of 8 channels is not free/);
-    r = await h.callJson("gma3_patch_add", { type: 6, mode: "TwoBreak", fid: 901, exclusive: true });
-    assert.match(r.result.summary, /multi-break modes are not supported/);
+    r = await h.callJson("gma3_patch_add", { type: 6, mode: "TwoBreak", fid: 901, address: "2.001", exclusive: true });
+    assert.match(r.result.summary, /needs explicit breaks/);
     assert.ok(!ops().includes("patch.enter"), "no session was started for any refusal");
   } finally {
     await h.close();
@@ -467,7 +467,7 @@ test("gma3_patch_set: swap two fixtures and rename one, committed and read back"
     assert.equal(isError, false, result.summary);
     assert.equal(result.verification.status, "matched");
     assert.deepEqual(w.live.filter((x) => x.fid > 400).map((x) => `${x.fid}@${x.patch}:${x.name}`), ["401@1.009:Par 1", "402@1.001:Swapped"]);
-    assert.deepEqual(h.fake.requests.find((r) => r.op === "patch.set")!.args.edits, [{ fid: 401, address: "1.009" }, { fid: 402, address: "1.001", name: "Swapped" }]);
+    assert.deepEqual((h.fake.requests.find((r) => r.op === "patch.set")!.args.edits as Array<Record<string, unknown>>).map(({expected, ...edit}) => edit), [{ fid: 401, address: "1.009" }, { fid: 402, address: "1.001", name: "Swapped" }]);
     assert.ok(h.fake.requests.filter((r) => r.op === "patch.fingerprint").every((r) => JSON.stringify(r.args.excludeFids) === "[401,402]"));
   } finally {
     await h.close();
@@ -600,6 +600,35 @@ test("patch_add: fixtures with cells say their layout is shared, and string ligh
   } finally {
     await h.close();
   }
+});
+
+
+test("multi-break patch previews normalize every break and never open the edit copy", async () => {
+  const { h } = await setup();
+  h.fake.on("patch.check", () => ({ fidFree: true, singleBreak: false, dmxFree: true, conflicts: [], occupancyUnknown: [], type: { no: 8, name: "Multi" }, mode: { name: "TwoBreak", footprint: 12, breaks: 2, breakNumbers: [1, 2], breakChannels: [8, 4] } }));
+  try {
+    const r = await h.callJson("gma3_patch_add", { type: 8, mode: 1, fid: 991, count: 2, breaks: [{ break: 2, address: "3.1" }, { break: 1, address: "2.1" }], preview: true, exclusive: true });
+    assert.equal(r.isError, false, JSON.stringify(r.result));
+    assert.equal(r.result.preview, true);
+    assert.deepEqual(r.result.plannedEdit.args.breaks, [{ break: 1, address: "2.001" }, { break: 2, address: "3.001" }]);
+    assert.equal(h.fake.requests.filter((x) => x.op === "patch.enter").length, 0);
+    const duplicate = await h.callJson("gma3_patch_add", { type: 8, mode: 1, fid: 991, breaks: [{ break: 1, address: "2.1" }, { break: 1, address: "3.1" }], exclusive: true });
+    assert.match(duplicate.result.validationErrors.join(), /repeats break/);
+  } finally { await h.close(); }
+});
+
+test("compound fixture removal inventories descendants and requires explicit inclusion", async () => {
+  const { h } = await setup();
+  const current = { fid: 4, name: "Group", subfixtures: 1, breaks: [] };
+  const descendants = [{ fid: 401, name: "Child", parentFid: 4, breaks: [{ break: 1, address: "1.001" }] }];
+  h.fake.on("patch.check", () => ({ fixtures: [{ fid: 4, exists: true, current, descendants }] }));
+  try {
+    const preview = await h.callJson("gma3_patch_remove", { fids: [4], include_children: true, exclusive: true, preview: true });
+    assert.equal(preview.isError, false, JSON.stringify(preview.result));
+    assert.deepEqual(preview.result.touchedFids, [4, 401]);
+    assert.deepEqual(preview.result.removalInventory["4"].descendants, descendants);
+    assert.equal(h.fake.requests.filter((x) => x.op === "patch.enter").length, 0);
+  } finally { await h.close(); }
 });
 
 // ---------------------------------------------------------------------------

@@ -4,6 +4,39 @@ An [MCP](https://modelcontextprotocol.io) server for **grandMA3 onPC**. Connect 
 show data, program fixtures, store and edit cues, control playback and faders, and search the manual
 installed with onPC. Arbitrary Lua execution is available as a separate, opt-in capability.
 
+This fork carries the verified programming extension on branch `feat/verified-programming-20261030`, based on upstream commit `0bade8e`. The upstream project and its original author retain their attribution and license. See the [qualification summary](docs/qualification/2026-10-30.md) for measured scope and remaining limits.
+
+The [4 November follow-up](docs/qualification/2026-11-04.md) covers offline job and distribution fixes.
+Its Node changes have separate automated verification; the earlier native qualification remains pinned to its original build.
+The subsequent [tracking coverage and remaining gaps](docs/tracking-status.md) explain the owned-chain
+workflow, its review fixes, scoped existing-cue edits and large-chain paging.
+For actual native switches and existing-cue edits, use [cue/part settings](docs/tools/cue-settings.md)
+and [sequence settings](docs/tools/playback.md). Tracking on/off is a sequence property;
+Cue Only and Tracking Shield are explicit options on the existing cue Store tools.
+The [native settings follow-up](docs/qualification/cue-settings-2026-11-04.md) records representative
+setting changes and actual following-cue restoration tests separately from the historical full baseline.
+The [programming completion pass](docs/qualification/programming-completion-2026-11-04.md)
+records the matched speed comparison, scoped range edits, remaining native controls and large-cue qualification.
+
+## Programming and recovery extensions
+
+[How the MCP connects and programs a show](docs/how-it-connects-and-programs.md) explains connection layers,
+normal session closures, recovery, the programmer, presets, cues, tracking and verification limits.
+The local extension adds [connection checks and persistent CLI sessions](docs/tools/connection.md),
+[calibrated focus targets](docs/tools/focus.md), [fixture-aware colour](docs/tools/colour.md),
+[MVR inspection, revision comparison and checked export](docs/tools/mvr.md), and
+[camera poses and 2D Layouts](docs/tools/workspace.md), and
+[appearances and native screen windows](docs/tools/workspace-ui.md). New programming tools preview by default.
+The comprehensive pass adds [tracking compilation and provenance](docs/tools/tracking.md),
+[durable jobs with progress, cancellation and verified recovery](docs/tools/jobs.md),
+[actual stored cue data and fixture diagnosis](docs/tools/native-cues.md),
+[bounded native batches and frozen snapshots](docs/tools/fastpath.md),
+[saved-show checkpoints](docs/tools/checkpoint.md), and
+[named instance routes with separate Node/plugin deployment checks](docs/setup/instances.md).
+[Qualification scope](docs/qualification/2026-10-30.md) distinguishes implemented software, observed native behavior and physical prerequisites.
+For original timing evidence and the current matched measurement protocol, see
+[cue programming performance](docs/programming-performance.md).
+
 ## Get started
 
 Choose the guide for the computer running grandMA3 onPC and your MCP client:

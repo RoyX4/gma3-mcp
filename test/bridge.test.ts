@@ -189,3 +189,54 @@ test("an error reply keeps the bridge's code and structured detail; a bracketed 
     await fake.close();
   }
 });
+
+test("connection diagnostics distinguish a live TCP socket from an unanswered bridge request", async () => {
+  let calls = 0;
+  const fake = await fakeBridge((req, sock) => {
+    calls++;
+    if (req.op === "ping") reply(sock, { id: req.id, ok: true, result: { bridgeVersion: "test" } });
+  });
+  const bridge = new Gma3Bridge({ host: "127.0.0.1", port: fake.port, requestTimeoutMs: 30 });
+  try {
+    await bridge.request("ping");
+    assert.equal(bridge.diagnostics.state, "responsive");
+    await assert.rejects(bridge.request("cmd", { command: "Store Cue 1" }), (e: unknown) => e instanceof BridgeError && e.dispatched);
+    assert.equal(bridge.connected, true);
+    assert.equal(bridge.diagnostics.state, "unresponsive");
+    assert.equal(bridge.diagnostics.timeouts, 1);
+    assert.equal(bridge.diagnostics.pendingRequests, 0);
+    assert.equal(calls, 2, "a timeout must not trigger a replay");
+    await bridge.request("ping");
+    assert.equal(bridge.diagnostics.state, "responsive");
+    assert.equal(bridge.diagnostics.connections, 1);
+  } finally { bridge.close(); await fake.close(); }
+});
+
+test("a late close event from an old socket cannot tear down a replacement connection", async () => {
+  const fake = await fakeBridge((req, sock) => reply(sock, { id: req.id, ok: true, result: req.op }));
+  const bridge = new Gma3Bridge({ host: "127.0.0.1", port: fake.port });
+  try {
+    await bridge.request("first");
+    // Delay delivery of the real socket's close notification to exercise the reconnect ordering.
+    const oldSocket = (bridge as unknown as { socket: net.Socket }).socket;
+    const delayed = oldSocket.listeners("close");
+    oldSocket.removeAllListeners("close");
+    bridge.close();
+    assert.equal(await bridge.request("replacement"), "replacement");
+    for (const callback of delayed) callback(false);
+    assert.equal(bridge.connected, true, "old close notifications must be scoped to their socket");
+    assert.equal(await bridge.request("after-old-close"), "after-old-close");
+  } finally { bridge.close(); await fake.close(); }
+});
+
+test("closing during connection establishment cannot leave an unexpected live session", async () => {
+  const fake = await fakeBridge((req, sock) => reply(sock, { id: req.id, ok: true, result: true }));
+  const bridge = new Gma3Bridge({ host: "127.0.0.1", port: fake.port });
+  try {
+    const outcome = bridge.connect().then(() => "opened", () => "cancelled");
+    bridge.close();
+    assert.equal(await outcome, "cancelled");
+    assert.equal(bridge.connected, false);
+    assert.equal(await bridge.request("ping"), true, "a later explicit request can establish a fresh session");
+  } finally { bridge.close(); await fake.close(); }
+});

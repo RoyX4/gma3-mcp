@@ -574,6 +574,42 @@ test("with embed on, a stored step reference where the programmer step had none 
 // SU-12 batch form: presets from explicit content, built in Preview
 // ---------------------------------------------------------------------------
 
+test("store_preset batch: a rig over 5000 channels can prove Normal unchanged and Preview empty", async () => {
+  const programmer = h.fake.handlerFor("programmer")!;
+  h.fake.on("programmer", (args, request) => {
+    const result = programmer(args, request) as Record<string, unknown>;
+    if (args.scope !== "all" || Number(args.maxChannels ?? 5000) >= 7001) return result;
+    return { ...result, coverage: { complete: false }, limitations: ["channel budget reached before the whole rig was read"] };
+  });
+  con.set("402", "Dimmer", 33);
+  const { result, isError } = await store({
+    mode: "universal",
+    presets: [{ preset: "23.1", fixtures: [401], intensity: 50 }],
+  });
+  assert.equal(isError, false, JSON.stringify(result));
+  assert.equal(result.outcome, "succeeded");
+  assert.equal(result.normalProgrammer, "untouched");
+  assert.equal(con.presets.get("23.1")!.rows[0].value, 50);
+  assert.deepEqual(con.prog.map((r) => `${r.fid} ${r.attribute}=${r.value} ${r.active}`), ["402 Dimmer=33 true"]);
+});
+
+test("store_preset batch: a rig beyond the bounded scan still refuses before changing either programmer", async () => {
+  const programmer = h.fake.handlerFor("programmer")!;
+  h.fake.on("programmer", (args, request) => {
+    const result = programmer(args, request) as Record<string, unknown>;
+    if (args.scope !== "all" || Number(args.maxChannels ?? 5000) >= 50001) return result;
+    return { ...result, coverage: { complete: false }, limitations: ["channel budget reached before the whole rig was read"] };
+  });
+  const { result, isError } = await store({
+    mode: "universal",
+    presets: [{ preset: "23.1", fixtures: [401], intensity: 50 }],
+  });
+  assert.equal(isError, true);
+  assert.match(stepError(result, "read_normal_programmer"), /could not be read completely/);
+  assert.equal(con.presets.has("23.1"), false);
+  assert.deepEqual(con.commands, [], "an incomplete scan never permits Preview On or a store");
+});
+
 test("store_preset batch: each preset built in Preview from its content, stored and read back; one refused fails alone; Normal untouched", async () => {
   con.set("402", "Dimmer", 33); // the operator's own Normal programmer value
   const { result, isError } = await store({

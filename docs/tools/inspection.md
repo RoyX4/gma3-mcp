@@ -43,10 +43,11 @@ Attribute discovery for one fixture or subfixture.
 | Parameter | Type | Meaning |
 | --- | --- | --- |
 | `fixture` | number or string | `101`, `"501.3"`, `"Fixture 501.3"`. Exactly one (sub)fixture; groups and ranges are refused. |
-| `include_channel_sets` | boolean | Add each channel function's ChannelSets (gobo slots, colour slots ...). Default false. |
+| `include_channel_sets` | boolean | Add the selected/default function's `channelSets`, such as gobo slots. Default false. |
+| `include_channel_functions` | boolean | Add each function's own attribute, unit, ranges and sets to `channelFunctionDetails`. Default false. |
 | `limit`, `offset` | integer | Pagination over the attribute rows (default 100, max 500). |
 
-Sends one bridge request: `fixtureAttributes {ref, limit, offset, includeChannelSets}`. The fixture is resolved
+Sends `fixtureAttributes {ref, limit, offset, includeChannelSets}` with `includeChannelFunctions:true` when detailed functions are requested. The fixture is resolved
 with `ObjectList(ref)`, i.e. **by fixture ID**; the patch index is read from `SubfixtureIndex` and reported
 separately (`subfixtureIndex`). For a SubFixture the owning Fixture is found through `Parent()` and supplies
 FixtureType, Mode, Patch and FID.
@@ -81,6 +82,12 @@ channel matches the attribute by name), `dmxChannel` (walk path only), and `chan
   appear once (stated in `limitations`). The DMXMode handle is resolved from `Get("Mode")`, the `Mode` field, or
   (because the console returned the display text `"1 Mode 0"` instead of a handle for one fixture live) from
   `FixtureType -> DMXModes` matched by that text.
+
+With `include_channel_functions: true`, each returned attribute row includes `channelFunctionDetails`. The legacy `channelFunctions` list holds names, and the row's top-level ranges describe the selected/default function. Each detailed entry includes the function's own name and attribute, physical unit, DMX bounds and default, physical bounds, fade, acceleration, and channel sets. A shutter's strobe function can therefore expose a different attribute and unit from the logical channel's selected function.
+
+Per-function channel sets include names, DMX and physical bounds, and wheel-slot indices. The new option includes them independently of `include_channel_sets`. `null` means a field or list is unavailable. `[]` means a readable list is empty. A supporting bridge acknowledges the request with `includeChannelFunctions:true`. Older bridges return the regular attribute data with an explicit limitation for the requested details.
+
+The detail budget counts up to 1,000 function and channel-set entries on the returned attribute page. `channelFunctionDetailsBudget` reports the limit, usage and truncation. `channelFunctionDetailsTruncated` and `channelSetsTruncated` identify affected lists. The direct opt-in bridge response allows two extra serialization levels for the nested sets and retains cycle handling. These fields describe fixture-profile definitions. Read actual levels separately with `gma3_programmer` or `gma3_fixture_output`.
 
 Not available: current values (use `gma3_programmer` / `gma3_fixture_output`), and a per-attribute DMX mapping
 when several RT channels share the attribute name (compound fixtures; `channels[]` still has the full map).
@@ -163,7 +170,8 @@ Raw universe read.
 | --- | --- | --- |
 | `universe` | integer | 1..1024; the op further bounds it by `Patch().DmxUniverses:Count()`. |
 | `from`, `to` | integer | 1..512, `from <= to`; `to` defaults to `from`. |
-| `nonzero_only` | boolean | Explicit filter, default false. |
+| `count` | integer | Addresses from `from`, instead of `to` (`from + count - 1 <= 512`; `to` and `count` together are refused). |
+| `nonzero_only` | boolean | Explicit filter, default false. `nonzeroOnly` (the result's spelling) is accepted too; the two must agree. |
 | `unit` | `raw8` / `percent` | `raw8` (default): 0..255 per address. `percent`: 0..100 as converted by the console (8-bit precision). |
 | `patched` | boolean | Map each returned address to `{fid, channel, part}` via every fixture's RT channels (default false; skipped with a limitation above 6000 RT channels). |
 
@@ -218,13 +226,9 @@ and `topLevelKeys` is there to check it live.
 Readable without playback: cue properties, part timing/command/MIB, `OwnDataPresent`, recipes (Group/Selection x
 Preset with timing), preset references, and preset content via `GetPresetData`.
 
-Not readable: **hard (non-recipe) fixture values stored in a cue part**. There is no `GetCueData` in 2.5.1; the
-cooked value storage is binary (`MemoryType Compressed`) and not exposed as children or properties. The tool
-reports `storedValues: null` and, when a part has `OwnDataPresent = Yes`, the limitation
-`"hard (non-recipe) fixture values stored in a cue part are not exposed by the 2.5.1 Lua API (no GetCueData); only
-recipe and preset references are readable"`. Tracked values are not reconstructed either: a part lists only what is
-stored in it (`trackedValues: "not_reconstructed"`). The alternatives (`Fixture X At Cue N`, `Cue N` SelFix, the
-DMX sheet during playback) all mutate state and are excluded.
+The current bridge reads **hard fixture channels from CuePart handles using GetPresetData**. A separate GetCueData function is not required. `gma3_cue_contents` adds normalized `storedValues` when complete native coverage is available; older imported plugins retain the explicit unavailable fallback.
+
+Use `gma3_native_cue_data` for a whole sequence's absolute/relative layers, phaser steps, preset references, native raw fingerprints and tracked source cue/part. Numeric part Tracking Distance endpoints and cue Release are reconstructed. Unknown distance formats, incomplete mappings and duplicate layer precedence prevent a complete claim. Break/Shield protect later edits through actual stored data; Assert and priorities affect playback arbitration, outside this sequence-owned layer model. Final DMX, fades and physical light remain separate observations. See [native-cues.md](native-cues.md).
 
 ---
 
@@ -262,7 +266,7 @@ selectionCount?, scannedFixtures: [{subfixtureIndex, fid?, name?, rootFid?, attr
 total, offset, count, rows: [row], limitations: [string] }`
 
 `scannedFixtures` (since plugin 0.3.2) lists every (sub)fixture index the scan covered, so a client can tell
-"no programmer value" from "not scanned" per fixture; it is cut at 1000 entries (`fixturesTruncated`). Since
+"no programmer value" from "not scanned" per fixture; it is cut at 5000 entries (`fixturesTruncated`). Since
 0.3.4 each entry also lists the `attributes` that (sub)fixture has (from its UI channels), so "no row" can be
 told apart from "no such attribute here" per cell. `rows` are paginated by `limit`/`offset` independently of
 `coverage`: `coverage.complete` describes the scan, `total` versus `count` whether every row was returned. For
@@ -382,7 +386,7 @@ look at its diagnostics, or run the tools by hand:
   0..255 and a 16-bit attribute combined as `raw16`.
 * `gma3_cue_contents` on a recipe cue: recipes with `presetResolved: true` and `presetRef.addrNative`; with
   `expand_presets: true` inspect `presets[*].topLevelKeys` and `rows` to confirm the `GetPresetData` flattening.
-  On a part with hard values: `ownDataPresent: true`, `storedValues: null` and the hard-values limitation.
+  On a part with hard values, inspect normalized `storedValues` and coverage. An older plugin reports null with a capability limitation.
 * In every case the selection count and the programmer must be unchanged (the live test asserts the selection count).
 
 ## Live test

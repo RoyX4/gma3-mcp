@@ -96,6 +96,32 @@ local function request(op, args, secondsPerFrame, client)
   return json.decode(res), frames
 end
 
+do
+  -- Exercise the actual serializer captured by the dispatcher, without exporting a
+  -- new production API or weakening the default for other response types.
+  local serializer
+  for i = 1, 100 do
+    local name, value = debug.getupvalue(state._handleLine, i)
+    if not name then break end
+    if name == "toJsonSafe" then serializer = value; break end
+  end
+  check("serializer: dispatcher keeps the bounded shared serializer", type(serializer) == "function")
+  if serializer then
+    local deep = {}; local cursor = deep
+    for _ = 1, 8 do cursor.next = {}; cursor = cursor.next end
+    deep.self = deep
+    local standard = serializer(deep)
+    cursor = standard
+    for _ = 1, 5 do cursor = cursor.next end
+    check("serializer: default depth stays six", cursor.next == "<table: max depth>", json.encode(standard))
+    check("serializer: default cycle guard stays active", standard.self == "<cycle>", json.encode(standard))
+    local extended = serializer(deep, nil, nil, nil, 8)
+    cursor = extended
+    for _ = 1, 7 do cursor = cursor.next end
+    check("serializer: opt-in depth eight remains bounded and cycle-safe", cursor.next == "<table: max depth>" and extended.self == "<cycle>", json.encode(extended))
+  end
+end
+
 local function resetBudget()
   state.lua.maxMs = 5000
   state.lua.maxSteps = 20000000
@@ -570,6 +596,7 @@ do
   attr("ColorRGB_G", 107, "G", featRGB, agRGB, "ColorComponent", "Percent", "0,1,0,1")
   attr("ColorRGB_B", 108, "B", featRGB, agRGB, "ColorComponent", "Percent", "0,0,1,1")
   attr("Shutter1", 149, "Sh1", featShutter, nil, "None", "Percent")
+  attr("Strobe1", 150, "Strobe", featShutter, nil, "Frequency", "Physical")
 
   -- Fixture types: DMXMode -> DMXChannels -> DMXChannel -> LogicalChannel -> ChannelFunction -> ChannelSet
   local function cf(name, attrName, dmxFrom, dmxTo, physFrom, physTo, sets)
@@ -599,7 +626,10 @@ do
     dmxChannel("Main Module", "Tilt", 3, 4, { cf("Tilt 1", "Tilt", "000000", "FFFFFF", "-135.0000000000", "135.0000000000") }),
     dmxChannel("Main Module", "Dimmer", 5, nil, { cf("Dimmer 1", "Dimmer", "000000", "FFFFFF", "0.0", "1.0") }),
     dmxChannel("Main Module", "Gobo1", 6, nil, { cf("Gobo1 1", "Gobo1", "000000", "FFFFFF", "0.0", "1.0", goboSets) }),
-    dmxChannel("Main Module", "Shutter1", 7, nil, { cf("Shutter1 1", "Shutter1", "000000", "0F0F0F", "0.0", "0.0"), cf("Shutter1 Strobe", "Shutter1", "101010", "FFFFFF", "1.0", "20.0") }),
+    dmxChannel("Main Module", "Shutter1", 7, nil, {
+      cf("Shutter1 1", "Shutter1", "000000", "0F0F0F", "0.0", "0.0", { { "Closed", "000000", "0F0F0F", "0.0", "0.0" } }),
+      cf("Shutter1 Strobe", "Strobe1", "101010", "FFFFFF", "1.0", "20.0", { { "Slow to fast", "101010", "FFFFFF", "1.0", "20.0" } }),
+    }),
   })
   local washMode = mode("Pixel", {
     dmxChannel("Main Module", "Dimmer", 1, nil, { cf("Dimmer 1", "Dimmer", "000000", "FFFFFF", "0.0", "1.0") }),
@@ -783,6 +813,56 @@ do
   check("fixtureAttributes: channel sets with wheel slots", gobo and #gobo.channelSets == 3 and gobo.channelSets[2].name == "gobo 1" and gobo.channelSets[2].dmxFrom == "0B0B0B" and gobo.channelSets[2].wheelSlotIndex == 2, json.encode(gobo))
   local shutter = r.ok and byAttr(r.result.attributes, "Shutter1")
   check("fixtureAttributes: all channel functions of the logical channel are named", shutter and #shutter.channelFunctions == 2 and shutter.channelFunctions[2] == "Shutter1 Strobe", json.encode(shutter))
+  check("fixtureAttributes: function details are opt-in", shutter and shutter.channelFunctionDetails == nil, json.encode(shutter))
+  r = request("fixtureAttributes", { ref = "Fixture 3", includeChannelFunctions = true })
+  local detailedShutter = r.ok and byAttr(r.result.attributes, "Shutter1")
+  local details = detailedShutter and detailedShutter.channelFunctionDetails
+  check("fixtureAttributes: detailed function option is acknowledged", r.ok and r.result.includeChannelFunctions == true, json.encode(r))
+  check("fixtureAttributes: detailed functions keep different raw DMX and physical ranges", details and #details == 2
+    and details[1].name == "Shutter1 1" and details[1].dmxFrom == "000000" and details[1].dmxTo == "0F0F0F" and details[1].physicalFrom == 0
+    and details[2].name == "Shutter1 Strobe" and details[2].dmxFrom == "101010" and details[2].dmxTo == "FFFFFF" and details[2].physicalFrom == 1 and details[2].physicalTo == 20, json.encode(details))
+  check("fixtureAttributes: detailed functions use each function's own attribute and unit", details and details[1].attribute == "Shutter1" and details[1].physicalUnit == "None"
+    and details[2].attribute == "Strobe1" and details[2].attributeIndex == 150 and details[2].physicalUnit == "Frequency", json.encode(details))
+  check("fixtureAttributes: detailed functions carry their own channel sets", details and details[1].channelSets[1].name == "Closed" and details[2].channelSets[1].name == "Slow to fast"
+    and details[2].channelSets[1].physicalFrom == 1 and details[2].channelSets[1].dmxFrom == "101010", json.encode(details))
+  check("fixtureAttributes: detailed option does not alter legacy selected metadata or add legacy sets", detailedShutter and detailedShutter.channelFunction == "Shutter1 1"
+    and detailedShutter.dmxTo == "0F0F0F" and detailedShutter.physicalTo == 0 and detailedShutter.channelSets == nil, json.encode(detailedShutter))
+  local strobeHandle = findCf(moverMode, "Shutter1 Strobe")
+  local strobeProps, strobeChildren = registry[strobeHandle].props, registry[strobeHandle].children
+  local strobeAttribute, strobeUnitFrom, strobeTo = strobeProps.attribute, strobeProps.physicalfrom, strobeProps.dmxto
+  strobeProps.attribute, strobeProps.physicalfrom, strobeProps.dmxto, registry[strobeHandle].children = nil, nil, nil, nil
+  r = request("fixtureAttributes", { ref = "Fixture 3", includeChannelFunctions = true })
+  details = r.ok and byAttr(r.result.attributes, "Shutter1").channelFunctionDetails
+  check("fixtureAttributes: unreadable function fields and sets stay unavailable", details and details[2].attribute == nil and details[2].physicalUnit == nil
+    and details[2].physicalFrom == nil and details[2].dmxTo == nil and details[2].channelSets == nil and has(r.result.limitations, "channel sets.*unavailable"), json.encode(r))
+  strobeProps.attribute, strobeProps.physicalfrom, strobeProps.dmxto, registry[strobeHandle].children = strobeAttribute, strobeUnitFrom, strobeTo, strobeChildren
+  local manySets = {}
+  for i = 1, 1001 do manySets[i] = strobeChildren[1] end
+  registry[strobeHandle].children = manySets
+  r = request("fixtureAttributes", { ref = "Fixture 3", includeChannelFunctions = true })
+  details = r.ok and byAttr(r.result.attributes, "Shutter1").channelFunctionDetails
+  check("fixtureAttributes: detailed sets obey the existing 1000-item request bound with an honest flag", details and #details[2].channelSets < 1000
+    and details[2].channelSetsTruncated == true and r.result.channelFunctionDetailsBudget.used == 1000 and r.result.channelFunctionDetailsBudget.truncated == true
+    and has(r.result.limitations, "channel sets truncated.*1000"), json.encode(r.result and r.result.limitations))
+  registry[strobeHandle].children = strobeChildren
+  local logical = registry[strobeHandle].parent
+  local originalFunctions, manyFunctions = registry[logical].children, {}
+  for i = 1, 1001 do manyFunctions[i] = originalFunctions[1] end
+  registry[logical].children = manyFunctions
+  r = request("fixtureAttributes", { ref = "Fixture 3", includeChannelFunctions = true })
+  detailedShutter = r.ok and byAttr(r.result.attributes, "Shutter1")
+  check("fixtureAttributes: detailed functions obey the existing 1000-item request bound with an honest flag", detailedShutter and #detailedShutter.channelFunctionDetails < 1000
+    and detailedShutter.channelFunctionDetailsTruncated == true and r.result.channelFunctionDetailsBudget.used == 1000 and r.result.channelFunctionDetailsBudget.truncated == true
+    and has(r.result.limitations, "channel functions truncated.*1000"), json.encode(r.result and r.result.limitations))
+  registry[logical].children = originalFunctions
+  local goboHandle = findCf(moverMode, "Gobo1 1")
+  local originalGoboSets = registry[goboHandle].children
+  registry[goboHandle].children = manySets
+  r = request("fixtureAttributes", { ref = "Fixture 3", includeChannelFunctions = true, limit = 1, offset = 4 })
+  detailedShutter = r.ok and byAttr(r.result.attributes, "Shutter1")
+  check("fixtureAttributes: detail budget applies to the requested attribute page", detailedShutter and #detailedShutter.channelFunctionDetails == 2
+    and r.result.channelFunctionDetailsBudget.used == 4 and r.result.channelFunctionDetailsBudget.truncated == false, json.encode(r))
+  registry[goboHandle].children = originalGoboSets
   r = request("fixtureAttributes", { ref = "Fixture 3", limit = 2, offset = 3 })
   check("fixtureAttributes: pagination", r.ok and r.result.total == 5 and r.result.count == 2 and r.result.offset == 3 and r.result.attributes[1].attribute == "Gobo1", json.encode(r))
 
@@ -825,6 +905,13 @@ do
   check("fixtureAttributes: walk rows carry mode offsets, no UI channel, and matched addresses", pan and pan.uiChannel == nil and pan.dmxChannel.name == "Main Module_Pan" and pan.dmxChannel.coarseOffset == "1" and pan.dmxChannel.fineOffset == "2" and pan.dmx.coarse == "2.001" and pan.physicalFrom == -270, json.encode(pan))
   gobo = r.ok and byAttr(r.result.attributes, "Gobo1")
   check("fixtureAttributes: walk rows include channel sets", gobo and gobo.channelSets and #gobo.channelSets == 3, json.encode(gobo))
+  GetUIChannels = nil
+  r = request("fixtureAttributes", { ref = "Fixture 3", includeChannelFunctions = true })
+  GetUIChannels = savedGetUIChannels
+  detailedShutter = r.ok and byAttr(r.result.attributes, "Shutter1")
+  details = detailedShutter and detailedShutter.channelFunctionDetails
+  check("fixtureAttributes: walk fallback includes all detailed functions and their own attributes", r.ok and r.result.source == "fixtureTypeWalk" and details and #details == 2
+    and details[2].attribute == "Strobe1" and details[2].physicalUnit == "Frequency" and details[2].dmxFrom == "101010" and details[2].channelSets[1].name == "Slow to fast", json.encode(r))
 
   r = request("fixtureAttributes", { ref = "Group 1" })
   check("fixtureAttributes: non-fixture reference rejected", r.ok == false and r.error:find("not a Fixture"), json.encode(r))
@@ -867,8 +954,25 @@ do
   r = request("programmer", { scope = "all", limit = 1, offset = 1 })
   check("programmer: pagination", r.ok and r.result.total == 3 and r.result.count == 1 and r.result.rows[1].fid == "2", json.encode(r))
   r = request("programmer", { scope = "all", maxChannels = 2 })
-  check("programmer: channel budget cuts the scan and reports incomplete coverage", r.ok and r.result.coverage.complete == false and r.result.coverage.scannedFixtures == 3 and r.result.coverage.scannedChannels == 4 and has(r.result.limitations, "channel budget"), json.encode(r))
+  check("programmer: channel budget cuts within a fixture and reports incomplete coverage", r.ok and r.result.coverage.complete == false and r.result.coverage.scannedFixtures == 3 and r.result.coverage.scannedChannels == 2 and has(r.result.limitations, "channel budget"), json.encode(r))
   check("programmer: the fixture list only covers what was scanned", r.ok and #r.result.scannedFixtures == 3, json.encode(r.result and r.result.scannedFixtures))
+
+  do
+    local savedCount, savedSubfixture, savedChannels = GetSubfixtureCount, GetSubfixture, GetUIChannels
+    GetSubfixture = function() return fxDimmer end
+    GetUIChannels = function() return {} end
+    GetSubfixtureCount = function() return 1791 end
+    r = request("programmer", { scope = "all", maxChannels = 50000 })
+    check("programmer: a 1791-subfixture MVR rig retains complete fixture metadata",
+      r.ok and r.result.coverage.complete == true and #r.result.scannedFixtures == 1791 and r.result.scannedFixtures[1791].subfixtureIndex == 1790 and r.result.fixturesTruncated == false,
+      r.ok and ("fixture metadata count=" .. #r.result.scannedFixtures) or json.encode(r))
+    GetSubfixtureCount = function() return 5001 end
+    r = request("programmer", { scope = "all", maxChannels = 50000 })
+    check("programmer: fixture metadata stays bounded with an honest truncation flag",
+      r.ok and r.result.coverage.complete == true and #r.result.scannedFixtures == 5000 and r.result.fixturesTruncated == true,
+      r.ok and ("fixture metadata count=" .. #r.result.scannedFixtures) or json.encode(r))
+    GetSubfixtureCount, GetSubfixture, GetUIChannels = savedCount, savedSubfixture, savedChannels
+  end
 
   -- 0.30.1: patch indices are 0..count-1. In a show without MA's Universal fixture, index 0 is the first patched
   -- fixture; its programmer values must be in the scope "all" scan (it was skipped before).
@@ -1555,7 +1659,7 @@ do
   r = request("feedback.read", {}, nil, C)
   check("feedback.read without items is refused with a code", r.ok == false and r.code == "no-items", r.error)
   r = request("feedback.read", { readers = { "commandText", "lastCommand", "blind", "solo", "page", "freeze", "selectedSequence", "previewBar", "sequenceActive" }, displays = { 1, 2, 9 }, executors = { 201, 202 }, sequences = { 5, 6 } }, nil, C)
-  check("feedback.read answers with Lua disabled", r.ok and r.result.atomic == false and r.result.epoch == 1 and r.result.bridgeVersion == "0.49.0" and r.result.module.version == feedbackModule.VERSION and r.result.identity.showFile == "mcp-test-disposable", J(r))
+  check("feedback.read answers with Lua disabled", r.ok and r.result.atomic == false and r.result.epoch == 1 and r.result.bridgeVersion == "0.51.0" and r.result.module.version == feedbackModule.VERSION and r.result.identity.showFile == "mcp-test-disposable", J(r))
   local by = {}
   if r.ok then for _, it in ipairs(r.result.items) do by[it.key] = it end end
   check("feedback.read: command text and last command are raw observations", by.commandText and by.commandText.value == "Store " and by.lastCommand.value == "Go+ Sequence 5 : OK" and by.lastCommand.note:find("not confirmation"), J(by.lastCommand))
@@ -1668,7 +1772,7 @@ do
   end
   local C = { id = 71 }
   r = request("feedback.context", { executors = { 201, 202 } }, nil, C)
-  check("feedback.context answers with Lua and input disabled", r.ok and r.result.bridgeVersion == "0.49.0" and r.result.module.version == feedbackModule.VERSION and r.result.atomic == false and r.result.generation == 1 and r.result.generationChanged == false and r.result.identity.showFile == "mcp-test-disposable" and r.result.identity.dataPool.name == "Default", J(r))
+  check("feedback.context answers with Lua and input disabled", r.ok and r.result.bridgeVersion == "0.51.0" and r.result.module.version == feedbackModule.VERSION and r.result.atomic == false and r.result.generation == 1 and r.result.generationChanged == false and r.result.identity.showFile == "mcp-test-disposable" and r.result.identity.dataPool.name == "Default", J(r))
   check("feedback.context: authoritative display, bank/page, slots with availability and value", r.ok and r.result.authoritativeDisplay.rule == "configured" and r.result.encoder.value.bank.name == "Color" and r.result.encoder.value.page.name == "RGB" and r.result.slots.value.slots[1].name == "ColorRGB_R" and r.result.slots.value.slots[1].availability == "available" and r.result.slots.value.slots[1].absolute == 50 and r.result.slots.value.slots[1].unit == "None" and r.result.slots.value.slots[2].valueState == "empty" and r.result.executorPage.no == 1, J(r.result.slots))
   check("feedback.context: executor targets with functions, level and playback-target status", r.ok and #r.result.executors == 2 and r.result.executors[1].value.functions.keyPress == "Temp" and r.result.executors[1].value.level.value == 100 and r.result.executors[1].value.playbackTarget == true and r.result.executors[2].value.empty == true and r.result.executors[2].value.reserved == nil, J(r.result.executors))
   check("feedback.context: nested fields survive the serialiser depth bound", r.ok and type(r.result.slots.value.slots[1].feature) == "string" and type(r.result.executors[1].value.assigned.name) == "string")
@@ -2713,6 +2817,112 @@ do
 
   Root, GetPath, DirList, CmdIndirect, GetTopModal, Mouse = saved.Root, saved.GetPath, saved.DirList, saved.CmdIndirect, saved.GetTopModal, saved.Mouse
   Enums.PathType.Showfiles = saved.Showfiles
+end
+
+-------------------------------------------------------------------------------
+-- MVR environmental types normalize their Geometries naming policy in the copy.
+-- Live 2.5.1.1: SceneObject/Geometries IGNOREENFORCEUNIQUECHILDNAMES Yes -> No.
+-- This metadata must not hide real geometry, material, mode or fixture edits.
+-------------------------------------------------------------------------------
+do
+  local savedShowData, savedRoles = ShowData, Enums.Roles
+  Enums.Roles = { Display = 1 }
+  local function node(class, name, props, kids)
+    local n = { class = class, name = name, no = 1, props = props or {}, kids = kids or {}, names = {} }
+    for k in pairs(n.props) do n.names[#n.names + 1] = k end
+    table.sort(n.names)
+    for _, child in ipairs(n.kids) do child.parent = n end
+    function n:GetClass() return self.class end
+    function n:Children() return self.kids end
+    function n:Parent() return self.parent end
+    function n:PropertyCount() return #self.names end
+    function n:PropertyName(index) return self.names[index + 1] end
+    function n:Get(k) return self.props[k:upper()] end
+    return n
+  end
+  local function model(policy, purpose)
+    local geometry = node("Geometry", "Mesh", { POSX = "0", ROTX = "0", MATERIAL = "Matte" })
+    local geoms = node("Geometries", "Geometries", { IGNOREENFORCEUNIQUECHILDNAMES = policy }, { geometry })
+    local mode = node("DMXMode", "Scene mode", { TOTALFOOTPRINT = "0" })
+    local fixtureType = node("FixtureType", "SceneObject", { SPECIALPURPOSE = purpose or "MVR Environmental", GUID = "Scene-GUID" },
+      { geoms, node("DMXModes", "DMXModes", {}, { mode }) })
+    return node("Patch", "LivePatch", {}, { node("FixtureTypes", "FixtureTypes", {}, { fixtureType }) }),
+      geometry, mode, geoms
+  end
+  local function fingerprint(patch, collection)
+    ShowData = function() return { LivePatch = patch } end
+    local answer = request("patch.fingerprint", { side = "live", collection = collection or "FixtureTypes" })
+    assert(answer.ok and answer.result.complete, json.encode(answer))
+    return answer.result.hash
+  end
+  local live, copy = model("Yes"), model("No")
+  local liveHash, copyHash = fingerprint(live), fingerprint(copy)
+  check("mvr fingerprint: copy-normalized environmental Geometries metadata does not reject unchanged types", liveHash == copyHash)
+  for _, edit in ipairs({ { "POSX", "1" }, { "ROTX", "45" }, { "MATERIAL", "Mirror" } }) do
+    local a, geometry = model("Yes")
+    local before = fingerprint(a)
+    geometry.props[edit[1]] = edit[2]
+    check("mvr fingerprint: real geometry " .. edit[1] .. " edit is detected", fingerprint(a) ~= before)
+  end
+  local modeTree, _, mode = model("Yes")
+  local before = fingerprint(modeTree)
+  mode.props.TOTALFOOTPRINT = "1"
+  check("mvr fingerprint: real DMX mode edit is detected", fingerprint(modeTree) ~= before)
+  local otherLive, otherCopy = model("Yes", "Normal"), model("No", "Normal")
+  check("mvr fingerprint: unrelated fixture-type naming policies remain protected", fingerprint(otherLive) ~= fingerprint(otherCopy))
+  local unrelated = node("Patch", "LivePatch", {}, { node("AttributeDefinitions", "AttributeDefinitions", {},
+    { node("Geometries", "Geometries", { IGNOREENFORCEUNIQUECHILDNAMES = "Yes" }) }) })
+  before = fingerprint(unrelated, "AttributeDefinitions")
+  unrelated.kids[1].kids[1].props.IGNOREENFORCEUNIQUECHILDNAMES = "No"
+  check("mvr fingerprint: same-named containers outside fixture types remain protected", fingerprint(unrelated, "AttributeDefinitions") ~= before)
+  local fixture = node("Fixture", "Stage fixture", { FID = "1", POSX = "0" })
+  local stageTree = node("Patch", "LivePatch", {}, { node("Stages", "Stages", {},
+    { node("Stage", "Stage 1", {}, { node("Fixtures", "Fixtures", {}, { fixture }) }) }) })
+  before = fingerprint(stageTree, "Stages")
+  fixture.props.POSX = "2"
+  check("mvr fingerprint: real fixture pose edit is detected", fingerprint(stageTree, "Stages") ~= before)
+  -- An environmental Fixture's read-only Handle FIXTURE points to itself. Its display text
+  -- can transiently be empty or name the fixture appended after it; raw self-identity is stable.
+  local function ownerModel(display, purpose)
+    local ft = node("FixtureType", "SceneObject", { GUID = "Scene-GUID", SPECIALPURPOSE = purpose or "MVR Environmental" })
+    local f = node("Fixture", "Control_Booth_Desk", { FIXTURE = "", FIXTURETYPE = "SceneObject", POSX = "0", GUID = "Desk-GUID" })
+    f.owner, f.ownerDisplay, f.fixtureType = f, display, ft
+    f.ownerReadOnly = true
+    local get = f.Get
+    function f:Get(k, role)
+      if k:upper() == "FIXTURE" then return role == nil and self.owner or self.ownerDisplay end
+      if k:upper() == "FIXTURETYPE" and role == nil then return self.fixtureType end
+      return get(self, k, role)
+    end
+    function f:PropertyType(index) return self.names[index + 1] == "FIXTURE" and "Handle" or "String" end
+    function f:PropertyInfo(index) return { ReadOnly = self.names[index + 1] == "FIXTURE" and self.ownerReadOnly } end
+    local list = node("Fixtures", "Fixtures", {}, { f })
+    return node("Patch", "LivePatch", {}, { node("Stages", "Stages", {}, { node("Stage", "Stage 1", {}, { list }) }) }), f, list
+  end
+  local ownerLive = ownerModel("")
+  local ownerCopy = ownerModel("Stage 1.Fixtures.Local-Test-Light")
+  check("mvr fingerprint: read-only environmental Fixture self reference ignores transient display text",
+    fingerprint(ownerLive, "Stages") == fingerprint(ownerCopy, "Stages"))
+  local changed, changedFixture, changedList = ownerModel("")
+  before = fingerprint(changed, "Stages")
+  changedFixture.fixtureType = node("FixtureType", "Another Scene Type", { GUID = "Other-GUID", SPECIALPURPOSE = "MVR Environmental" })
+  check("mvr fingerprint: assigned fixture type edit remains protected", fingerprint(changed, "Stages") ~= before)
+  changed, changedFixture, changedList = ownerModel("")
+  before = fingerprint(changed, "Stages")
+  changedList.kids = { node("Fixture", "Grouping", { FID = "77" }, { changedFixture }) }
+  changedFixture.parent = changedList.kids[1]
+  check("mvr fingerprint: semantic fixture parent move remains protected", fingerprint(changed, "Stages") ~= before)
+  changed, changedFixture = ownerModel("")
+  before = fingerprint(changed, "Stages")
+  changedFixture.owner = node("Fixture", "Different owner", {})
+  check("mvr fingerprint: an actual non-self owner reference is not normalized", fingerprint(changed, "Stages") ~= before)
+  local writableA, fa = ownerModel("")
+  local writableB, fb = ownerModel("Other")
+  fa.ownerReadOnly, fb.ownerReadOnly = false, false
+  check("mvr fingerprint: writable fixture references are not normalized", fingerprint(writableA, "Stages") ~= fingerprint(writableB, "Stages"))
+  local ordinaryA, ordinaryB = ownerModel("", "Normal"), ownerModel("Other", "Normal")
+  check("mvr fingerprint: non-environmental fixture references are not normalized", fingerprint(ordinaryA, "Stages") ~= fingerprint(ordinaryB, "Stages"))
+  ShowData, Enums.Roles = savedShowData, savedRoles
 end
 
 print(string.format("%d passed, %d failed", passes, failures))

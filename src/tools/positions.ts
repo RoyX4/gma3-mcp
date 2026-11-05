@@ -366,7 +366,18 @@ interface Final {
   from: string;
 }
 
-export async function placeFixtures(ctx: ToolContext, raw: PlaceArgs): Promise<OperationResult> {
+/** Internal orchestration hook: replace each property dispatch with a caller's guarded write.
+ * Return the set reply or throw (preserving BridgeError.dispatched on a lost reply). No fallback or retry.
+ */
+export interface PlacementPropertyWrite {
+  fid: number;
+  property: string;
+  value: number | string;
+  timeoutMs: number;
+}
+export type PlacementPropertyWriter = (write: PlacementPropertyWrite) => Promise<unknown>;
+
+export async function placeFixtures(ctx: ToolContext, raw: PlaceArgs, writeProperty?: PlacementPropertyWriter): Promise<OperationResult> {
   const op = "place_fixtures";
   const v = new Validator();
   const unit = (raw.unit ?? "m") as Unit;
@@ -484,7 +495,9 @@ export async function placeFixtures(ctx: ToolContext, raw: PlaceArgs): Promise<O
           continue;
         }
         try {
-          const reply = await bridge.request("set", { ref: `Fixture ${f.fid}`, property, value }, t);
+          const reply = writeProperty
+            ? await writeProperty({ fid: f.fid, property, value, timeoutMs: t })
+            : await bridge.request("set", { ref: `Fixture ${f.fid}`, property, value }, t);
           steps.push({ name, status: "succeeded", op: "set", detail: { value, reply: (reply as { value?: unknown })?.value } });
           if (!written.has(f.fid)) written.set(f.fid, new Set());
           written.get(f.fid)?.add(property);

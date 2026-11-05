@@ -12,7 +12,7 @@ image; the package requires Node.js 24 or newer. Launch onPC once to create its 
 Run these commands in Terminal:
 
 ```bash
-git clone https://github.com/bdstark/gma3-mcp.git
+git clone --branch feat/verified-programming-20261030 https://github.com/RoyX4/gma3-mcp.git
 cd gma3-mcp
 npm ci
 npm run build

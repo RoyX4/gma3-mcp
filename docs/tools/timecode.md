@@ -1,13 +1,16 @@
 # Timecode shows (SB-08)
 
-Three tools author and run timecode shows from structured timestamps, with no manual timeline placement:
+Six tools author and run timecode shows from structured timestamps, with no manual timeline placement:
 - `gma3_timecodes` reads the timecode pool, one show, and optionally the timecode slots;
 - `gma3_build_timecode` creates a show, replaces its tracks or appends tracks: sequence tracks of cue events at
   explicit times;
+- `gma3_record_fader_curve` records a planned piecewise native Master-fader fade;
+- `gma3_build_fader_timecode` creates exact stored Master-fader events without running the sequence;
+- `gma3_timecode_record` explicitly records native executor operations;
 - `gma3_timecode_transport` plays, stops, rewinds or seeks a show, then observes it and checks the events it crossed.
 
 **Building never plays or records.** Only `gma3_timecode_transport` sends `Go`, `Off`, `Top` or writes the cursor. No
-tool records.
+ordinary builder or playback tool records. `gma3_timecode_record` explicitly captures, starts or stops recording.
 
 Bridge **0.25.0** adds `timecode.read` and `timecode.edit` (see [the bridge protocol](../reference.md#timecode-shows-plugin-v0250-sb-08)).
 Evidence: [the SB-08 probe record](../probes/sb-08-timecode-macos-2.5.1.md).
@@ -16,12 +19,15 @@ Evidence: [the SB-08 probe record](../probes/sb-08-timecode-macos-2.5.1.md).
 | --- | --- | --- |
 | `gma3_timecodes` | nothing (read-only) | untouched |
 | `gma3_build_timecode` | one timecode show: its name, settings, and one track group with its tracks and events | untouched |
+| `gma3_build_fader_timecode` | one new timecode show with native Master-fader events | untouched |
+| `gma3_record_fader_curve` | records while changing a sequence's live Master | untouched |
+| `gma3_timecode_record` | arms/stops native recording | untouched |
 | `gma3_timecode_transport` | **plays, stops, rewinds or moves the cursor**: whatever the events do | untouched |
 
 ## The things to know first
 
 - **Structure:** show → track group → track (with a **target**, a sequence in this release) → time range →
-  command subtrack → events.
+  command or fader subtrack → events.
   - Each event has a time, a **token** (the action) and, for Goto, a cue.
   - Flash and Temp events also have a status: press (On) or release (Off).
 - **Time:**
@@ -37,7 +43,7 @@ Evidence: [the SB-08 probe record](../probes/sb-08-timecode-macos-2.5.1.md).
 - **Source, recording, playback and reception are distinct:**
   - `settings.tc_slot` **configures** the time source: `"internal"` or a timecode slot 1–16. It does not start
     anything.
-  - **Recording** is not offered. Its armed state is not readable: it is a console method the bridge does not call.
+  - **Recording** uses the explicit recording tools. Its actual armed state comes from `Timecode.IsRecording()`.
   - **Playback** is the transport tool's `play`.
   - **Receiving** external timecode (SMPTE, MIDI, Art-Net) is not readable on 2.5.1. A slot shows its time only.
 - **Building is several requests.** The console creates a group's first track and a track's time range one frame later,
@@ -55,7 +61,7 @@ Evidence: [the SB-08 probe record](../probes/sb-08-timecode-macos-2.5.1.md).
   - `name`, `playing`, `cursorSeconds`, `durationSeconds`;
   - `source`: `tcSlot` as internal or slot N, the slot offset, auto start/stop;
   - `playback`: loop mode and count, switch off, assert previous events, restart option;
-  - `recording`: the record setting, and the armed state as unavailable;
+  - `recording`: the record setting, and the native `IsRecording` armed state (unavailable on older bridges);
   - `groups`, and `tracks` with `target`, `sequence` and `events`. Each event has `seconds`, `time`, `raw`, `action`
     (go, goto, off, flash_press, ...), `token`, `status`, `cue` and the storage position (`subtrack`, `index`);
   - `problems`: tracks without a target, Goto events without a cue, tokens these tools do not model, truncated reads.
@@ -158,7 +164,6 @@ Evidence: [the SB-08 probe record](../probes/sb-08-timecode-macos-2.5.1.md).
   - a deleted target reported, with that track's events gone and the other track untouched;
   - replace, keeping the show's name and settings.
 - Not covered:
-  - fader automation (FaderSubTrack) and recording;
   - targets other than sequences;
   - several time ranges per track;
   - markers;
@@ -170,3 +175,76 @@ Evidence: [the SB-08 probe record](../probes/sb-08-timecode-macos-2.5.1.md).
 `GMA3_LIVE=1 node --import tsx --test test/live/timecode.live.ts` on a disposable show with an empty programmer and
 bridge 0.25.0. It uses Timecode 901 and Sequences 908–909, refuses to run when any of them exists, and deletes them at
 the end.
+
+
+## Native recording
+
+`gma3_timecode_record {timecode, action:"capture", duration_seconds:5}` records for a bounded 0.1–60-second
+interval and sends one distinct `Record Off` afterward. `start` leaves recording active; `stop` explicitly ends it.
+`preview:true` only reads state and returns intended commands. An unreadable recording state or locked show
+refuses a new recording. An already recording show must be stopped explicitly before starting another capture.
+
+The tool reports native recording state and before/after event counts, including zero captured events.
+An uncertain Record is never replayed. If capture dispatch succeeds but its first readback fails, a distinct stop
+is still sent once and its observed state is reported; a guessed interval is never called verified recording.
+The track's Rec and PlaybackAndRecord settings determine which actual console operations are captured.
+
+`Record`, `Record Off`, and `Timecode.IsRecording()` are demonstrated in MA's bundled
+`system_test_timecode_record.lua`. Non-command events returned by `timecode.read` preserve their native class
+and up to 64 native properties, with a completeness flag, so recorded continuous automation is not flattened into
+fake Go events. Recording start/stop and captured fader data were also exercised on the isolated onPC 2.5.1.1
+qualification show. Recording does not establish exact equivalence between requested endpoint times and the
+stored automation; use the direct builder below when exact stored events are required.
+
+
+## Authoring a continuous Master-fader curve through native recording
+
+`gma3_record_fader_curve` is a preview-default route for an existing **empty**, internal-source timecode show:
+
+```json
+{"timecode":4,"sequence":8,"points":[{"at":0,"value":0},{"at":2,"value":80},{"at":5,"value":20}],"preview":true}
+```
+
+There are 2–32 points, starting at zero, strictly increasing and ending within 60 seconds. Levels are 0–100.
+Apply explicitly uses `preview:false,exclusive:true`. It issues native `FaderMaster Sequence N At value Fade seconds`
+segments while recording, reads each endpoint with GetFader, and sends a distinct Record Off once in cleanup.
+This changes a live sequence Master; sequence AutoStart/AutoStop and record/playback settings may affect output.
+Existing non-empty timecodes are refused so this route cannot silently overwrite or replay prior events.
+
+The native Fade syntax is documented in the bundled `keyword_fadermaster.html`; the bundled `ExecAt` test also
+exercises native fader commands. The console handles interpolation rather than a host loop of discrete Go events.
+The host reports actual observed endpoint times separately from requested point times. Dispatch latency can shift
+segment boundaries. A failed/uncertain fade is never replayed; later segments stop, and recording cleanup still runs.
+
+Verification has two explicit scopes. `verification` checks stopped recording, all observed Master endpoints and
+complete non-command stored native events. `curveVerification` stays unavailable: recording captures native
+operations and does not prove that their timestamps/values equal the host plan. No recorded events, incomplete
+fields, or command events alone fail the capture check. Native qualification observed a requested 20% endpoint
+as GetFader 19.999998807907, with a recorded FaderValue of 19. The tool retains both observations and does not
+guess a conversion rule from that example. Physical output and playback timing remain unqualified.
+
+## Creating exact stored Master-fader automation
+
+`gma3_build_fader_timecode` creates a new timecode number and refuses an existing one. Preview is the default:
+
+```json
+{"timecode":15,"sequence":8,"events":[{"at":0,"value":0},{"at":1,"value":25,"fade_seconds":0.25},{"at":2,"value":50,"fade_seconds":0.5},{"at":3,"value":100,"fade_seconds":1}],"preview":true}
+```
+
+Apply uses `preview:false`. There are 1–512 events with integer Master levels 0–100. `at` accepts the timestamp
+forms described above. A fade starts when its event executes: `fade_seconds` describes that native fade, not an
+implicit arrival time at the next event. Input is validated before creation. An atomic native absence/target check
+establishes ownership of the new show; every subsequent step checks its exact address and target.
+
+The bridge creates a `FaderSubTrack` with `FaderToken=Master` and native `FaderEvent` children. Typed numeric setters
+write raw time (`Int64`), percentage level (`Int32`) and fade duration (`Int64Time`); readback checks each value and
+the complete owned structure. Inspection never substitutes display-formatted strings for these numeric fields.
+Partial or uncertain creation stops and leaves the owned show for inspection; it is never replayed or overwritten.
+This route sends no Record, Go or live fader command.
+
+On isolated onPC 2.5.1.1, the four events above read back exactly as 0/25/50/100 with raw times
+0/16777216/33554432/50331648 and fades 0/0.25/0.5/1 seconds. The target sequence Master was unchanged before/after.
+The tool completed that four-event sample in 280 ms; this is one measured lab sample, not a general throughput
+promise. Native property metadata exposed the types and writability but no numeric min/max; the accepted range is
+therefore deliberately limited to documented Master percentages. Stored-data verification does not establish
+physical output, fade interpolation or playback timing.

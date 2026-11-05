@@ -102,7 +102,7 @@ local presetData = { [embedded] = embeddedData, [source] = { by_fixtures = {} },
 GetPresetData = function(h) return presetData[h] end
 local seq = H({ name = "Seq", class = "Sequence", no = 1, props = {} })
 local objects = { ["Preset 23.3"] = embedded, ["Preset 4.902"] = source, ["Preset 23.5"] = unreadable, ["Sequence 9 Cue 1 Part 0"] = part, ["Sequence 1"] = seq, ["Preset 4"] = colorPool, ["Preset 23"] = allPool }
-ObjectList = function(ref) local h = objects[ref]; return h and { h } or nil end
+ObjectList = function(ref) if ref:find("%.%-") then return nil end; local h = objects[ref]; if not h then for _, candidate in pairs(objects) do if methods.Addr(candidate) == ref then h = candidate; break end end end; return h and { h } or nil end
 
 local prefs = H({ name = "StorePreferences", class = "StorePreferences", props = { StoreMode = "Ask", StoreSource = "Programmer", ChannelFilter = "Active", StoreLook = "No", PresetMode = "Default", PresetInputFilter = "Yes", StoreEmbedded = "No", StoreMAtricks = "Yes", KeepActivation = "No" } })
 local profileWithPrefs = { name = "Default", StorePreferences = prefs, KeyboardShortCuts = { Get = function() return "true" end, Count = function() return 0 end } }
@@ -126,9 +126,10 @@ local function check(name, cond, detail)
   else failures = failures + 1; print("FAIL " .. name .. (detail and (": " .. tostring(detail)) or "")) end
 end
 local function J(v) local ok, s = pcall(json.encode, v); return ok and s or tostring(v) end
-local function request(op, args)
+local defaultClient = { id = 1 }
+local function request(op, args, client)
   local line = json.encode({ id = "t", op = op, args = args or {} })
-  local co = coroutine.create(function() return state._handleLine({ id = 1 }, line) end)
+  local co = coroutine.create(function() return state._handleLine(client or defaultClient, line) end)
   local ok, res = coroutine.resume(co)
   while ok and coroutine.status(co) == "suspended" do ok, res = coroutine.resume(co) end
   assert(ok, res)
@@ -136,7 +137,7 @@ local function request(op, args)
 end
 
 local r = request("ping")
-check("ping reports bridge 0.30.0", r.ok and r.result.bridgeVersion == "0.49.0", J(r))
+check("ping reports bridge 0.30.0", r.ok and r.result.bridgeVersion == "0.51.0", J(r))
 
 r = request("preset.read", { ref = "Preset 23.3" })
 local res = r.ok and r.result or {}
@@ -173,6 +174,216 @@ r = request("preset.context", { pool = 99 })
 check("preset.context: a missing pool", r.ok and r.result.pool.exists == false and r.result.pool.no == 99, J(r))
 r = request("preset.context", {})
 check("preset.context: no pool, preferences only", r.ok and r.result.pool == nil and r.result.preferences.KeepActivation == "No", J(r))
+
+-- Native cue content preserves every raw channel field, including release/block flags.
+local cue = H({ name = "First", class = "Cue", no = 1000, parent = seq, children = { part }, props = { Tracking = "Yes", CueFade = "0" } })
+registry[seq].children = { cue }
+registry[part].parent = cue
+presetData[part].count = 2
+presetData[part].by_fixtures["401"].Dimmer.dict_flags.blocked = 1
+r = request("cue.content", { ref = "Sequence 1" })
+check("cue.content: complete native cue parts and raw flags", r.ok and r.result.complete == true and #r.result.cues == 1 and #r.result.cues[1].parts == 1 and json.decode(r.result.cues[1].parts[1].contentJson).rows[2].dictFlags.blocked == 1 and r.result.cues[1].parts[1].rawChannelsJson ~= nil, J(r))
+presetData[part].count = 3
+r = request("cue.content", { ref = "Sequence 1" })
+check("cue.content: unmapped native channels prevent complete assertion", r.ok and r.result.complete == false, J(r))
+presetData[part].count = 2
+presetData[part].by_fixtures["401"].Dimmer[1].absolute = "release"
+objects["Sequence 1 Cue 1"] = cue
+r = request("cue.content", { ref = "Sequence 1 Cue 1" })
+check("cue.content: release remains a release value", r.ok and r.result.complete == true and json.decode(r.result.cues[1].parts[1].contentJson).rows[2].value == "release", J(r))
+
+presetData[part].by_fixtures["401"].Dimmer[1].absolute=6600
+presetData[part].by_fixtures["401"].Dimmer[1].abs_release=true
+r=request("preset.read",{ref="Sequence 9 Cue 1 Part 0"})
+check("preset.read: native abs_release flag identifies release without guessing the number",r.ok and r.result.rows[2].valueKind=="release" and r.result.rows[2].value==6600,J(r))
+registry[part].addr="14.14.1.7.9.-1.0"
+r=request("cue.content",{ref="Sequence 1"})
+check("cue.content: native negative cue-part database addresses need no re-resolution",r.ok and r.result.complete==true and json.decode(r.result.cues[1].parts[1].contentJson).count==2,J(r))
+
+-- Frozen cue pages cover large lists without rescanning or mixing later edits into the capture.
+local previousRoot, previousUser, previousEnvironment = Root, CurrentUser, CurrentEnvironment
+Root = function() return { MANetSocket = { Get = function() return "Paged Lab" end }, maNetSocket = { hostname = "Paged Station" } } end
+CurrentUser = function() return {name="Admin"} end
+CurrentEnvironment = function() return {name="Normal"} end
+local function internalCue(name, no, addr)
+  local p = H({name="Part 0",class="Part",addr=addr..".0"})
+  presetData[p] = {count=0,by_fixtures={}}
+  return H({name=name,no=no,class="Cue",addr=addr,children={p}})
+end
+local internalSeq = H({name="Internals",class="Sequence",addr="INTERNAL",children={
+  internalCue("OffCue",nil,"INTERNAL.0"), internalCue("CueZero",0,"INTERNAL.1000")
+}})
+objects["Sequence 6"] = internalSeq
+local internalRead = request("cue.content",{action="create",ref="Sequence 6"})
+check("cue.content: recognized internal main parts need no native Part property",
+  internalRead.ok and internalRead.result.complete and internalRead.result.cues[1].parts[1].no==0
+  and internalRead.result.cues[2].parts[1].no==0,J(internalRead))
+request("cue.content",{action="release",snapshotId=internalRead.result.snapshotId})
+local pagedParts, pagedCues = {}, {}
+for i=1,503 do
+  -- Native Part numbers can differ from address slots; the handle's no is absent.
+  local p=H({name="Paged Part",class="Part",addr="PAGED.C"..i..".1",props={Part=i==201 and 2 or 0}})
+  pagedParts[i]=p; presetData[p]={count=0,by_fixtures={}}
+  pagedCues[i]=H({name="Paged "..i,class="Cue",no=i*1000,addr="PAGED.C"..i,children={p},props={AllowDuplicates="Yes"}})
+end
+local pagedSeq=H({name="Paged",class="Sequence",no=5,addr="PAGED",children=pagedCues,props={Tracking="Yes"}})
+objects["Sequence 5"]=pagedSeq
+local nativeReads=0
+GetPresetData=function(h) nativeReads=nativeReads+1; return presetData[h] end
+local caps=request("cue.content",{action="capabilities"})
+check("cue.content: declares bounded frozen paging capability",caps.ok and caps.result.protocol=="gma3-cue-snapshot-v1" and caps.result.maxCueObjects==10002 and caps.result.maxPageCues==200,J(caps))
+local captured=request("cue.content",{action="create",ref="Sequence 5",limit=200,ttlMs=60000})
+local cs=captured.ok and captured.result or {}
+check("cue.content: captures all503 objects but replies with200",captured.ok and cs.complete and cs.frozen and cs.atomic==false and cs.total==503 and #cs.cues==200 and #cs.cueOrder==503 and cs.cues[1].fields.AllowDuplicates=="Yes",J(captured))
+local readsAtCapture=nativeReads
+check("cue.content: normalized and raw data use one native observation per part",readsAtCapture==503,tostring(readsAtCapture))
+presetData[pagedParts[201]]={count=999,by_fixtures={}}
+local nextPage=request("cue.content",{action="page",snapshotId=cs.snapshotId,cursor=cs.nextCursor,limit=200})
+check("cue.content: later edit cannot mix into frozen pages or trigger native rescan",nextPage.ok and nextPage.result.offset==200 and #nextPage.result.cues==200 and json.decode(nextPage.result.cues[1].parts[1].contentJson).count==0 and nativeReads==readsAtCapture,J(nextPage):sub(1,1200))
+check("cue.content: raw Part property supplies the native part number instead of the address slot",nextPage.ok and nextPage.result.cues[1].parts[1].no==2)
+local foreign=request("cue.content",{action="page",snapshotId=cs.snapshotId,cursor=cs.nextCursor,limit=200},{id=2})
+check("cue.content: frozen snapshots belong to one client",not foreign.ok and foreign.code=="snapshot-unavailable",J(foreign))
+local tail=request("cue.content",{action="page",snapshotId=cs.snapshotId,cursor=nextPage.ok and nextPage.result.nextCursor,limit=200})
+check("cue.content: final page covers remaining103 without rescan",tail.ok and tail.result.offset==400 and #tail.result.cues==103 and tail.result.nextCursor==nil and nativeReads==readsAtCapture,J(tail))
+check("cue.content: invalid cursor and limit are rejected",not request("cue.content",{action="page",snapshotId=cs.snapshotId,cursor="foreign/200"}).ok and not request("cue.content",{action="create",ref="Sequence 5",limit=201}).ok)
+check("cue.content: snapshot release is confirmed",request("cue.content",{action="release",snapshotId=cs.snapshotId}).result.released==true)
+check("cue.content: released snapshot cannot be reused",not request("cue.content",{action="page",snapshotId=cs.snapshotId,cursor=cs.nextCursor}).ok)
+Root, CurrentUser, CurrentEnvironment = previousRoot, previousUser, previousEnvironment
+
+function methods.PropertyCount(u) local n=0; for _ in pairs(registry[u].props) do n=n+1 end; return n end
+function methods.PropertyName(u,i) local names={}; for k in pairs(registry[u].props) do names[#names+1]=k:upper() end; table.sort(names); return names[i+1] end
+function methods.PropertyInfo() return {ReadOnly=false} end
+local settings = H({name="FixtureSheetSettings",class="FixtureSheetSettings",props={SelectedOnly="Yes",GUID="volatile-settings"}})
+local widget = H({name="WindowFixtureSheet",class="ViewWidget",props={Name="WindowFixtureSheet",X=0,Y=0,W=10,H=8,Display=1,GUID="volatile-window"},children={settings}})
+local view = H({name="Native View",class="View",props={Name="Native View",ScreenContentMask=1},children={widget}})
+objects["View 9001"]=view
+r = request("view.content", {ref="View 9001"})
+local vc = r.ok and r.result or {}
+check("view.content: saved settings and rectangles are read without volatile IDs", r.ok and vc.complete==true and type(vc.contentJson)=="string" and vc.contentJson:find('SELECTEDONLY') and not vc.contentJson:find('volatile'),J(r))
+registry[settings].props.selectedonly="No"
+local changed=request("view.content",{ref="View 9001"})
+check("view.content: changing a nested saved window setting changes content", changed.ok and changed.result.contentJson~=vc.contentJson,J(changed))
+
+registry[widget].addr="14.19.1.4.9001.1"
+registry[settings].addr="14.19.1.4.9001.1.1"
+registry[settings].props.owner=widget
+local twinSettings=H({name="FixtureSheetSettings",class="FixtureSheetSettings",addr="14.19.1.11.1.1.1.1.1",props={SelectedOnly="No"}})
+local twin=H({name="WindowFixtureSheet",class="ViewWidget",addr="14.19.1.11.1.1.1.1",props={Name="WindowFixtureSheet",X=0,Y=0,W=10,H=8,Display=1},children={twinSettings}})
+registry[twinSettings].props.owner=twin
+objects["View 9002"]=H({name="Twin",class="View",props={ScreenContentMask=1},children={twin}})
+local selfReference=request("view.content",{ref="View 9001"})
+local twinReference=request("view.content",{ref="View 9002"})
+check("view.content: a self-window handle normalizes across saved/live address roots",selfReference.ok and twinReference.ok and selfReference.result.complete and twinReference.result.complete and selfReference.result.contentJson==twinReference.result.contentJson,J(selfReference))
+
+function methods.Count(u) return #(registry[u].children or {}) end
+local referenced=H({name="Referenced Sequence",class="Sequence",addr="14.14.1.7.500",children={}})
+registry[settings].props.target=referenced
+local handleBefore=request("view.content",{ref="View 9001"})
+registry[referenced].children={H({name="Auto cache",class="Transient",props={}})}
+local handleAfter=request("view.content",{ref="View 9001"})
+check("view.content: reference-target runtime childCount cannot change saved configuration identity",handleBefore.ok and handleAfter.ok and handleBefore.result.complete and handleAfter.result.complete and handleBefore.result.contentJson==handleAfter.result.contentJson,J({before=handleBefore.result and handleBefore.result.complete,after=handleAfter.result and handleAfter.result.complete}))
+registry[settings].props.target=nil
+
+local opaque=io.tmpfile()
+registry[settings].props.opaque=opaque
+r=request("view.content",{ref="View 9001"})
+check("view.content: unsupported native userdata never becomes complete empty handle metadata",r.ok and r.result.complete==false,J(r))
+registry[settings].props.opaque=nil
+registry[settings].props.keyed={[opaque]="value"}
+r=request("view.content",{ref="View 9001"})
+check("view.content: pointer-valued table keys cannot be a complete stable configuration",r.ok and r.result.complete==false,J(r))
+registry[settings].props.keyed=nil
+registry[settings].props.enabled=false
+r=request("view.content",{ref="View 9001"})
+check("view.content: false remains a real saved value",r.ok and r.result.complete and r.result.contentJson:find('"value":false')~=nil,J(r))
+registry[settings].props.enabled=nil
+
+local actionType=io.tmpfile();debug.setmetatable(actionType,{__tostring=function() return "Action" end})
+function methods.PropertyType(u,i) local name=methods.PropertyName(u,i);return name=="ACTION" and actionType or "String" end
+registry[settings].props.action=opaque
+r=request("view.content",{ref="View 9001"})
+check("view.content: userdata Action property type is skipped before reading its value",r.ok and r.result.complete and not r.result.contentJson:find('"name":"ACTION"'),J(r))
+registry[settings].props.action=nil
+
+local realPropertyCount=methods.PropertyCount
+function methods.PropertyCount(u) if u==settings then error("enumeration failed") end;return realPropertyCount(u) end
+r=request("view.content",{ref="View 9001"})
+check("view.content: failed property enumeration is explicitly incomplete",r.ok and r.result.complete==false,J(r))
+local propertyNameCalls=0
+local realPropertyName=methods.PropertyName
+function methods.PropertyCount(u) if u==settings then return 1000000 end;return realPropertyCount(u) end
+function methods.PropertyName(u,i) propertyNameCalls=propertyNameCalls+1;if u==settings then return "Property"..i end;return realPropertyName(u,i) end
+r=request("view.content",{ref="View 9001"})
+check("view.content: oversized schema is bounded before enumerating a million names",r.ok and r.result.complete==false and propertyNameCalls<100,J({ok=r.ok,complete=r.result and r.result.complete,propertyNameCalls=propertyNameCalls}))
+methods.PropertyCount,methods.PropertyName=realPropertyCount,realPropertyName
+
+-- Native View3DSettings CAMERA has a nil raw Get/property accessor even while its Edit role holds a real handle.
+local typedPropertyType=methods.PropertyType
+function methods.PropertyType(u,i) local name=methods.PropertyName(u,i);return (name=="CAMERA" or name=="PREFERENCEHANDLE" or name=="RENDERQUALITY") and "Handle" or typedPropertyType(u,i) end
+local camera=H({name="Witness Camera",class="Camera",addr="14.19.1.3.9010",props={}})
+local editCamera,displayCamera="#40000B66","Witness Camera"
+StrToHandle=function(text) if text=="#40000B66" then return camera end end
+registry[settings].props.camera=function(role) if role==Enums.Roles.Edit then return editCamera elseif role==Enums.Roles.Display then return displayCamera end end
+r=request("view.content",{ref="View 9001"})
+check("view.content: nil raw writable Handle resolves its Edit-role reference exactly",r.ok and r.result.complete and r.result.contentJson:find('14.19.1.3.9010',1,true),J(r))
+editCamera,displayCamera="#DEAD","Unresolved Camera"
+r=request("view.content",{ref="View 9001"})
+check("view.content: unresolved nonempty Edit Handle is incomplete rather than empty",r.ok and r.result.complete==false,J(r))
+editCamera,displayCamera=nil,"Visible Camera"
+r=request("view.content",{ref="View 9001"})
+check("view.content: visible Handle with no readable Edit identity is incomplete",r.ok and r.result.complete==false,J(r))
+editCamera,displayCamera="", ""
+r=request("view.content",{ref="View 9001"})
+check("view.content: empty Edit and Display roles establish an empty Handle",r.ok and r.result.complete,J(r))
+editCamera,displayCamera="#00000000", ""
+r=request("view.content",{ref="View 9001"})
+check("view.content: null Edit handle plus empty Display establishes an empty Handle",r.ok and r.result.complete,J(r))
+registry[settings].props.camera=nil
+local invalidSentinel=io.tmpfile();invalid[invalidSentinel]=true
+StrToHandle=function(text) if text=="#FFFFFFFFFFFFFFFF" then return invalidSentinel elseif text=="#40000B66" then return camera end end
+registry[settings].props.preferencehandle=function(role) if role==Enums.Roles.Edit then return "#FFFFFFFFFFFFFFFF" elseif role==Enums.Roles.Display then return "" end end
+r=request("view.content",{ref="View 9001"})
+check("view.content: proven invalid native sentinel is retained explicitly, not treated as an empty target",r.ok and r.result.complete and r.result.contentJson:find('invalid',1,true) and r.result.contentJson:find('#FFFFFFFFFFFFFFFF',1,true),J(r))
+registry[settings].props.preferencehandle=nil
+registry[settings].class="View3DSettings"
+registry[settings].props.renderquality=function(role) if role==Enums.Roles.Edit then return "" elseif role==Enums.Roles.Display then return "<Standard>" end end
+r=request("view.content",{ref="View 9001"})
+check("view.content: observed unassigned 3D render quality retains its native selection display state",r.ok and r.result.complete and r.result.contentJson:find('unassigned',1,true) and r.result.contentJson:find('<Standard>',1,true),J(r))
+registry[settings].props.renderquality=function(role) if role==Enums.Roles.Edit then return "" elseif role==Enums.Roles.Display then return "<Unknown>" end end
+r=request("view.content",{ref="View 9001"})
+check("view.content: unqualified same-class unassigned RenderQuality labels fail closed",r.ok and r.result.complete==false,J(r))
+registry[settings].props.renderquality=function(role) if role==Enums.Roles.Edit then return "" elseif role==Enums.Roles.Display then return "<Standard>" end end
+registry[settings].class="FixtureSheetSettings"
+r=request("view.content",{ref="View 9001"})
+check("view.content: unqualified default-display Handle semantics fail closed on other object classes",r.ok and r.result.complete==false,J(r))
+registry[settings].props.renderquality=nil
+registry[settings].class="View3DSettings"
+editCamera,displayCamera="", "<Front>"
+registry[settings].props.camera=function(role) if role==Enums.Roles.Edit then return editCamera elseif role==Enums.Roles.Display then return displayCamera end end
+r=request("view.content",{ref="View 9001"})
+local builtinCamera
+if r.ok and r.result.contentJson then
+  local content=json.decode(r.result.contentJson)
+  for _,property in ipairs(content[1].configuration.children[1].properties) do
+    if property.name=="CAMERA" then builtinCamera=property.value end
+  end
+end
+local builtinFields={}
+for _,entry in ipairs(builtinCamera and builtinCamera.entries or {}) do builtinFields[entry.key]=entry.value end
+check("view.content: observed builtin Front camera retains exact display/edit mode without a pool identity",r.ok and r.result.complete and builtinCamera and #builtinCamera.entries==3 and builtinFields.handleState=="builtin" and builtinFields.edit=="" and builtinFields.display=="<Front>" and builtinFields.addr==nil,J(r))
+displayCamera="<Unknown>"
+r=request("view.content",{ref="View 9001"})
+check("view.content: unqualified builtin Camera display labels fail closed",r.ok and r.result.complete==false,J(r))
+displayCamera="<Front>"
+editCamera="#DEAD"
+r=request("view.content",{ref="View 9001"})
+check("view.content: builtin Camera label cannot conceal an unresolved explicit Edit handle",r.ok and r.result.complete==false,J(r))
+editCamera=""
+registry[settings].class="FixtureSheetSettings"
+r=request("view.content",{ref="View 9001"})
+check("view.content: builtin Camera roles are qualified only on View3DSettings",r.ok and r.result.complete==false,J(r))
+registry[settings].props.camera=nil
+methods.PropertyType=typedPropertyType
 
 print(string.format("%d passed, %d failed", passes, failures))
 if failures > 0 then print("FAILED"); os.exit(1) end

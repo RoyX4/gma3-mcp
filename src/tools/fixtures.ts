@@ -48,7 +48,7 @@ import {
   type StepResult,
   type Verification,
 } from "../results.js";
-import { Validator, attributeName, exactlyOne, finiteNumber, fixtureSelection, oneOf, percent } from "../validate.js";
+import { Validator, attributeName, exactlyOne, finiteNumber, fixtureSelection, oneOf, percent, timeSeconds } from "../validate.js";
 import { exists, readFields } from "./common.js";
 
 // ---------------------------------------------------------------------------
@@ -62,6 +62,10 @@ const VALUE_UNAVAILABLE = "programmer read-back was not performed";
 
 /** Tolerance for programmer read-back, in percent of the attribute range (8-bit DMX quantisation is 0.39 %). */
 const VERIFY_TOLERANCE_PERCENT = 0.5;
+/** GetProgPhaser timing is floating point seconds; compare individual timing within one millisecond. */
+const INDIVIDUAL_TIMING_TOLERANCE_SECONDS = 0.001;
+/** 2.5.1.1 native probe: plain value64, +Fade68, +Delay72, both76; require individual AND active masks. */
+const INDIVIDUAL_TIMING_BITS = { fade: 4, delay: 8 } as const;
 /** Follow-up programmer scans per call for fixtures whose values live on their cells (compound fixtures). */
 const MAX_FOLLOWUP_SCANS = 8;
 /** Explicit targets with at most this many fixtures are pre-checked against the fixture-type attributes. */
@@ -96,9 +100,24 @@ export function formatValue(n: number): string {
   return n.toLocaleString("en-US", { useGrouping: false, maximumFractionDigits: 4 });
 }
 
-/** Build the documented `Attribute "<name>" At Absolute [<ValueType>] <value>` command. */
-export function attributeCommand(attribute: string, value: number, valueType?: string): string {
-  return `Attribute "${attribute}" At Absolute${valueType ? ` ${valueType}` : ""} ${formatValue(value)}`;
+export interface AttributeTiming { fade?: number; delay?: number }
+export const attributeTimingShape = {
+  fade: z.number().optional().describe("Individual attribute fade in seconds; 0 is instantaneous."),
+  delay: z.number().optional().describe("Individual attribute delay in seconds; 0 starts immediately."),
+};
+export function parseAttributeTiming(v: Validator, raw: Record<string, unknown>, path = ""): AttributeTiming {
+  const timing: AttributeTiming = {};
+  for (const key of ["fade", "delay"] as const) {
+    const value = v.check(() => timeSeconds(`${path}${key}`, raw[key], { optional: true }));
+    if (value !== undefined) timing[key] = value;
+  }
+  return timing;
+}
+/** Build a validated value command, optionally carrying individual Fade/Delay in seconds. */
+export function attributeCommand(attribute: string, value: number, valueType?: string, timing: AttributeTiming = {}): string {
+  return `Attribute "${attribute}" At Absolute${valueType ? ` ${valueType}` : ""} ${formatValue(value)}` +
+    (timing.fade !== undefined ? ` Fade ${formatValue(timing.fade)}` : "") +
+    (timing.delay !== undefined ? ` Delay ${formatValue(timing.delay)}` : "");
 }
 
 interface SelectionCount {
@@ -313,7 +332,7 @@ interface ResolvedFixture {
 }
 
 /** One value the setter asked the console to apply. */
-export interface Expectation {
+export interface Expectation extends AttributeTiming {
   attribute: string;
   value: number;
   /** Unit the value was sent in. "readout" = no value-type keyword (the user profile's readout applies). */
@@ -321,6 +340,8 @@ export interface Expectation {
 }
 
 interface ProgrammerRow {
+  phaser?: { fade?: number | null; delay?: number | null };
+  masks?: { activePhaser?: number; individual?: number };
   fixture?: string | null;
   fid?: string | null;
   subfixtureIndex?: number;
@@ -348,6 +369,32 @@ interface ProgrammerResult {
   limitations?: string[];
 }
 
+/** One immutable, complete read. It may be shared only across checks at the same mutation-free point and scope. */
+export interface ProgrammerObservation {
+  readonly scope: "selection" | "fixtures";
+  readonly fixtures?: string;
+  readonly result?: ProgrammerResult;
+  readonly reason?: string;
+}
+function freezeRead<T>(value: T): T {
+  if (value && typeof value === "object") {
+    for (const item of Object.values(value)) freezeRead(item);
+    Object.freeze(value);
+  }
+  return value;
+}
+export async function captureProgrammer(bridge: Gma3Bridge, args: { scope: "selection" | "fixtures"; fixtures?: string }): Promise<ProgrammerObservation> {
+  const read = await readProgrammerPages(bridge, args, true);
+  return freezeRead({ ...args, ...read });
+}
+async function programmerRead(bridge: Gma3Bridge, args: { scope: "selection" | "fixtures"; fixtures?: string }, observed?: ProgrammerObservation): Promise<{ result: ProgrammerResult } | { reason: string }> {
+  if (!observed) return readProgrammerPages(bridge, args);
+  if (observed.scope !== args.scope || observed.fixtures !== args.fixtures) return { reason: "the supplied programmer snapshot has a different scope; it cannot verify this target" };
+  if (!observed.result) return { reason: observed.reason ?? "the supplied programmer snapshot has no result" };
+  if (observed.result.coverage?.complete !== true || observed.result.fixturesTruncated) return { reason: "the supplied programmer snapshot is incomplete" };
+  return { result: observed.result };
+}
+
 interface ScannedFixture {
   subfixtureIndex?: number;
   fid?: string | null;
@@ -360,16 +407,20 @@ interface ScannedFixture {
 /** Rows per request page and the hard cap on pages fetched before giving up on completeness. */
 const PROGRAMMER_PAGE = 5000;
 const PROGRAMMER_MAX_PAGES = 10;
+/** Whole-rig coverage budget, distinct from the number of active rows returned per page. */
+export const PROGRAMMER_MAX_CHANNELS = 50000;
 
 /**
  * Read a programmer scan completely: the op paginates `rows`, so every page is fetched until the
  * returned rows reach `total`. Returns the merged result, or a reason when it could not be completed.
  */
-async function readProgrammerPages(bridge: Gma3Bridge, args: Record<string, unknown>): Promise<{ result: ProgrammerResult } | { reason: string; partial?: ProgrammerResult }> {
+async function readProgrammerPages(bridge: Gma3Bridge, args: Record<string, unknown>, strictCoverage = false): Promise<{ result: ProgrammerResult } | { reason: string; partial?: ProgrammerResult }> {
   // Every page is a fresh scan on the console, so each one reports its own coverage and fixture
   // list. A page that is incomplete or truncated makes the whole read unavailable, whatever the
   // first page said; the merged result carries the strictest flags and every limitation seen.
-  const first = (await bridge.request("programmer", { ...args, limit: PROGRAMMER_PAGE, offset: 0 })) as ProgrammerResult;
+  const scanArgs = { maxChannels: PROGRAMMER_MAX_CHANNELS, ...args, limit: PROGRAMMER_PAGE };
+  const first = (await bridge.request("programmer", { ...scanArgs, offset: 0 })) as ProgrammerResult;
+  if (strictCoverage && first.coverage?.complete !== true) return { reason: "the programmer snapshot did not declare complete coverage" };
   const rows = [...(first.rows ?? [])];
   const total = typeof first.total === "number" ? first.total : rows.length;
   const limitations = [...(first.limitations ?? [])];
@@ -388,7 +439,8 @@ async function readProgrammerPages(bridge: Gma3Bridge, args: Record<string, unkn
     if (pages >= PROGRAMMER_MAX_PAGES) {
       return { reason: `the programmer scan returned ${total} rows but only ${rows.length} were fetched within ${PROGRAMMER_MAX_PAGES} pages`, partial: merged() };
     }
-    const page = (await bridge.request("programmer", { ...args, limit: PROGRAMMER_PAGE, offset: rows.length })) as ProgrammerResult;
+    const page = (await bridge.request("programmer", { ...scanArgs, offset: rows.length })) as ProgrammerResult;
+    if (strictCoverage && page.coverage?.complete !== true) return { reason: `page ${pages + 1} did not declare complete programmer coverage` };
     pages++;
     limitations.push(...(page.limitations ?? []));
     if (page.coverage?.complete === false) {
@@ -420,7 +472,8 @@ export function expectedPercent(exp: Expectation, row: ProgrammerRow): { percent
     const to = row.physicalTo;
     if (typeof from !== "number" || typeof to !== "number") return { reason: `the physical range of ${exp.attribute} is not available for this fixture` };
     if (to === from) return { reason: `the physical range of ${exp.attribute} is empty (${from}..${to})` };
-    return { percent: ((exp.value - from) / (to - from)) * 100 };
+    // GetProgPhaser.absolute uses ascending physical percent, including on inverted Zoom ranges.
+    return { percent: ((exp.value - Math.min(from, to)) / Math.abs(to - from)) * 100 };
   };
   switch (exp.unit) {
     case "percent":
@@ -507,6 +560,23 @@ function judgeFixture(label: string, key: string, entries: ScannedFixture[], row
       }
       for (const row of matching) {
         verdict.rowsChecked++;
+        for (const layer of ["fade", "delay"] as const) {
+          const expected = exp[layer];
+          if (expected === undefined) continue;
+          const individual = row.masks?.individual;
+          const active = row.masks?.activePhaser;
+          if (typeof individual !== "number" || !Number.isInteger(individual) || typeof active !== "number" || !Number.isInteger(active)) {
+            verdict.unavailable.push(`${label}${cell}: individual ${layer} activation masks of ${exp.attribute} were not supplied by the console`);
+          } else if ((individual & INDIVIDUAL_TIMING_BITS[layer]) === 0 || (active & INDIVIDUAL_TIMING_BITS[layer]) === 0) {
+            verdict.problems.push(`${label}${cell}: ${exp.attribute} ${layer} timing is not active for individual storage`);
+          }
+          const actual = row.phaser?.[layer];
+          if (typeof actual !== "number" || !Number.isFinite(actual)) {
+            verdict.unavailable.push(`${label}${cell}: individual ${layer} of ${exp.attribute} was not supplied by the console`);
+          } else if (Math.abs(actual - expected) > INDIVIDUAL_TIMING_TOLERANCE_SECONDS) {
+            verdict.problems.push(`${label}${cell}: ${exp.attribute} ${layer} reads ${actual} s, expected ${expected} s`);
+          }
+        }
         if (typeof row.value !== "number") {
           verdict.problems.push(`${label}${cell}: ${exp.attribute} holds a ${row.stepCount ?? "multi"}-step phaser, not the static value ${exp.value}`);
           continue;
@@ -526,7 +596,11 @@ function judgeFixture(label: string, key: string, entries: ScannedFixture[], row
           continue;
         }
         if (Math.abs(row.value - want.percent) > VERIFY_TOLERANCE_PERCENT) {
-          const physical = typeof row.physicalFrom === "number" && typeof row.physicalTo === "number" ? ` = ${formatValue(row.physicalFrom + (row.value / 100) * (row.physicalTo - row.physicalFrom))} ${row.physicalUnit ?? ""}`.trimEnd() : "";
+          const from = row.physicalFrom;
+          const to = row.physicalTo;
+          const physical = typeof from === "number" && typeof to === "number"
+            ? ` = ${formatValue(Math.min(from, to) + (row.value / 100) * Math.abs(to - from))} ${row.physicalUnit ?? ""}`.trimEnd()
+            : "";
           verdict.problems.push(`${label}${cell}: ${exp.attribute} reads ${formatValue(row.value)} % of range${physical}, expected ${formatValue(want.percent)} % (${formatValue(exp.value)} ${exp.unit})`);
         }
       }
@@ -547,12 +621,12 @@ function judgeFixture(label: string, key: string, entries: ScannedFixture[], row
  * scan was complete and fully paginated; `mismatched` on any wrong or missing value or a fixture
  * without the attribute; `unavailable` when a read could not be completed or interpreted.
  */
-export async function verifyProgrammer(bridge: Gma3Bridge, expectations: Expectation[], steps: StepResult[], warnings: string[]): Promise<{ verification: Verification; summary: Record<string, unknown> }> {
-  const checked = `programmer values of the selected fixtures (${expectations.map((e) => `${e.attribute} = ${formatValue(e.value)} ${e.unit}`).join(", ")}), tolerance ${VERIFY_TOLERANCE_PERCENT} % of range${expectations.some((e) => isDecimalUnit(e.unit)) ? "; decimal values exactly, as DMX values" : ""}`;
+export async function verifyProgrammer(bridge: Gma3Bridge, expectations: Expectation[], steps: StepResult[], warnings: string[], targetFixtures?: string, observed?: ProgrammerObservation): Promise<{ verification: Verification; summary: Record<string, unknown> }> {
+  const checked = `programmer values of ${targetFixtures ?? "the selected fixtures"} (${expectations.map((e) => `${e.attribute} = ${formatValue(e.value)} ${e.unit}`).join(", ")}), tolerance ${VERIFY_TOLERANCE_PERCENT} % of range${expectations.some((e) => isDecimalUnit(e.unit)) ? "; decimal values exactly, as DMX values" : ""}`;
   const unavailableReasons: string[] = [];
   let primary: ProgrammerResult;
   try {
-    const read = await readProgrammerPages(bridge, { scope: "selection" });
+    const read = await programmerRead(bridge, targetFixtures ? { scope: "fixtures", fixtures: targetFixtures } : { scope: "selection" }, observed);
     if ("reason" in read) {
       steps.push({ name: "read_programmer", kind: "read", status: "failed", op: "programmer", error: read.reason });
       return { verification: unavailable(read.reason, checked), summary: { performed: true, complete: false } };
@@ -568,6 +642,13 @@ export async function verifyProgrammer(bridge: Gma3Bridge, expectations: Expecta
     return { verification: unavailable(`programmer read-back failed: ${message}`, checked), summary: { performed: false } };
   }
   const limitations = [...(primary.limitations ?? [])];
+  const timedAttributes = new Set(expectations.filter(e => e.fade !== undefined || e.delay !== undefined).map(e => e.attribute.toLowerCase()));
+  const timingRows: ProgrammerRow[] = [];
+  const collectTimingRows = (rows: ProgrammerRow[]) => {
+    if (!timedAttributes.size) return;
+    for (const row of rows) if (row.attribute && timedAttributes.has(row.attribute.toLowerCase())) timingRows.push(row);
+  };
+  collectTimingRows(primary.rows ?? []);
   const indexRows = (rows: ProgrammerRow[]): Map<number, ProgrammerRow[]> => {
     const m = new Map<number, ProgrammerRow[]>();
     for (const r of rows) {
@@ -614,6 +695,7 @@ export async function verifyProgrammer(bridge: Gma3Bridge, expectations: Expecta
         continue;
       }
       const sub = read.result;
+      collectTimingRows(sub.rows ?? []);
       steps.push({ name: "read_programmer_fixture", kind: "read", status: "succeeded", op: "programmer", detail: { fixture: f.fid, rows: sub.total, coverage: sub.coverage } });
       limitations.push(...(sub.limitations ?? []));
       if ((sub.coverage && sub.coverage.complete === false) || sub.fixturesTruncated) {
@@ -642,12 +724,21 @@ export async function verifyProgrammer(bridge: Gma3Bridge, expectations: Expecta
   if (expectations.some((e) => e.unit === "readout")) {
     warnings.push("no unit was given, so the read-back assumed the user profile's readout is Natural (percent for Dimmer and colour, physical units for Pan/Tilt); if the profile uses another readout the comparison may mismatch");
   }
-  const actual = { rows: (primary.rows ?? []).map((r) => ({ fixture: r.fixture, fid: r.fid, attribute: r.attribute, value: r.value, physicalFrom: r.physicalFrom, physicalTo: r.physicalTo, readout: r.readout })) };
+  const actual = {
+    rows: (primary.rows ?? []).map((r) => ({ fixture: r.fixture, fid: r.fid, subfixtureIndex: r.subfixtureIndex, attribute: r.attribute, value: r.value, physicalFrom: r.physicalFrom, physicalTo: r.physicalTo, readout: r.readout })),
+    ...(timedAttributes.size ? { individualTiming: {
+      toleranceSeconds: INDIVIDUAL_TIMING_TOLERANCE_SECONDS,
+      rows: timingRows.map(r => ({
+        fixture: r.fixture, fid: r.fid, subfixtureIndex: r.subfixtureIndex, attribute: r.attribute,
+        fade: r.phaser?.fade ?? null, delay: r.phaser?.delay ?? null, masks: r.masks ?? null,
+      })),
+    } } : {}),
+  };
   if (problems.length) {
     return { verification: { status: "mismatched", checked, expected: expectations, actual, detail: problems.join("; ") }, summary };
   }
   if (unavailableReasons.length) {
-    return { verification: unavailable(unavailableReasons.join("; "), checked), summary };
+    return { verification: { ...unavailable(unavailableReasons.join("; "), checked), ...(timedAttributes.size ? { expected: expectations, actual } : {}) }, summary };
   }
   return { verification: { status: "matched", checked, expected: expectations, actual }, summary };
 }
@@ -774,12 +865,12 @@ const anySucceeded = (steps: StepResult[], names: string[]): boolean => steps.so
  * itself and its cells (a compound fixture's values live on its cells). The link proves the recall reached the
  * channel; it also survives a later manual value, so the check belongs right after the recall.
  */
-export async function verifyPresetLink(bridge: Gma3Bridge, preset: { addrNative: string; label: string }, steps: StepResult[]): Promise<{ verification: Verification; summary: Record<string, unknown> }> {
+export async function verifyPresetLink(bridge: Gma3Bridge, preset: { addrNative: string; label: string }, steps: StepResult[], observed?: ProgrammerObservation): Promise<{ verification: Verification; summary: Record<string, unknown> }> {
   const checked = `every selected fixture (or its cells) holds programmer values linked to ${preset.label}`;
   const linkedRows = (rows: ProgrammerRow[]) => rows.filter((r) => r.absPreset?.addrNative === preset.addrNative);
   let primary: ProgrammerResult;
   try {
-    const read = await readProgrammerPages(bridge, { scope: "selection" });
+    const read = await programmerRead(bridge, { scope: "selection" }, observed);
     if ("reason" in read) {
       steps.push({ name: "read_programmer", kind: "read", status: "failed", op: "programmer", error: read.reason });
       return { verification: unavailable(read.reason, checked), summary: { performed: true, complete: false } };
@@ -1038,11 +1129,12 @@ export const registerFixtureTools: RegisterTools = (server, ctx: ToolContext) =>
       description:
         'Set one attribute (Dimmer, Pan, Zoom, ColorRGB_R, ...) to an absolute value in the programmer. Sends `Attribute "<name>" At Absolute [<unit keyword>] <value>` after establishing the target. ' +
         "Target is explicit: `fixtures` (range/group) OR `use_selection: true`. With `fixtures` the tool sends ClearSelection and then SELECTS exactly those fixtures (the selection changes; previously selected fixtures are not affected unless add_to_selection is true). " +
-        "Never clears programmer values. Without `unit` the number is interpreted by the user profile's readout. " +
+        "Never clears programmer values. Optional fade/delay set individual attribute timing in seconds and are verified from fresh programmer timing, within 0.001 s; missing timing is unavailable. Without `unit` the number is interpreted by the user profile's readout. " +
         "Small explicit targets are pre-checked against the fixture type's attribute list (check_attributes), and after setting, the programmer is read back and compared per fixture in the unit sent (verify); a fixture without the attribute is a mismatch, not a success. " +
         "Serialised against this server's other mutations only.",
       inputSchema: {
         ...setterShape,
+        ...attributeTimingShape,
         attribute: z.string().describe('Attribute name as grandMA3 shows it, e.g. "Dimmer", "Pan", "Tilt", "Zoom", "ColorRGB_R" (letters, digits, _ and . only).'),
         value: z.number().describe("Absolute value. Range depends on unit: percent/percent_fine 0..100, decimal8 0..255, decimal16 0..65535, decimal24 0..16777215, physical/natural any finite number."),
         unit: z
@@ -1065,10 +1157,11 @@ export const registerFixtureTools: RegisterTools = (server, ctx: ToolContext) =>
         if (value !== undefined && value < 0 && !(unit === "physical" || unit === "natural")) {
           v.fail(`value must not be negative for unit ${unit ?? "readout"} (got ${value}); use unit "physical" or "natural" for signed values`);
         }
-        const baseTarget = { fixtures: args.fixtures, use_selection: args.use_selection, attribute: args.attribute, value: args.value, unit: args.unit };
+        const timing = parseAttributeTiming(v, args);
+        const baseTarget = { fixtures: args.fixtures, use_selection: args.use_selection, attribute: args.attribute, value: args.value, unit: args.unit, ...timing };
         if (!v.ok || !t || !attribute || value === undefined) return validationFailure(op, baseTarget, v.errors);
-        const command = attributeCommand(attribute, value, rule.keyword);
-        const target = { ...t.target, attribute, value, unit: unit ?? "readout" };
+        const command = attributeCommand(attribute, value, rule.keyword, timing);
+        const target = { ...t.target, attribute, value, unit: unit ?? "readout", ...timing };
         const verify = args.verify !== false;
         const preCheck = args.check_attributes !== false;
         return ctx.mutations.run(async () => {
@@ -1080,7 +1173,7 @@ export const registerFixtureTools: RegisterTools = (server, ctx: ToolContext) =>
           plan.push({ name: "set_attribute", run: () => commandStep(bridge, "set_attribute", command) });
           const { steps } = await runSteps(plan);
           const mutated = anySucceeded(steps, ["set_attribute"]) || steps.some((s) => s.name === "set_attribute" && s.status === "unknown");
-          const rb = await readBackValues(bridge, verify, steps, [{ attribute, value, unit: unit ?? "readout" }], mutated, warnings);
+          const rb = await readBackValues(bridge, verify, steps, [{ attribute, value, unit: unit ?? "readout", ...timing }], mutated, warnings);
           return finish({
             operation: op,
             target,
@@ -1283,7 +1376,7 @@ export const registerFixtureTools: RegisterTools = (server, ctx: ToolContext) =>
       title: "Set several attributes (a look) in one call",
       description:
         'Set a whole look on one target in one call: intensity (`At <value>`, percent) and/or several attributes, each `Attribute "<name>" At Absolute [<unit keyword>] <value>`, in the order given. Stops at the first command the console rejects (partial result). ' +
-        "Target is explicit: `fixtures` OR `use_selection: true`; with `fixtures`, ClearSelection and then a select (see gma3_set_attribute). Never clears programmer values. " +
+        "Target is explicit: `fixtures` OR `use_selection: true`; with `fixtures`, ClearSelection and then a select (see gma3_set_attribute). Never clears programmer values. Each values[] item may have individual fade/delay seconds; fresh timing is checked within 0.001 s, and missing timing is unavailable. Use a Dimmer values[] item to time intensity individually. " +
         "Note: setting one colour attribute activates the fixture's whole colour group in the programmer (the other mix channels at their defaults), so the programmer can hold more rows than attributes sent. " +
         "Small explicit targets are pre-checked against the fixture types' attributes (check_attributes); the programmer is read back and every targeted fixture (and cell) is compared per attribute in the unit sent (verify), as gma3_set_attribute does. Serialised against this server's other mutations only.",
       inputSchema: {
@@ -1292,6 +1385,7 @@ export const registerFixtureTools: RegisterTools = (server, ctx: ToolContext) =>
         values: z
           .array(
             z.object({
+              ...attributeTimingShape,
               attribute: z.string().describe('Attribute name, e.g. "Pan", "ColorRGB_W", "Gobo1", "Shutter1".'),
               value: z.number().describe("Absolute value in unit."),
               unit: z.enum(ATTRIBUTE_UNIT_NAMES as [AttributeUnit, ...AttributeUnit[]]).optional().describe("percent, percent_fine, physical, natural, decimal8/16/24; omit for the console's readout."),
@@ -1307,7 +1401,7 @@ export const registerFixtureTools: RegisterTools = (server, ctx: ToolContext) =>
         const v = new Validator();
         const t = validateTarget(v, args);
         const intensity = args.intensity === undefined ? undefined : v.check(() => percent("intensity", args.intensity));
-        const values: Array<{ attribute: string; value: number; unit?: AttributeUnit }> = [];
+        const values: Array<{ attribute: string; value: number; unit?: AttributeUnit } & AttributeTiming> = [];
         const list = Array.isArray(args.values) ? args.values : [];
         if (args.values !== undefined && !Array.isArray(args.values)) v.fail("values must be a list");
         if (list.length > MAX_ATTRIBUTES) v.fail(`at most ${MAX_ATTRIBUTES} attributes per call`);
@@ -1319,15 +1413,16 @@ export const registerFixtureTools: RegisterTools = (server, ctx: ToolContext) =>
           if (value !== undefined && value < 0 && !(unit === "physical" || unit === "natural")) v.fail(`values[${i}].value must not be negative for unit ${unit ?? "readout"}; use physical or natural for signed values`);
           if (attribute && values.some((x) => x.attribute.toLowerCase() === attribute.toLowerCase())) v.fail(`attribute ${attribute} appears twice`);
           if (attribute && intensity !== undefined && attribute.toLowerCase() === "dimmer") v.fail("Dimmer and intensity are the same attribute: give one of them");
-          if (attribute && value !== undefined) values.push({ attribute, value, ...(unit ? { unit } : {}) });
+          const timing = parseAttributeTiming(v, e, `values[${i}].`);
+          if (attribute && value !== undefined) values.push({ attribute, value, ...(unit ? { unit } : {}), ...timing });
         });
         if (intensity === undefined && list.length === 0) v.fail("give intensity and/or values");
         const baseTarget = { fixtures: args.fixtures, use_selection: args.use_selection, intensity: args.intensity, values: args.values };
         if (!v.ok || !t) return validationFailure(op, baseTarget, v.errors);
-        const commands: Array<{ name: string; attribute: string; value: number; unit: AttributeUnit | "readout"; command: string }> = [];
+        const commands: Array<{ name: string; attribute: string; value: number; unit: AttributeUnit | "readout"; command: string } & AttributeTiming> = [];
         if (intensity !== undefined) commands.push({ name: "set_intensity", attribute: "Dimmer", value: intensity, unit: "percent", command: `At ${formatValue(intensity)}` });
-        values.forEach((x, i) => commands.push({ name: `set_${i + 1}_${x.attribute}`, attribute: x.attribute, value: x.value, unit: x.unit ?? "readout", command: attributeCommand(x.attribute, x.value, x.unit ? ATTRIBUTE_UNITS[x.unit].keyword : undefined) }));
-        const target = { ...t.target, values: commands.map(({ attribute, value, unit }) => ({ attribute, value, unit })) };
+        values.forEach((x, i) => commands.push({ name: `set_${i + 1}_${x.attribute}`, ...x, unit: x.unit ?? "readout", command: attributeCommand(x.attribute, x.value, x.unit ? ATTRIBUTE_UNITS[x.unit].keyword : undefined, x) }));
+        const target = { ...t.target, values: commands.map(({ name: _name, command: _command, ...wanted }) => wanted) };
         const verify = args.verify !== false;
         const preCheck = args.check_attributes !== false;
         return ctx.mutations.run(async () => {
@@ -1341,7 +1436,7 @@ export const registerFixtureTools: RegisterTools = (server, ctx: ToolContext) =>
           for (const c of commands) plan.push({ name: c.name, run: () => commandStep(bridge, c.name, c.command) });
           const { steps } = await runSteps(plan);
           const sent = commands.filter((c) => steps.some((s) => s.name === c.name && (s.status === "succeeded" || s.status === "unknown")));
-          const rb = await readBackValues(bridge, verify, steps, sent.map(({ attribute, value, unit }) => ({ attribute, value, unit })), sent.length > 0, warnings);
+          const rb = await readBackValues(bridge, verify, steps, sent.map(({ name: _name, command: _command, ...wanted }) => wanted), sent.length > 0, warnings);
           return finish({
             operation: op,
             target,

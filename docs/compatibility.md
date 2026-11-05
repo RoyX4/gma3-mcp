@@ -1,5 +1,7 @@
 # Tested platforms and versions
 
+The 30 October upgrade was installed locally and published in [RoyX4/gma3-mcp](https://github.com/RoyX4/gma3-mcp). This chat's disposable lab remains stopped. The latest general-PSR reproduction stopped before Finish. See the [original native qualification](qualification/2026-10-30.md) and [subsequent offline fixes](qualification/2026-11-04.md).
+
 [README](../README.md) · [Live probe records](probes/README.md) · [Module integration](modules.md)
 
 This beta's reviewed source baseline is
@@ -7,6 +9,19 @@ This beta's reviewed source baseline is
 The tables distinguish recorded console behavior from tests using simulated console dependencies.
 Earlier probe records identify the component versions they exercised; they are not a claim that every
 probe was rerun against this exact revision. An installation guide is not qualification evidence.
+
+## Comprehensive extension qualification, 30 October 2026
+
+The extension is separately stamped with Node build input hash `315abd2e07109cfc9c0ef6c5db182bcda2c270acb39979f8e0a9e43e93bb1377` (FINALv4). Its imported bridge was 0.44.0, with fingerprint `lua-bytecode-adler32:b5a53c86:271751`, hardkeys 0.12.0, feedback 0.8.0 and control 0.7.0. Runtime Lua was 5.5; regression harnesses used Lua 5.4. VM bytecode identities are not source hashes or cross-platform guarantees.
+
+| Environment / gate | Observed scope | Limits |
+| --- | --- | --- |
+| Ubuntu 26.04.1, Wine 11.20, grandMA3 onPC 2.5.1.1 | Disposable isolated lab writes, eleven-section persistence, versioned job restart/rebind and selected workspace/patch/recipe/timecode cases | Experimental Wine use; no claim of native Windows/macOS or physical hardware equivalence |
+| Matched complete cue jobs | 27 historical Intel samples and 9 final-build NVIDIA samples, with equal effective native stored states | Synthetic twelve-cue static-percent workload; no material gain over baseline full-state authoring or GPU causality claim |
+| Idle-native connection observation | 239 samples across 1,200,047.534537 ms verified span; one connection, zero disconnects/timeouts | A prior busy-handler timeout remains recorded; the idle pass does not qualify heavy native operations or later generations |
+| FINALv4 automated gate | 1,215 Node tests, 20 packaged Lua suites, 45 fastpath checks, TypeScript/build/diff and 148-tool offline discovery | Simulated dependencies and discovery are distinct from native or physical qualification |
+
+See [the portable qualification summary](qualification/2026-10-30.md), [complete-job timing and method](programming-performance.md), and [MVR position/PSR boundaries](probes/g25-mvr-positions-native-2.5.1.1.md). General PSR, measured optics/clearance/native shadows and unsupported Preview/hardware contexts remain partial. Detailed private show files and workstation receipts are not distributed. Existing clients and imported plugins retain separate identities until independently updated and checked. The historical upstream tables below are not reruns of this extension.
 
 ## Component baseline
 

@@ -13,8 +13,8 @@
  *     Preview programmer. Preset links (abs_preset) read back there as in Normal.
  *   - The programmer keeps its values after a Store, so each cue starts from ClearAll (sent only after the console
  *     confirms Preview: in Normal it would discard the operator's programmer).
- *   - A cue's stored values cannot be read back (no GetCueData on 2.5.1), so each look is checked in the programmer
- *     right before its store; a look that did not apply stops the batch before that cue is stored.
+ *   - This standalone builder checks each look in Preview before Store. Native cue.content can read stored
+ *     channels through GetPresetData on a CuePart handle; durable jobs additionally compare stored owned state.
  *   - A cue stored without a name is named after the preset it holds ("[4.901]").
  *   - A Time trigger counts from the previous cue's start (a fade does not lengthen the step); with Wrap Around the
  *     last cue is followed by cue 1 only when cue 1 has a trigger too. `Goto Sequence N Cue C` from off starts the
@@ -22,6 +22,9 @@
  */
 import { z } from "zod";
 import type { Gma3Bridge } from "../bridge.js";
+import { canGroupStaticLook, previewSeriesContext, previewSeriesStep } from "../preview-command-series.js";
+import { createEnvironmentReader } from "../programmer-environment.js";
+import { verifyReleases, type ReleaseSpec } from "../tracking/release.js";
 import {
   asRead,
   buildResult,
@@ -45,20 +48,26 @@ import { cueRef, exists } from "./common.js";
 import { operation, type RegisterTools, type ToolContext } from "./context.js";
 import { ON_NAME_TAKEN, checkPoolName, nameOrSuffixed, recordLeftName, type NamePool, type OnNameTaken, type PoolNameCache } from "./poolnames.js";
 import { BATCH_NOTE, batchOptionShape, compactResult, duplicates, runBatchCall } from "../batch.js";
-import { TIME_NORMALIZERS, TIMING_PROPS, TRIGGERS, TRIGGER_KEYS, type TimingKey, type TriggerKey } from "./cues.js";
+import { TIME_NORMALIZERS, TIMING_PROPS, TRIGGERS, TRIGGER_KEYS, STORE_TRACKING_LIMITATION, storeTrackingFlags, storeTrackingShape, validateStoreTrackingOptions, type StoreTrackingOptions, type TimingKey, type TriggerKey } from "./cues.js";
 import {
   ATTRIBUTE_UNITS,
   ATTRIBUTE_UNIT_NAMES,
   MAX_ATTRIBUTES,
+  PROGRAMMER_MAX_CHANNELS,
   attributeCommand,
+  attributeTimingShape,
+  captureProgrammer,
   formatValue,
+  parseAttributeTiming,
   presetRef,
   snapshotProgrammer,
   verifyPresetLink,
   verifyProgrammer,
+  type AttributeTiming,
   type AttributeUnit,
   type Expectation,
   type ProgrammerSnapshot,
+  type ProgrammerObservation,
 } from "./fixtures.js";
 import { cueNo, readSequenceRate } from "./speed.js";
 import { effectAttributes, effectCommands, parsePhaser, parseStep, verifyBuild, type Effect, type Unit } from "./phasers.js";
@@ -66,6 +75,7 @@ import { SEQUENCE_SETTINGS, configureSequence, findReferences, settingValue, typ
 import { HeldLock } from "../mutations.js";
 import { VarTracker, variablePresence, variableRefs } from "./variables.js";
 import { dataPoolShape, inDataPool } from "./datapool.js";
+import { fixtureRange } from "./inspection.js";
 
 export const MAX_CUES = 100;
 export const MAX_LOOKS = 16;
@@ -75,7 +85,7 @@ const OBSERVE_MAX_S = 120;
 const SAMPLE_MS = 40;
 
 const NOT_READABLE =
-  "A cue's stored values cannot be read back on 2.5.1 (no GetCueData); each look was checked in the Preview programmer right before its cue was stored.";
+  "This standalone batch checked each look in Preview before Store and checked cue metadata. Use gma3_native_cue_data for actual stored channels; durable programming jobs also compare compiler-owned stored/tracked state after each batch.";
 
 // ---------------------------------------------------------------------------
 // Validation
@@ -86,21 +96,31 @@ interface PresetSpec {
   preset: number | string;
   ref: string;
 }
-interface ValueSpec {
+interface ValueSpec extends AttributeTiming {
   attribute: string;
   value: number;
   unit?: AttributeUnit;
+  layer?: "absolute" | "relative";
 }
 export interface LookSpec {
   fixtures: string;
   presets: PresetSpec[];
   intensity?: number;
   values: ValueSpec[];
+  /** A stored tracking release, distinct from removing a programmer value with Off Attribute. */
+  releases?: ReleaseSpec[];
   /** SU-14: a phaser built on the look's fixtures (steps and phaser layers, as gma3_build_phaser takes them). */
   phaser?: Effect;
 }
+function canGroupLook(look: LookSpec): boolean {
+  return !look.presets.length && !look.phaser && !look.releases?.length
+    && !look.values.some(value => value.layer === "relative" || value.fade !== undefined || value.delay !== undefined)
+    && canGroupStaticLook(look.fixtures, look.values.length + (look.intensity === undefined ? 0 : 1));
+}
 export interface CueSpec {
   cue: string;
+  /** Internal explicit target for existing-cue value edits. Other builders keep the default cue store. */
+  part?: number;
   name?: string;
   looks: LookSpec[];
   /** SU-14: the cue's command (Part 0 Command), run when the cue is called. */
@@ -185,7 +205,7 @@ function validateLookPhaser(v: Validator, raw: unknown, path: string): Effect | 
 
 /** A look: a target and what to give it. Presets first, then intensity, then values (later commands win), then a phaser. */
 function validateLook(v: Validator, raw: unknown, path: string, defaultFixtures: string | undefined): LookSpec | undefined {
-  const r = (raw ?? {}) as { fixtures?: unknown; presets?: unknown; intensity?: unknown; values?: unknown; phaser?: unknown };
+  const r = (raw ?? {}) as { fixtures?: unknown; presets?: unknown; intensity?: unknown; values?: unknown; phaser?: unknown; releases?: unknown };
   let fixtures: string | undefined;
   if (r.fixtures !== undefined) fixtures = v.check(() => fixtureSelection(`${path}.fixtures`, r.fixtures));
   else if (defaultFixtures) fixtures = defaultFixtures;
@@ -203,24 +223,41 @@ function validateLook(v: Validator, raw: unknown, path: string, defaultFixtures:
     else if (r.values.length > MAX_ATTRIBUTES) v.fail(`${path}: at most ${MAX_ATTRIBUTES} values per look`);
     else
       r.values.forEach((e, i) => {
-        const x = (e ?? {}) as { attribute?: unknown; value?: unknown; unit?: unknown };
+        const x = (e ?? {}) as Record<string, unknown>;
         const attribute = v.check(() => attributeName(`${path}.values[${i}].attribute`, x.attribute));
+        const layer = v.check(() => oneOf(`${path}.values[${i}].layer`, x.layer, ["absolute", "relative"] as const, { optional: true }));
         const unit = v.check(() => oneOf(`${path}.values[${i}].unit`, x.unit, ATTRIBUTE_UNIT_NAMES, { optional: true }));
         const rule = unit ? ATTRIBUTE_UNITS[unit] : { min: undefined, max: undefined, integer: false };
-        const value = v.check(() => finiteNumber(`${path}.values[${i}].value`, x.value, { min: rule.min, max: rule.max, integer: rule.integer }));
-        if (value !== undefined && value < 0 && !(unit === "physical" || unit === "natural")) v.fail(`${path}.values[${i}].value must not be negative for unit ${unit ?? "readout"}`);
-        if (attribute && values.some((y) => y.attribute.toLowerCase() === attribute.toLowerCase())) v.fail(`${path}: attribute ${attribute} appears twice`);
-        if (attribute && intensity !== undefined && attribute.toLowerCase() === "dimmer") v.fail(`${path}: Dimmer and intensity are the same attribute: give one of them`);
-        if (attribute && value !== undefined) values.push({ attribute, value, ...(unit ? { unit } : {}) });
+        const timing = parseAttributeTiming(v, x, `${path}.values[${i}].`);
+        if (layer === "relative" && unit !== "percent" && unit !== "physical") v.fail(`${path}.values[${i}]: relative values require explicit percent or physical units for verified read-back`);
+        if (layer === "relative" && (timing.fade !== undefined || timing.delay !== undefined)) v.fail(`${path}.values[${i}]: individual fade and delay require an absolute value`);
+        const value = v.check(() => finiteNumber(`${path}.values[${i}].value`, x.value, { min: layer === "relative" && unit === "percent" ? -100 : rule.min, max: rule.max, integer: rule.integer }));
+        if (value !== undefined && value < 0 && layer !== "relative" && !(unit === "physical" || unit === "natural")) v.fail(`${path}.values[${i}].value must not be negative for unit ${unit ?? "readout"}`);
+        if (attribute && values.some((y) => y.attribute.toLowerCase() === attribute.toLowerCase() && (y.layer ?? "absolute") === (layer ?? "absolute"))) v.fail(`${path}: attribute ${attribute} appears twice in the ${layer ?? "absolute"} layer`);
+        if (attribute && intensity !== undefined && attribute.toLowerCase() === "dimmer" && layer !== "relative") v.fail(`${path}: Dimmer and intensity are the same attribute: give one of them`);
+        if (attribute && value !== undefined) values.push({ attribute, value, ...(unit ? { unit } : {}), ...(layer ? { layer } : {}), ...timing });
       });
   }
+  const releases: ReleaseSpec[] = [];
+  if (r.releases !== undefined) {
+    if (!Array.isArray(r.releases) || !r.releases.length || r.releases.length > MAX_ATTRIBUTES) v.fail(`${path}.releases must be a non-empty attribute list, at most ${MAX_ATTRIBUTES}`);
+    else for (const [i, input] of r.releases.entries()) {
+      const release = (typeof input === "string" ? { attribute: input } : input ?? {}) as Record<string, unknown>;
+      const attr = v.check(() => attributeName(`${path}.releases[${i}].attribute`, release.attribute));
+      const layer = v.check(() => oneOf(`${path}.releases[${i}].layer`, release.layer ?? "absolute", ["absolute", "relative"] as const));
+      if (attr && releases.some((a) => a.attribute.toLowerCase() === attr.toLowerCase() && a.layer === layer)) v.fail(`${path}: duplicate release ${attr} ${layer}`);
+      else if (attr && layer) releases.push({ attribute: attr, layer });
+      if (attr && (values.some((x) => x.attribute.toLowerCase() === attr.toLowerCase() && (x.layer ?? "absolute") === layer) || (intensity !== undefined && attr.toLowerCase() === "dimmer" && layer === "absolute"))) v.fail(`${path}: ${attr} ${layer} has both a release and a value`);
+    }
+  }
   const phaser = validateLookPhaser(v, r.phaser, `${path}.phaser`);
+  if (phaser && releases.some((r) => effectAttributes(phaser).some((a) => a.toLowerCase() === r.attribute.toLowerCase()))) v.fail(`${path}: an attribute cannot have both a phaser and release in one look`);
   if (phaser) for (const a of Object.keys(phaser.steps.flatMap((st) => Object.keys(st.values)).reduce((m, k) => ({ ...m, [k]: 1 }), {} as Record<string, number>))) {
     if (values.some((x) => x.attribute.toLowerCase() === a.toLowerCase()) || (a.toLowerCase() === "dimmer" && intensity !== undefined)) v.fail(`${path}: ${a} is both a static value and a phaser attribute: give it once`);
   }
-  if (presets.length === 0 && intensity === undefined && values.length === 0 && !phaser && v.ok) v.fail(`${path}: give presets, intensity, values and/or a phaser`);
+  if (presets.length === 0 && intensity === undefined && values.length === 0 && !phaser && !releases.length && v.ok) v.fail(`${path}: give presets, intensity, values, releases and/or a phaser`);
   if (!fixtures) return undefined;
-  return { fixtures, presets, intensity, values, ...(phaser ? { phaser } : {}) };
+  return { fixtures, presets, intensity, values, ...(releases.length ? { releases } : {}), ...(phaser ? { phaser } : {}) };
 }
 
 /**
@@ -228,7 +265,12 @@ function validateLook(v: Validator, raw: unknown, path: string, defaultFixtures:
  * `allowEmpty`: a cue with a command may have no look at all (a command-only cue, stored from an empty programmer).
  */
 export function validateLooks(v: Validator, raw: Record<string, unknown>, path: string, defaultFixtures: string | undefined, allowEmpty = false): LookSpec[] {
-  const shorthand = ["presets", "intensity", "values", "phaser"].some((k) => raw[k] !== undefined) || (raw.fixtures !== undefined && !allowEmpty);
+  const shorthand = ["presets", "intensity", "values", "phaser", "releases"].some((k) => raw[k] !== undefined) || (raw.fixtures !== undefined && !allowEmpty);
+  if (raw.hold === true) {
+    if (shorthand || (Array.isArray(raw.looks) && raw.looks.length)) v.fail(`${path}: hold must have no programmer content`);
+    if (raw.looks !== undefined && !Array.isArray(raw.looks)) v.fail(`${path}.looks must be a list`);
+    return [];
+  }
   if (raw.looks !== undefined) {
     if (shorthand) v.fail(`${path}: give looks, or fixtures/presets/intensity/values, not both`);
     if (!Array.isArray(raw.looks) || raw.looks.length === 0) {
@@ -247,11 +289,16 @@ export function validateLooks(v: Validator, raw: Record<string, unknown>, path: 
   return look ? [look] : [];
 }
 
-function validateTrigger(v: Validator, rawTrigger: unknown, rawTime: unknown, path: string, timeFromSaved = false): { trigger?: TriggerKey; time?: number } {
+/**
+ * A trigger and its time. `timeElsewhere`: a Time trigger without a time passes here because the time comes from
+ * somewhere else (gma3_edit_cues restore_times: the saved ones; the call-level default of a cue list: each cue's own,
+ * checked per cue). `hint` names the way to give a missing time.
+ */
+function validateTrigger(v: Validator, rawTrigger: unknown, rawTime: unknown, path: string, timeElsewhere = false, hint = ""): { trigger?: TriggerKey; time?: number } {
   const trigger = v.check(() => oneOf(`${path}trigger`, rawTrigger, TRIGGER_KEYS, { optional: true }));
   const time = v.check(() => timeSeconds(`${path}time`, rawTime, { optional: true }));
   if (time !== undefined && trigger === undefined) v.fail(`${path}time needs a trigger ("time" or "follow")`);
-  if (trigger === "time" && time === undefined && !timeFromSaved) v.fail(`${path}time (seconds) is required for trigger "time" (or restore_times: true to set the saved ones)`);
+  if (trigger === "time" && time === undefined && !timeElsewhere) v.fail(`${path}time (seconds) is required for trigger "time"${hint}`);
   if ((trigger === "go" || trigger === "sound" || trigger === "bpm") && time !== undefined) v.fail(`${path}time is not applicable to trigger "${trigger}"`);
   return { trigger, time };
 }
@@ -265,7 +312,20 @@ function validateTiming(v: Validator, raw: Record<string, unknown>, path: string
   return timing;
 }
 
-function validateCues(v: Validator, raw: unknown, defaultFixtures: string | undefined): CueSpec[] {
+/** The call-level timing and trigger of gma3_store_cues: defaults for every cue. */
+interface CueDefaults {
+  timing: CueSpec["timing"];
+  trigger?: TriggerKey;
+  time?: number;
+}
+
+/**
+ * The cues of a call. A cue's own timing keys and trigger win over the call's defaults: a cue without a trigger takes
+ * the call's trigger and time (its own time, when given, replaces the call's time under that trigger); a cue with its
+ * own trigger takes none of the call's time (live 2026-11-03: the call-level trigger used to reach only the presets form, so
+ * `trigger: "follow", time: 0.25` for the whole call left every cue on Go).
+ */
+export function validateCues(v: Validator, raw: unknown, defaultFixtures: string | undefined, defaults: CueDefaults = { timing: {} }): CueSpec[] {
   if (!Array.isArray(raw) || raw.length === 0) {
     v.fail("cues must be a non-empty list");
     return [];
@@ -282,9 +342,9 @@ function validateCues(v: Validator, raw: unknown, defaultFixtures: string | unde
     const name = v.check(() => objectName(`${path}.name`, r.name, { optional: true }));
     const command = v.check(() => cueCommand(`${path}.command`, r.command));
     const note = v.check(() => noteText(`${path}.note`, r.note, { optional: true }));
-    const looks = validateLooks(v, r, path, defaultFixtures, command !== undefined);
-    const timing = validateTiming(v, r, `${path}.`);
-    const trig = validateTrigger(v, r.trigger, r.time, `${path}.`);
+    const looks = validateLooks(v, r, path, defaultFixtures, command !== undefined || r.hold === true);
+    const timing = { ...defaults.timing, ...validateTiming(v, r, `${path}.`) };
+    const trig = r.trigger !== undefined ? validateTrigger(v, r.trigger, r.time, `${path}.`) : validateTrigger(v, defaults.trigger, r.time ?? defaults.time, `${path}.`, false, defaults.trigger === "time" ? " (the call's trigger; give time for the call or for this cue)" : "");
     if (cue && out.some((x) => Number(x.cue) === Number(cue))) v.fail(`${path}: cue ${cue} appears twice`);
     if (cue) out.push({ cue, name, looks, ...(command !== undefined ? { command } : {}), ...(note !== undefined ? { note } : {}), timing, ...trig });
   });
@@ -316,11 +376,11 @@ async function readCueList(bridge: Gma3Bridge, sequence: number, t: number): Pro
 }
 
 /**
- * Environment and value count of the current programmer (one short read). `values` is null unless the scan was
+ * Environment and value count of the current programmer (one complete scan). `values` is null unless the scan was
  * complete and reported a count: an incomplete scan says nothing about whether the programmer is empty.
  */
 async function environmentOf(bridge: Gma3Bridge, t: number): Promise<{ environment: string | null; values: number | null }> {
-  const r = (await bridge.request("programmer", { scope: "all", limit: 1 }, t)) as { environment?: string; total?: number; coverage?: { complete?: boolean }; fixturesTruncated?: boolean };
+  const r = (await bridge.request("programmer", { scope: "all", limit: 1, maxChannels: PROGRAMMER_MAX_CHANNELS }, t)) as { environment?: string; total?: number; coverage?: { complete?: boolean }; fixturesTruncated?: boolean };
   const valid = r.coverage?.complete === true && r.fixturesTruncated !== true && typeof r.total === "number";
   return { environment: typeof r.environment === "string" ? r.environment : null, values: valid ? (r.total as number) : null };
 }
@@ -335,7 +395,7 @@ const failedRead = (name: string, error: string, detail?: unknown): StepResult =
 
 type StoreMode = "create" | "merge" | "overwrite";
 
-interface Batch {
+interface Batch extends StoreTrackingOptions {
   sequence: number;
   sequenceName?: string;
   /**
@@ -348,6 +408,8 @@ interface Batch {
   verify: boolean;
   /** SU-14: delete every existing cue first (the sequence object, and so its executor assignments, stay). */
   replace?: boolean;
+  storeScope?: { fixtures: string; attributes: string[] };
+  verifyStored?: (cue: CueSpec) => Promise<Verification>;
 }
 
 type CueStatus = "stored" | "failed" | "unknown" | "not_attempted";
@@ -376,8 +438,8 @@ interface BatchResult {
   verification: Verification;
 }
 
-function storeCommand(sequence: number, cue: string, mode: StoreMode): string {
-  return `Store ${cueRef(sequence, cue)}${mode === "merge" ? " /Merge" : mode === "overwrite" ? " /Overwrite" : ""} /NoConfirmation`;
+function storeCommand(sequence: number, cue: CueSpec, mode: StoreMode, tracking: StoreTrackingOptions, filter: string): string {
+  return `Store ${cueRef(sequence, cue.cue, cue.part)}${filter}${mode === "merge" ? " /Merge" : mode === "overwrite" ? " /Overwrite" : ""}${storeTrackingFlags(tracking)} /NoConfirmation`;
 }
 
 /** The sequence's Name write, judged by its read-back (#102): "<name>#<n>" counts as applied with allowSuffix. */
@@ -411,13 +473,14 @@ function setStep(bridge: Gma3Bridge, name: string, ref: string, property: string
  * gma3_build_phaser checks it). Other attributes of the cue (a look's intensity or values) are not judged here; the
  * activation-group siblings that came with the phaser (same step count) are.
  */
-/** A look's fixtures (top level, by their root FID) and which of them have every phaser attribute on themselves or a cell. */
-async function phaserCoverage(bridge: Gma3Bridge, fixtures: string, attrs: string[], t: number): Promise<{ supported: Map<number, string>; unsupported: string[]; complete: boolean }> {
-  const scan = (await bridge.request("programmer", { scope: "fixtures", fixtures, limit: 1, maxChannels: 50000 }, t)) as {
-    scannedFixtures?: Array<{ subfixtureIndex?: number; fid?: string | null; name?: string | null; rootFid?: string | null; attributes?: string[] }>;
-    coverage?: { complete?: boolean };
-    fixturesTruncated?: boolean;
-  };
+interface PhaserCoverageScan {
+  scannedFixtures?: Array<{ subfixtureIndex?: number; fid?: string | null; name?: string | null; rootFid?: string | null; attributes?: string[] }>;
+  coverage?: { complete?: boolean };
+  fixturesTruncated?: boolean;
+}
+
+/** Derive support from the very snapshot whose values will be judged, including compound cells. */
+function phaserCoverageOf(scan: PhaserCoverageScan, attrs: string[]): { supported: Map<number, string>; unsupported: string[]; complete: boolean } {
   const supported = new Map<number, string>();
   const roots = new Map<string, boolean>();
   for (const e of scan.scannedFixtures ?? []) {
@@ -426,21 +489,27 @@ async function phaserCoverage(bridge: Gma3Bridge, fixtures: string, attrs: strin
     roots.set(root, (roots.get(root) ?? false) || has);
     if (has && typeof e.subfixtureIndex === "number") supported.set(e.subfixtureIndex, e.fid && e.fid !== "None" ? e.fid : e.name ?? String(e.subfixtureIndex));
   }
-  return { supported, unsupported: [...roots].filter(([, ok]) => !ok).map(([r]) => r), complete: scan.coverage?.complete !== false && scan.fixturesTruncated !== true };
+  return { supported, unsupported: [...roots].filter(([, ok]) => !ok).map(([r]) => r), complete: Array.isArray(scan.scannedFixtures) && scan.coverage?.complete === true && scan.fixturesTruncated !== true };
+}
+
+/** A look's fixtures (top level, by their root FID) and which have the phaser attributes on themselves or a cell. */
+async function phaserCoverage(bridge: Gma3Bridge, fixtures: string, attrs: string[], t: number): Promise<ReturnType<typeof phaserCoverageOf>> {
+  const scan = await bridge.request<PhaserCoverageScan>("programmer", { scope: "fixtures", fixtures, attributes: attrs, limit: 1, maxChannels: 50000 }, t);
+  return phaserCoverageOf(scan, attrs);
 }
 
 async function checkLookPhaser(bridge: Gma3Bridge, fixtures: string, effect: Effect, t: number): Promise<Verification> {
   const checked = `the phaser on ${fixtures} in the programmer (steps, step timing, phaser layers, phase per fixture)`;
   try {
-    const scan = (await bridge.request("programmer", { scope: "fixtures", fixtures, limit: 5000, maxChannels: 50000 }, t)) as {
+    const scan = (await bridge.request("programmer", { scope: "fixtures", fixtures, limit: 5000, maxChannels: 50000 }, t)) as PhaserCoverageScan & {
+      total?: number;
       rows?: Array<Record<string, unknown> & { subfixtureIndex: number; attribute?: string; stepCount?: number }>;
-      scannedFixtures?: Array<{ subfixtureIndex?: number; fid?: string | null; name?: string | null; attributes?: string[] }>;
-      coverage?: { complete?: boolean };
     };
-    if (scan.coverage?.complete === false) return unavailable("the programmer scan of the look's fixtures was incomplete", checked);
     const attrs = effectAttributes(effect);
     // Every fixture of the look must be covered (review round 1): one without the attributes is a mismatch, not left out.
-    const cov = await phaserCoverage(bridge, fixtures, attrs, t);
+    const cov = phaserCoverageOf(scan, attrs);
+    if (!cov.complete) return unavailable("the programmer scan of the look's fixtures was incomplete or its fixture metadata was truncated", checked);
+    if (typeof scan.total === "number" && scan.total > (scan.rows?.length ?? 0)) return unavailable("the programmer scan of the look's fixtures returned only part of its rows", checked);
     const scope = cov.supported;
     if (cov.unsupported.length) return { status: "mismatched", checked, detail: `fixture(s) ${cov.unsupported.join(", ")} of ${fixtures} have no ${attrs.join(", ")}, so they hold no phaser` };
     if (scope.size === 0) return { status: "mismatched", checked, detail: `no fixture of ${fixtures} has ${attrs.join(", ")}` };
@@ -457,7 +526,7 @@ async function checkLookPhaser(bridge: Gma3Bridge, fixtures: string, effect: Eff
 /** The expectations of a look's attribute values (intensity is Dimmer in percent), for verifyProgrammer. */
 const expectationsOf = (look: LookSpec): Expectation[] => [
   ...(look.intensity !== undefined ? [{ attribute: "Dimmer", value: look.intensity, unit: "percent" as const }] : []),
-  ...look.values.map((x) => ({ attribute: x.attribute, value: x.value, unit: x.unit ?? ("readout" as const) })),
+  ...look.values.filter((x) => x.layer !== "relative").map(({ layer: _layer, unit, ...value }) => ({ ...value, unit: unit ?? ("readout" as const) })),
 ];
 
 const worst = (list: Verification[], checked: string): Verification => {
@@ -522,6 +591,9 @@ export async function buildInPreview(ctx: ToolContext, o: { items: PreviewItem[]
   const reports: PreviewItemReport[] = o.items.map(() => ({ status: "not_attempted", verification: unavailable("not attempted"), steps: [], storeSucceeded: false }));
   const presets = new Map<string, { addrNative: string; label: string }>();
   let normalBefore: ProgrammerSnapshot | undefined;
+  // Only environment guards use this cheap fresh reader. Empty-Preview proof and complete
+  // Normal snapshots still scan the programmer. A failed capability falls back for this call.
+  const readEnvironment = createEnvironmentReader(bridge, t, async () => (await environmentOf(bridge, t)).environment, (warning) => warnings.push(warning));
 
   // 1. Inspection: the caller's checks, every preset, attribute and fixture expression, the Normal programmer.
   const allLooks = o.items.flatMap((c) => c.looks);
@@ -549,7 +621,7 @@ export async function buildInPreview(ctx: ToolContext, o: { items: PreviewItem[]
     {
       name: "check_attributes",
       run: async () => {
-        const names = new Set(allLooks.flatMap((l) => l.values.map((x) => x.attribute)));
+        const names = new Set(allLooks.flatMap((l) => [...l.values.map((x) => x.attribute), ...(l.releases ?? []).map((r) => r.attribute)]));
         for (const a of names) {
           const e = await exists(bridge, `Attribute "${a}"`);
           if (e.exists === false) return failedRead("check_attributes", `attribute ${JSON.stringify(a)} is not defined in this show; nothing was sent`);
@@ -575,8 +647,12 @@ export async function buildInPreview(ctx: ToolContext, o: { items: PreviewItem[]
       name: "check_phaser_fixtures",
       run: async () => {
         try {
+          const checked = new Set<string>();
           for (const look of allLooks.filter((l) => l.phaser)) {
             const attrs = effectAttributes(look.phaser as Effect);
+            const key = JSON.stringify([look.fixtures, [...attrs].sort()]);
+            if (checked.has(key)) continue;
+            checked.add(key);
             const cov = await phaserCoverage(bridge, look.fixtures, attrs, t);
             if (!cov.complete) return failedRead("check_phaser_fixtures", `the fixtures of ${look.fixtures} could not all be read; nothing was sent`);
             if (cov.unsupported.length) return failedRead("check_phaser_fixtures", `fixture(s) ${cov.unsupported.join(", ")} of ${look.fixtures} have no ${attrs.join(", ")} (nor any cell with them), so the phaser would leave them out; nothing was sent`, { unsupported: cov.unsupported });
@@ -591,7 +667,7 @@ export async function buildInPreview(ctx: ToolContext, o: { items: PreviewItem[]
       name: "read_normal_programmer",
       run: async () => {
         try {
-          const env = await environmentOf(bridge, t);
+          const env = await readEnvironment();
           if (env.environment !== "Normal") return failedRead("read_normal_programmer", `the console is in the ${env.environment ?? "unknown"} environment; the ${o.noun} are built in Preview and the build must start from Normal (gma3_phaser_release leaves Preview)`);
           normalBefore = await snapshotProgrammer(bridge);
           if (!normalBefore.complete) return failedRead("read_normal_programmer", `the Normal programmer could not be read completely (${normalBefore.reason}), so it could not be checked afterwards; nothing was sent`);
@@ -604,6 +680,7 @@ export async function buildInPreview(ctx: ToolContext, o: { items: PreviewItem[]
   ]);
   const steps: StepResult[] = [...inspect.steps];
   if (inspect.outcome !== "succeeded") return { steps, readBack, warnings, items: reports, sent: false, backInNormal: true, normalProgrammer: "not_entered" };
+  const seriesContext = allLooks.some(canGroupLook) ? await previewSeriesContext(bridge, t) : undefined;
 
   // 2. Build in Preview.
   let entered = false;
@@ -661,9 +738,9 @@ export async function buildInPreview(ctx: ToolContext, o: { items: PreviewItem[]
           name: `${pre}confirm_preview`,
           run: async () => {
             try {
-              const env = await environmentOf(bridge, t);
-              if (env.environment !== "Preview") return failedRead(`${pre}confirm_preview`, `the console left the Preview environment (now ${env.environment ?? "unknown"}); nothing more was built`);
-              return asRead({ name: `${pre}confirm_preview`, status: "succeeded", op: "programmer" });
+              const env = await readEnvironment();
+              if (env.environment !== "Preview") return { ...failedRead(`${pre}confirm_preview`, `the console left the Preview environment (now ${env.environment ?? "unknown"}); nothing more was built`), op: env.op };
+              return asRead({ name: `${pre}confirm_preview`, status: "succeeded", op: env.op });
             } catch (err) {
               return asRead(stepFromError(`${pre}confirm_preview`, err, { op: "programmer" }));
             }
@@ -673,8 +750,23 @@ export async function buildInPreview(ctx: ToolContext, o: { items: PreviewItem[]
       }
       item.looks.forEach((look, j) => {
         const lp = `${pre}look ${j + 1} `;
-        plan.push({ name: `${lp}clear_selection`, run: () => commandStep(bridge, `${lp}clear_selection`, "ClearSelection", t) });
-        plan.push({ name: `${lp}select`, run: () => commandStep(bridge, `${lp}select`, look.fixtures, t) });
+        const grouped = seriesContext !== undefined && canGroupLook(look);
+        const valueCommands = [
+          ...(look.intensity === undefined ? [] : [{ name: "intensity", command: `At ${formatValue(look.intensity)}` }]),
+          ...look.values.map(value => ({
+            name: value.attribute + (value.layer === "relative" ? " relative" : ""),
+            command: attributeCommand(value.attribute, value.value, value.unit ? ATTRIBUTE_UNITS[value.unit].keyword : undefined, value)
+              .replace(" At Absolute", value.layer === "relative" ? " At Relative" : " At Absolute"),
+          })),
+        ];
+        if (grouped) {
+          const name = `${lp}stage static values`;
+          plan.push({ name, run: () => previewSeriesStep(bridge, name, seriesContext,
+            ["ClearSelection", look.fixtures, ...valueCommands.map(value => value.command)], t) });
+        } else {
+          plan.push({ name: `${lp}clear_selection`, run: () => commandStep(bridge, `${lp}clear_selection`, "ClearSelection", t) });
+          plan.push({ name: `${lp}select`, run: () => commandStep(bridge, `${lp}select`, look.fixtures, t) });
+        }
         const entry: NonNullable<PreviewItemReport["looks"]>[number] = { fixtures: look.fixtures, presets: look.presets.map((p) => p.ref), verification: o.verify ? "matched" : "not_requested" };
         report.looks!.push(entry);
         const parts: Verification[] = [];
@@ -689,18 +781,40 @@ export async function buildInPreview(ctx: ToolContext, o: { items: PreviewItem[]
             const all = worst(parts, `look ${j + 1} on ${look.fixtures} in the programmer`);
             entry.verification = all.status;
             if (all.detail) entry.detail = all.detail;
-            if (v.status === "mismatched") return { name, kind: "read", status: "failed", op: "programmer", error: `${what} did not apply, so ${pre.replace(/: $/, "")} was not stored: ${v.detail}` };
+            if (v.status !== "matched") return { name, kind: "read", status: "failed", op: "programmer", error: `${what} ${v.status === "mismatched" ? "did not apply" : "could not be verified"}, so ${pre.replace(/: $/, "")} was not stored: ${v.detail ?? v.status}` };
             return asRead({ name, status: "succeeded", op: "programmer", detail: { verification: v.status } });
           },
         });
+        const exp = expectationsOf(look);
+        // Earlier recalls must be checked immediately: the next preset can overwrite their links. The final
+        // preset's links survive static writes, so that link and those values can share one immutable snapshot.
+        const sharedPreset = o.verify && exp.length ? look.presets.at(-1) : undefined;
+        let observed: ProgrammerObservation | undefined;
         for (const p of look.presets) {
           plan.push({ name: `${lp}apply ${p.ref}`, run: () => commandStep(bridge, `${lp}apply ${p.ref}`, `At ${p.ref}`, t) });
-          if (o.verify) plan.push(check(`${lp}check ${p.ref}`, p.ref, async () => (await verifyPresetLink(bridge, presets.get(p.ref) as { addrNative: string; label: string }, readBack)).verification));
+          if (o.verify && p !== sharedPreset) plan.push(check(`${lp}check ${p.ref}`, p.ref, async () => (await verifyPresetLink(bridge, presets.get(p.ref) as { addrNative: string; label: string }, readBack)).verification));
         }
-        if (look.intensity !== undefined) plan.push({ name: `${lp}intensity`, run: () => commandStep(bridge, `${lp}intensity`, `At ${formatValue(look.intensity as number)}`, t) });
-        look.values.forEach((x) => plan.push({ name: `${lp}${x.attribute}`, run: () => commandStep(bridge, `${lp}${x.attribute}`, attributeCommand(x.attribute, x.value, x.unit ? ATTRIBUTE_UNITS[x.unit].keyword : undefined), t) }));
-        const exp = expectationsOf(look);
-        if (o.verify && exp.length) plan.push(check(`${lp}check values`, "the look's values", async () => (await verifyProgrammer(bridge, exp, readBack, warnings)).verification));
+        if (!grouped) for (const value of valueCommands) {
+          const name = `${lp}${value.name}`;
+          plan.push({ name, run: () => commandStep(bridge, name, value.command, t) });
+        }
+        if (sharedPreset) {
+          plan.push({ name: `${lp}capture final values`, run: async () => {
+            try {
+              observed = await captureProgrammer(bridge, { scope: "selection" });
+              if (!observed.result || observed.result.coverage?.complete !== true || observed.result.fixturesTruncated) return failedRead(`${lp}capture final values`, observed.reason ?? "the final programmer snapshot is incomplete; the cue was not stored");
+              return asRead({ name: `${lp}capture final values`, status: "succeeded", op: "programmer", detail: { sharedChecks: ["final preset link", "static values"] } });
+            } catch (err) { return asRead(stepFromError(`${lp}capture final values`, err, { op: "programmer" })); }
+          } });
+          plan.push(check(`${lp}check ${sharedPreset.ref}`, sharedPreset.ref, async () => (await verifyPresetLink(bridge, presets.get(sharedPreset.ref) as { addrNative: string; label: string }, readBack, observed)).verification));
+        }
+        if (o.verify && exp.length) plan.push(check(`${lp}check values`, "the look's values", async () => (await verifyProgrammer(bridge, exp, readBack, warnings, undefined, observed)).verification));
+        if (o.verify) for (const unit of ["percent", "physical"] as const) {
+          const relatives = look.values.filter((x) => x.layer === "relative" && x.unit === unit);
+          if (relatives.length) plan.push(check(`${lp}check relative ${unit}`, "the look's relative values", () => checkLookPhaser(bridge, look.fixtures, { steps: [{ values: Object.fromEntries(relatives.map((x) => [x.attribute, { relative: x.value }])) }], phaser: {}, unit }, t)));
+        }
+        for (const release of look.releases ?? []) plan.push({ name: `${lp}release ${release.attribute} ${release.layer}`, run: () => commandStep(bridge, `${lp}release ${release.attribute} ${release.layer}`, `Attribute "${release.attribute}" At ${release.layer === "absolute" ? "Absolute" : "Relative"} Release`, t) });
+        if (o.verify && look.releases?.length) plan.push(check(`${lp}check release`, "the look's release markers", () => verifyReleases(bridge, look.fixtures, look.releases!, t)));
         if (look.phaser) {
           const effect = look.phaser;
           const commands = effectCommands(effect);
@@ -734,12 +848,15 @@ export async function buildInPreview(ctx: ToolContext, o: { items: PreviewItem[]
     // Leave Preview whatever happened, once it may have been entered.
     if (entered) {
       let env: string | null | undefined;
+      let envOp = "programmer";
       try {
-        env = (await environmentOf(bridge, t)).environment;
+        const state = await readEnvironment();
+        env = state.environment;
+        envOp = state.op;
       } catch {
         env = undefined;
       }
-      steps.push(asRead({ name: "confirm_preview_end", status: env === undefined ? "unknown" : "succeeded", op: "programmer", detail: { environment: env ?? null }, ...(env === undefined ? { error: "the environment could not be read, so nothing was cleared; run gma3_phaser_release" } : {}) }));
+      steps.push(asRead({ name: "confirm_preview_end", status: env === undefined ? "unknown" : "succeeded", op: envOp, detail: { environment: env ?? null }, ...(env === undefined ? { error: "the environment could not be read, so nothing was cleared; run gma3_phaser_release" } : {}) }));
       if (env === "Preview") {
         // A Preview programmer that was not empty before the build is someone else's: it is left as it was.
         if (building) steps.push(await commandStep(bridge, "release_preview_programmer", "ClearAll", t));
@@ -753,7 +870,7 @@ export async function buildInPreview(ctx: ToolContext, o: { items: PreviewItem[]
   let backInNormal = !entered;
   if (entered && normalBefore) {
     try {
-      const env = await environmentOf(bridge, t);
+      const env = await readEnvironment();
       backInNormal = env.environment === "Normal" && cleanupSteps.every((x) => x.status === "succeeded");
       const after = await snapshotProgrammer(bridge);
       if (env.environment === "Normal" && after.complete) normalProgrammer = sameProgrammer(normalBefore, after) ? "untouched" : "changed";
@@ -773,6 +890,14 @@ export async function buildCueBatch(ctx: ToolContext, b: Batch): Promise<BatchRe
   const { bridge } = ctx;
   const t = ctx.requestTimeoutMs;
   let existing: CueListEntry[] | null = null;
+  let filter = "";
+  if (b.storeScope) {
+    const fixtures = fixtureRange("store scope fixtures", b.storeScope.fixtures);
+    if (!b.storeScope.attributes.length || b.storeScope.attributes.length > MAX_ATTRIBUTES) throw new ValidationError("Store scope must have a bounded nonempty attribute list");
+    const attributes = b.storeScope.attributes.map(value => `"${attributeName("store scope attribute", value)}"`);
+    filter = ` If ${fixtures} Attribute ${attributes.join(" + ")} EndIf`;
+  }
+  const nativeChecks = new Map<string, Verification>();
   const readSequence = {
     name: "read_sequence",
     run: async (): Promise<StepResult> => {
@@ -790,15 +915,27 @@ export async function buildCueBatch(ctx: ToolContext, b: Batch): Promise<BatchRe
   };
   const items: PreviewItem[] = b.cues.map((c) => {
     const pre = `cue ${c.cue}: `;
-    const part0 = cueRef(b.sequence, c.cue, 0);
+    const part = cueRef(b.sequence, c.cue, c.part ?? 0);
     const cueObj = cueRef(b.sequence, c.cue);
-    const store: Array<{ name: string; run: StepFn }> = [{ name: `${pre}store`, run: () => commandStep(bridge, `${pre}store`, storeCommand(b.sequence, c.cue, b.mode), t) }];
-    if (c.name !== undefined) store.push(setStep(bridge, `${pre}name`, part0, "Name", c.name, t));
-    for (const [k, val] of Object.entries(c.timing) as Array<[keyof CueSpec["timing"], number]>) store.push(setStep(bridge, `${pre}${k}`, part0, TIMING_PROPS[k], val, t));
+    const store: Array<{ name: string; run: StepFn }> = [{ name: `${pre}store`, run: () => commandStep(bridge, `${pre}store`, storeCommand(b.sequence, c, b.mode, b, filter), t) }];
+    if (c.name !== undefined) store.push(setStep(bridge, `${pre}name`, part, "Name", c.name, t));
+    for (const [k, val] of Object.entries(c.timing) as Array<[keyof CueSpec["timing"], number]>) store.push(setStep(bridge, `${pre}${k}`, part, TIMING_PROPS[k], val, t));
     if (c.trigger) store.push(setStep(bridge, `${pre}trigger`, cueObj, "TrigType", TRIGGERS[c.trigger], t));
     if (c.time !== undefined) store.push(setStep(bridge, `${pre}trigger_time`, cueObj, "TrigTime", c.time, t));
-    if (c.command !== undefined) store.push(setStep(bridge, `${pre}command`, part0, "Command", c.command, t));
+    if (c.command !== undefined) store.push(setStep(bridge, `${pre}command`, part, "Command", c.command, t));
     if (c.note !== undefined) store.push(setStep(bridge, `${pre}note`, cueObj, "Note", c.note, t));
+    const verifyStored = b.verifyStored;
+    if (verifyStored) {
+      const name = `${pre}verify_native_store`;
+      store.push({ name, run: async () => {
+        let verification: Verification;
+        try { verification = await verifyStored(c); }
+        catch (err) { verification = unavailable(err instanceof Error ? err.message : String(err)); }
+        nativeChecks.set(c.cue, verification);
+        return asRead({ name, op: "cue.content", status: verification.status === "matched" ? "succeeded" : "failed", detail: verification,
+          ...(verification.status !== "matched" ? { error: verification.detail ?? "Native Store readback did not match" } : {}) });
+      } });
+    }
     return { prefix: pre, looks: c.looks, store };
   });
   // replace: every existing cue is deleted once everything was checked (Delete ... Cue 1 Thru keeps the sequence object,
@@ -839,7 +976,8 @@ export async function buildCueBatch(ctx: ToolContext, b: Batch): Promise<BatchRe
   const { steps, readBack, warnings, normalProgrammer } = built;
   const reports: CueReport[] = b.cues.map((c, i) => {
     const r = built.items[i];
-    return { cue: c.cue, status: r.status, verification: r.verification, ...(r.looks ? { looks: r.looks } : {}), ...(r.error ? { error: r.error } : {}) };
+    const verified = nativeChecks.get(c.cue);
+    return { cue: c.cue, status: r.status, verification: verified ? worst([r.verification, verified], "Preview looks and native Store readback") : r.verification, ...(r.looks ? { looks: r.looks } : {}), ...(r.error ? { error: r.error } : {}) };
   });
   const sequenceExisted = existing !== null;
   if (!built.sent) return { steps, readBack, warnings, cues: reports, sent: false, backInNormal: true, normalProgrammer: "not_entered", sequenceExisted, verification: unavailable("nothing was sent") };
@@ -871,7 +1009,7 @@ export async function buildCueBatch(ctx: ToolContext, b: Batch): Promise<BatchRe
           r.name = typeof cf.Name === "string" ? cf.Name : null;
           let actual: Record<string, unknown> = { ...cf };
           if (Object.keys(timingExpected).length) {
-            const pr = (await bridge.request("objects", { ref: cueRef(b.sequence, c.cue, 0), fields: Object.keys(timingExpected), limit: 1 }, t)) as { items?: Array<{ fields?: Record<string, unknown> }> };
+            const pr = (await bridge.request("objects", { ref: cueRef(b.sequence, c.cue, c.part ?? 0), fields: Object.keys(timingExpected), limit: 1 }, t)) as { items?: Array<{ fields?: Record<string, unknown> }> };
             actual = { ...actual, ...(pr.items?.[0]?.fields ?? {}) };
           }
           props = compareFields(checked, { ...expected, ...timingExpected }, actual, { normalize: TIME_NORMALIZERS });
@@ -898,7 +1036,7 @@ export async function buildCueBatch(ctx: ToolContext, b: Batch): Promise<BatchRe
       ? unavailable("no cue was stored")
       : worst(
           [...attempted.map((r) => ({ ...r.verification, detail: r.verification.detail ? `cue ${r.cue}: ${r.verification.detail}` : undefined })), ...(normalProgrammer === "changed" ? [{ status: "mismatched" as const, detail: "the Normal programmer changed during the build" }] : [])],
-          `${attempted.length} cue(s): each look in the Preview programmer before its store, then the cue's existence, name, timing and trigger`,
+          `${attempted.length} cue(s): each look in the Preview programmer before its store, then the cue's existence, its name, and the timing, trigger, command and note it was given`,
         );
   return { steps, readBack, warnings, cues: reports, sent: true, backInNormal: built.backInNormal, normalProgrammer, sequenceExisted, verification: overall };
 }
@@ -1028,7 +1166,7 @@ async function observeChase(
 const EXCLUSIVE_REASON =
   "exclusive must be true: the cues are built in the console's Preview environment (its own programmer and selection; the operator's Normal programmer and the output are not touched), and nobody else may use the console while the build runs";
 
-function batchResult(op: string, target: Record<string, unknown>, r: BatchResult, extra: Record<string, unknown>, verification?: Verification): OperationResult {
+export function batchResult(op: string, target: Record<string, unknown>, r: BatchResult, extra: Record<string, unknown>, verification?: Verification): OperationResult {
   const result = buildResult({
     operation: op,
     target,
@@ -1263,6 +1401,7 @@ export async function storeCues(ctx: ToolContext, raw: Record<string, unknown>, 
   const sequence = v.check(() => objectNumber("sequence", raw.sequence));
   const replace = raw.replace === true;
   const mode = replace && raw.mode === undefined ? "create" : v.check(() => oneOf("mode", raw.mode, ["create", "merge", "overwrite"] as const));
+  const tracking = validateStoreTrackingOptions(v, raw);
   if (replace && mode !== "create") v.fail("replace rebuilds the sequence from its cues: mode is create (or leave it out)");
   const sequenceName = v.check(() => objectName("sequence_name", raw.sequence_name, { optional: true }));
   const onNameTaken = (raw.on_name_taken ?? "refuse") as OnNameTaken;
@@ -1271,14 +1410,16 @@ export async function storeCues(ctx: ToolContext, raw: Record<string, unknown>, 
   let cues: CueSpec[] = [];
   let range: PresetRange | undefined;
   let firstCue = 1;
+  // The call's timing and trigger: the cues of a preset range (complete here), and the defaults of a cue list (a Time
+  // trigger may leave the time to each cue: the merged cue specs are checked in validateCues; Codex review 1).
+  const timing = validateTiming(v, raw, "");
+  const trig = validateTrigger(v, raw.trigger, raw.time, "", raw.presets === undefined && raw.cues !== undefined);
   if ((raw.cues === undefined) === (raw.presets === undefined)) v.fail("give exactly one of cues (a list) or presets ({pool, from, to}: one cue per preset)");
   else if (raw.presets !== undefined) {
     range = validatePresetRange(v, raw.presets, "presets");
     firstCue = v.check(() => finiteNumber("first_cue", raw.first_cue, { integer: true, min: 1, max: 9999, optional: true })) ?? 1;
     if (!defaultFixtures) v.fail("presets needs fixtures (the target every preset is recalled on)");
-  } else cues = validateCues(v, raw.cues, defaultFixtures);
-  const timing = range ? validateTiming(v, raw, "") : {};
-  const trig = range ? validateTrigger(v, raw.trigger, raw.time, "") : {};
+  } else cues = validateCues(v, raw.cues, defaultFixtures, { timing, ...trig });
   const settings = validateSequenceSettings(v, raw.sequence_settings);
   const protect = raw.protect_running === true;
   if (protect && !settings?.priority) v.fail("protect_running applies to an override: give sequence_settings.priority above ltp");
@@ -1315,7 +1456,7 @@ export async function storeCues(ctx: ToolContext, raw: Record<string, unknown>, 
       if (chk.status !== "succeeded") return buildResult({ operation: op, target, steps: pre, verification: unavailable("nothing was sent") });
     }
     const before = replace ? await assignmentsOf(bridge, sequence, t) : null;
-    const r = await buildCueBatch(ctx, { sequence, sequenceName, nameRule: { allowSuffix: onNameTaken === "allow_suffix" }, mode, cues, verify: raw.verify !== false, replace });
+    const r = await buildCueBatch(ctx, { sequence, sequenceName, nameRule: { allowSuffix: onNameTaken === "allow_suffix" }, mode, cues, verify: raw.verify !== false, replace, ...tracking });
     if (r.sent) {
       // Later sequences of the call check against the name this one was left with (#102; poolnames.ts).
       const nameStep = r.steps.find((s) => s.name === "sequence_name");
@@ -1325,7 +1466,9 @@ export async function storeCues(ctx: ToolContext, raw: Record<string, unknown>, 
     }
     r.steps.unshift(...pre);
     r.warnings.push(...warnings);
-    const extra: Record<string, unknown> = { sequenceExisted: r.sequenceExisted };
+    const trackingRequested = Object.keys(tracking).length > 0;
+    const extra: Record<string, unknown> = { sequenceExisted: r.sequenceExisted,
+      ...(trackingRequested ? { storeOptions: tracking, notVerified: `${NOT_READABLE} ${STORE_TRACKING_LIMITATION}` } : {}) };
     let verification = r.verification;
     if (replace && r.sent) {
       const after = await assignmentsOf(bridge, sequence, t);
@@ -1345,7 +1488,9 @@ export async function storeCues(ctx: ToolContext, raw: Record<string, unknown>, 
       r.steps.push({ name: "sequence_settings", status: "skipped", error: `not attempted: ${reason}` });
       extra.sequenceSettings = { outcome: "not_attempted", reason };
     }
-    return batchResult(op, { sequence, cues: cues.map((c) => c.cue), mode, ...(replace ? { replace } : {}) }, r, extra, verification);
+    const result = batchResult(op, { sequence, cues: cues.map((c) => c.cue), mode, ...(replace ? { replace } : {}) }, r, extra, verification);
+    if (trackingRequested) result.summary += ` ${STORE_TRACKING_LIMITATION}`;
+    return result;
   });
 }
 
@@ -1403,7 +1548,7 @@ export async function editCues(ctx: ToolContext, raw: Record<string, unknown>): 
   const from = v.check(() => cueNumber("from", raw.from, { optional: true }));
   const to = v.check(() => cueNumber("to", raw.to, { optional: true }));
   if (from !== undefined && to !== undefined && Number(from) > Number(to)) v.fail("from must not be after to");
-  const trig = validateTrigger(v, raw.trigger, raw.time, "", raw.restore_times === true);
+  const trig = validateTrigger(v, raw.trigger, raw.time, "", raw.restore_times === true, " (or restore_times: true to set the saved ones)");
   const timing: Partial<Record<TimingKey, number>> = validateTiming(v, raw, "");
   const snap = v.check(() => timeSeconds("snap_delay", raw.snap_delay, { optional: true }));
   if (snap !== undefined) timing.snap_delay = snap;
@@ -1563,12 +1708,26 @@ export async function editCues(ctx: ToolContext, raw: Record<string, unknown>): 
             actual = { ...actual, ...(p.items?.[0]?.fields ?? {}) };
           }
           report.name = actual && typeof actual.Name === "string" ? actual.Name : null;
-          report.verification = actual ? compareFields(checked, { ...expected, ...timingExpected }, actual, { normalize: TIME_NORMALIZERS }) : { status: "mismatched", checked, detail: `cue ${no} no longer exists` };
+          const wanted = { ...expected, ...timingExpected };
+          report.verification = actual ? compareFields(checked, wanted, actual, { normalize: TIME_NORMALIZERS }) : { status: "mismatched", checked, detail: `cue ${no} no longer exists` };
+          if (actual) {
+            // Names and command literals are case-sensitive text, unlike enum display values.
+            const mismatches = ["Name", "Command"].filter(property => wanted[property] !== undefined
+              && (typeof actual[property] !== "string" || actual[property].trim() !== wanted[property]));
+            if (mismatches.length) report.verification = { ...report.verification, status: "mismatched",
+              detail: [report.verification.detail, ...mismatches.map(property => `${property}: expected exact text ${JSON.stringify(wanted[property])}, read ${JSON.stringify(actual[property] ?? null)}`)].filter(Boolean).join("; ") };
+          }
           readBack.push(asRead({ name: `${pre}read_back`, status: "succeeded", op: "objects", detail: { verification: report.verification.status } }));
         } catch (err) {
           const message = err instanceof Error ? err.message : String(err);
           readBack.push(asRead({ name: `${pre}read_back`, status: "failed", op: "objects", error: message }));
           report.verification = unavailable(`read-back failed: ${message}`, checked);
+        }
+        if (report.verification.status !== "matched") {
+          stopped = true;
+          if (report.status === "stored") report.status = "failed";
+          report.error ??= `${pre}read-back ${report.verification.status}: ${report.verification.detail ?? "the requested edit was not verified"}; later cues were not edited`;
+          steps.push(asRead({ name: `${pre}check_edit_verified`, status: "failed", op: "objects", error: report.error }));
         }
       }
     }
@@ -1756,15 +1915,18 @@ export async function buildChase(ctx: ToolContext, raw: Record<string, unknown>)
 
 const presetSchema = z.object({ pool: z.number().describe("Preset pool: 1 Dimmer, 2 Position, 3 Gobo, 4 Color, 5 Beam, 6 Focus, 7 Control, 8 Shapers, 9 Video, 21.. All."), preset: z.union([z.number(), z.string()]).describe("Preset number in the pool, or its name.") });
 const valueSchema = z.object({
+  ...attributeTimingShape,
   attribute: z.string().describe('Attribute name, e.g. "Pan", "ColorRGB_W".'),
   value: z.number(),
+  layer: z.enum(["absolute", "relative"]).optional().describe("Default absolute. Relative requires explicit percent or physical units; signed values are preserved and checked independently."),
   unit: z.enum(ATTRIBUTE_UNIT_NAMES as [AttributeUnit, ...AttributeUnit[]]).optional().describe("percent, percent_fine, physical, natural, decimal8/16/24; omit for the console's readout."),
 });
 const lookShape = {
   fixtures: z.string().optional().describe('Target, e.g. "101 Thru 112", "Group 3" (default: the call\'s fixtures).'),
   presets: z.array(presetSchema).optional().describe(`Presets applied in order (At Preset), up to ${MAX_PRESETS_PER_LOOK}.`),
   intensity: z.number().optional().describe("Intensity 0..100 percent (At <value>)."),
-  values: z.array(valueSchema).optional().describe(`Attribute values (Attribute ... At Absolute), up to ${MAX_ATTRIBUTES}; applied after the presets.`),
+  values: z.array(valueSchema).optional().describe(`Attribute values, up to ${MAX_ATTRIBUTES}. Applied after presets. Absolute values may specify individual fade and delay in seconds.`),
+  releases: z.array(z.union([z.string(), z.object({ attribute: z.string(), layer: z.enum(["absolute", "relative"]).optional() })])).optional().describe("Stored tracking release per attribute/layer. String defaults absolute. Sends At Absolute|Relative Release; requires active native release marker before Store. Off Attribute is never substituted."),
   phaser: z
     .object({
       steps: z.array(z.object({ values: z.record(z.string(), z.union([z.number(), z.object({ absolute: z.number().optional(), relative: z.number().optional() })])), width: z.number().optional(), transition: z.number().optional(), accel: z.number().optional(), decel: z.number().optional() })).describe("2-16 steps: attribute -> value (absolute) or {absolute, relative}, plus step timing."),
@@ -1818,7 +1980,7 @@ export function compactCueResult(r: OperationResult, detail: boolean): Operation
 
 const commandSchema = z.string().optional().describe('The cue\'s command (Part 0 Command), run when the cue is called, e.g. "Go+ Macro 20". A cue with a command needs no look.');
 const noteSchema = z.string().optional().describe('The cue\'s Note, e.g. scene metadata a plugin reads (one line; trimmed; "" clears it); written after the store and read back exactly.');
-const cueSchema = z.object({ cue: z.union([z.number(), z.string()]), name: z.string().optional(), command: commandSchema, note: noteSchema, ...contentShape, ...timingShape, ...triggerShape });
+const cueSchema = z.object({ cue: z.union([z.number(), z.string()]), name: z.string().optional(), hold: z.boolean().optional().describe("Store an explicitly empty cue from the checked empty Preview programmer; with sequence tracking enabled it inherits preceding state."), command: commandSchema, note: noteSchema, ...contentShape, ...timingShape, ...triggerShape });
 const presetRangeSchema = z.object({ pool: z.number(), from: z.number(), to: z.number() });
 const sequenceSettingsShape = {
   sequence_settings: z.record(z.string(), z.unknown()).optional().describe("Sequence settings applied after the build, as gma3_configure_sequence takes them (priority, off_when_overridden, wrap_around, ...)."),
@@ -1839,7 +2001,8 @@ export const registerCueListTools: RegisterTools = (server, ctx) => {
       title: "Store a list of cues from explicit content",
       description:
         "Store several cues of one sequence in one call, each from explicit content: a look (fixtures with presets, intensity, attribute values and/or a phaser) or several looks, with an optional name, timing, trigger, command and note (the cue's Note, e.g. scene metadata a plugin reads) per cue; a cue with a command needs no look (stored empty). mode create refuses (nothing sent) when any of the cues exists; merge and overwrite store into existing cues. The store creates the sequence when it does not exist; sequence_name names it: a new name another sequence has is refused before anything is sent, naming the holder (a duplicate makes lookups by name ambiguous; whether the console would store \"<name>#2\" is not verified for sequences), unless on_name_taken: \"allow_suffix\"; in the batch form a name an earlier sequence of the call took counts as taken. " +
-        "presets {pool, from, to} (instead of cues): one cue per existing preset of the range on fixtures, named after it, with the call's timing and trigger. replace: true deletes the existing cues first (the sequence object, its settings and executor assignments stay, checked). sequence_settings (as gma3_configure_sequence) are applied after the build in the same call; a priority above ltp lists the running sequences it would switch off (Off When Overridden on), and protect_running: true turns that off on them. " +
+        "fade, delay, out_fade, out_delay, trigger and time given for the call are defaults for every cue (a cue's own keys win; a cue with its own trigger takes none of the call's time); each stored cue's TrigType and TrigTime are read back against what it was given. presets {pool, from, to} (instead of cues): one cue per existing preset of the range on fixtures, named after it, with the call's timing and trigger. replace: true deletes the existing cues first (the sequence object, its settings and executor assignments stay, checked). sequence_settings (as gma3_configure_sequence) are applied after the build in the same call; a priority above ltp lists the running sequences it would switch off (Off When Overridden on), and protect_running: true turns that off on them. " +
+        `Optional cue_only and tracking_shield add native Store options to each cue in this sequence; omitted options retain console defaults. ${STORE_TRACKING_LIMITATION} ` +
         BUILD_NOTE +
         " " +
         COMPACT_NOTE +
@@ -1851,6 +2014,7 @@ export const registerCueListTools: RegisterTools = (server, ctx) => {
         sequence_name: z.string().optional(),
         on_name_taken: z.enum(ON_NAME_TAKEN).optional().describe("When another sequence has sequence_name: refuse (default, nothing is sent) or allow_suffix (store anyway)."),
         mode: z.enum(["create", "merge", "overwrite"]).optional().describe("Required (per sequence or for the whole batch)."),
+        ...storeTrackingShape,
         fixtures: z.string().optional().describe("Default target for looks that do not name their own fixtures."),
         cues: z.array(cueSchema).optional().describe(`1 to ${MAX_CUES} cues, stored in the order given. Required unless sequences or presets is given.`),
         presets: presetRangeSchema.optional().describe("One cue per existing preset of the range on fixtures, numbered from first_cue, named after the preset (instead of cues)."),
@@ -1862,17 +2026,23 @@ export const registerCueListTools: RegisterTools = (server, ctx) => {
         exclusive: z.boolean().optional().describe("Required (true)."),
         verify: z.boolean().optional(),
         sequences: z
-          .array(z.object({ sequence: z.number(), sequence_name: z.string().optional(), on_name_taken: z.enum(ON_NAME_TAKEN).optional(), mode: z.enum(["create", "merge", "overwrite"]).optional(), fixtures: z.string().optional(), cues: z.array(cueSchema) }))
+          .array(z.object({ sequence: z.number(), sequence_name: z.string().optional(), on_name_taken: z.enum(ON_NAME_TAKEN).optional(), mode: z.enum(["create", "merge", "overwrite"]).optional(), fixtures: z.string().optional(), cues: z.array(cueSchema), ...storeTrackingShape }))
           .optional()
           .describe("Batch form: several sequences, each {sequence, sequence_name, mode, fixtures, cues}."),
         ...batchOptionShape,
       },
     },
     (args) =>
-      operation(() => {
+      operation(async () => {
         const a = args as Record<string, unknown>;
         const scoped = inDataPool(ctx, a);
         if (a.sequences === undefined) return storeCues(scoped, a).then((r) => compactCueResult(r, a.detail === true));
+        const optionsValidation = new Validator();
+        validateStoreTrackingOptions(optionsValidation, a);
+        if (!optionsValidation.ok) return validationFailure("store_cues", { sequences: "refused" }, optionsValidation.errors);
+        const hasTracking = (item: unknown) => !!item && typeof item === "object"
+          && (("cue_only" in item && item.cue_only !== undefined) || ("tracking_shield" in item && item.tracking_shield !== undefined));
+        const trackingRequested = hasTracking(a) || (Array.isArray(a.sequences) && a.sequences.some(hasTracking));
         // The sequence pool's names are read once for the whole call; a sequence named earlier in the call holds its name (#102).
         const names: PoolNameCache<string> = new Map();
         return runBatchCall(a, {
@@ -1882,8 +2052,18 @@ export const registerCueListTools: RegisterTools = (server, ctx) => {
           identityKeys: ["sequence", "sequence_name", "cues"],
           label: (it) => `Sequence ${String(it.sequence)}`,
           key: (it) => `Sequence ${String(it.sequence)}`,
-          check: (items) => duplicates(items.map((it) => String(it.sequence))).map((n) => `Sequence ${n} appears more than once in sequences`),
+          check: (items) => {
+            const errors = duplicates(items.map((it) => String(it.sequence))).map((n) => `Sequence ${n} appears more than once in sequences`);
+            for (const [index, item] of items.entries()) {
+              const v = new Validator(); validateStoreTrackingOptions(v, item);
+              errors.push(...v.errors.map((error) => `sequences[${index}].${error}`));
+            }
+            return errors;
+          },
           run: (it, c) => storeCues(c, it, { names }),
+        }).then((result) => {
+          if (trackingRequested) { result.notVerified = STORE_TRACKING_LIMITATION; result.summary += ` ${STORE_TRACKING_LIMITATION}`; }
+          return result;
         });
       }),
   );

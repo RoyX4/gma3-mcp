@@ -29,7 +29,7 @@ The plan the tool returns (`plan.steps[].stepTiming`, `plan.distribution`, `plan
 | `fixtures` *or* `group` | fixture ids/ranges, selected in list order on grid X (`Grid k/0/0`), or a stored group (recalled at the origin with its grid) |
 | `steps` *or* `template` | 2–16 steps, or one of the templates below |
 | step | `values: {Attribute: number | {absolute, relative}}`, `preset: "4.4"` (called into the step, stored as a reference), `width`, `transition`, `accel`, `decel` |
-| `unit` | `percent` (default) or `physical` (degrees for Pan/Tilt, as `At Absolute|Relative Physical`) |
+| `unit` | `percent` (default, emitted as `At Absolute|Relative Percent`) or `physical` (degrees for Pan/Tilt, as `At Absolute|Relative Physical`); step transition always uses explicit `Percent` |
 | `phaser` | `speed_bpm`, `phase` (`{from, to}`, `{from?, step}` or `"spread"`), `measure`, `speed_master`, `repeat` and `shuffle` (both need `phase`) |
 | `mirror` | `{attributes, wings?: 2}`: invert these attributes on every second wing (SU-13) |
 | `variants` | `["sync", "follow", "mirror"]`: build these versions into consecutive presets (SU-13) |
@@ -74,7 +74,7 @@ a beat, so a runner on n cells lasts n beats:
 A scanner (one dot running back and forth) needs a different on-time per cell, which one phaser cannot hold; it is not
 a template.
 
-`preview: true` returns the expanded steps and the exact console commands.
+`preview: true` returns the expanded steps and the exact console commands. Attribute values explicitly use Percent or Physical; all four step-timing layers explicitly use Percent, and speed explicitly uses BPM. These commands do not inherit a user/attribute readout such as Physical or Decimal24. Phase, Measure and SpeedMaster retain their documented intrinsic numeric forms. The Night Shift native capture (`test/fixtures/nightshift-odd-two-wings-native.json`) is the console evidence for the explicit units; mock command tests alone do not establish console parsing.
 
 ### Whole rig, variants, mirror and several effects (SU-13)
 
@@ -93,6 +93,7 @@ a template.
   selection MAtricks XShuffle while the phase is set: the phases are permuted. The check requires every attribute of a
   fixture to share its phase, and the fixtures' phases over the whole selection to be the unshuffled set. A channel
   that only part of a mixed rig has (RGBW's W) is checked against its own fixture's phase.
+- **Two wings with an odd fixture count.** The native nine-Aura witness mirrors about the actual centre: phase 300→0 gives 300, 225, 150, 75, 0, 75, 150, 225, 300. The centre is not duplicated. For two wings the verifier uses `min(k, n-1-k)` over `ceil(n/2)` positions, preserving the established even-count and singleton-wing behavior. More than two wings keep their existing model; this witness does not qualify odd partial wings for those counts.
 - **Mirror.** `mirror: {attributes, wings}` cuts the fixtures (grid order) into `wings` parts and inverts the attributes
   on every second part: relative and physical values change sign (Pan −20° for +20°), percent becomes 100 − v. The
   per-fixture values are written once every step exists, on those fixtures, and the whole selection is restored before
@@ -130,10 +131,10 @@ a template.
 2. `preview_on` (`Preview On`) and `check_preview`: the Preview environment is active and its programmer empty.
 3. `select`: `ClearSelection` and `Grid k/0/0` + `Fixture <id>` per fixture, or `Grid 0/0/0` + `Group n`.
 4. `build`: the effect's commands, in this order:
-   - every step's values (`Step i`, `At Preset`, `Attribute "A" At Absolute|Relative [Physical] v`);
-   - then each step's timing (`Step i`, `At Width|Transition|Acceleration|Deceleration`). Step layers set while the
+   - every step's values (`Step i`, `At Preset`, `Attribute "A" At Absolute|Relative Percent|Physical v`);
+   - then each step's timing (`Step i`, `At Width|Transition|Acceleration|Deceleration Percent v`). Step layers set while the
      programmer has one step are ignored, so they come after;
-   - then the phaser layers (`At Speed`, `At Phase a Thru b`, `At Measure`, `At SpeedMaster`), wrapped in
+   - then the phaser layers (`At Speed BPM`, `At Phase a Thru b`, `At Measure`, `At SpeedMaster`), wrapped in
      `Set Selection MAtricks` / `Reset Selection MAtricks` for a repeat;
    - finally `Step 1`.
 5. `check_build`: the Preview programmer is read and checked before anything is stored.

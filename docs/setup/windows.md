@@ -11,7 +11,7 @@ Install grandMA3 onPC, Git and Node.js with npm. Node.js 24 is used by this proj
 image; the package requires Node.js 24 or newer. Launch onPC once to create its resource folders.
 
 ```powershell
-git clone https://github.com/bdstark/gma3-mcp.git
+git clone --branch feat/verified-programming-20261030 https://github.com/RoyX4/gma3-mcp.git
 Set-Location gma3-mcp
 npm.cmd ci
 npm.cmd run build

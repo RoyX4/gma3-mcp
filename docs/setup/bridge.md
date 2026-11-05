@@ -138,7 +138,7 @@ reports `server.build.state: "stale"` in `gma3_status` and warns the agent when 
 | Bridge cannot be reached | Start the plugin, check its startup message, and match the MCP port to the plugin port. For remote use, check the SSH tunnel too. |
 | Old behavior after an update | Re-import and run `ReloadAllPlugins`; confirm the startup version. |
 | `modules: ... FAILED` at start | The XML was imported without its module components, or a component has a syntax error. Copy all plugin files, delete the slot and re-import. `node scripts/bridge-cli.mjs modules` shows the error. |
-| Bridge stops answering after `SaveShow` or another dialog | A confirmation pop-up on the plugin thread stalls the bridge until it is dismissed in onPC (`SaveShow /NoConfirmation` asks to rename the show to "NoConfirmation"). Save and load shows from the console, not through the bridge. |
+| Bridge stops answering after `SaveShow` or another dialog | A confirmation pop-up on the plugin thread can stall the bridge (`SaveShow /NoConfirmation` asks to rename the show to "NoConfirmation"). Use `gma3_save_show`, which queues SaveShow indirectly and checks its own dialog and output file. Inspect unfamiliar dialogs before another command. |
 | Tools do not appear | Build `dist/index.js`, check its absolute path and the `node` executable in the client configuration, then restart the client. |
 | Manual pages unavailable | Point `GMA3_INSTALL_DIR` at the resource folder, or `GMA3_HELP_DIR` at the manual's exact HTML directory. See the [configuration reference](../reference.md#environment-variables). |
 | Lua tool is present but refuses execution | Lua is disabled on the console by default. See [Lua policy](../lua.md). |

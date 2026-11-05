@@ -1,0 +1,13 @@
+{
+  "schemaVersion": 1,
+  "instances": {
+    "stage": {
+      "station": "MyConsole",
+      "shows": [
+        "MyShow"
+      ],
+      "host": "127.0.0.1",
+      "port": 9800
+    }
+  }
+}

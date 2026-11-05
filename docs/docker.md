@@ -5,6 +5,12 @@
 Docker runs the Node.js MCP server. The Lua plugin still runs inside grandMA3 onPC and must be copied,
 imported and started using the appropriate platform guide. The native setup is the simpler starting point.
 
+The runtime image includes Python 3 for local MVR archive inspection, the deployment qualification
+manifest and the [example instance profile](../examples/instances.example.json). Files inspected by
+MVR tools must be mounted into the container, and tool arguments must use their absolute container
+paths. The manifest records earlier native qualification; bundling it does not qualify a container's
+network route or its connected console. See the [qualification scope](qualification/2026-10-30.md).
+
 ## Build and configure
 
 From the repository directory:

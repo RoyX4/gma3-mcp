@@ -8,11 +8,34 @@ import { helpDir, helpVersion, listHelpPages, lookupHelp } from "./help.js";
 import { CHEATSHEET } from "./cheatsheet.js";
 import { MutationLock } from "./mutations.js";
 import { serverBuild } from "./buildinfo.js";
+import { deploymentStatus } from "./deployment.js";
+import { fileURLToPath } from "node:url";
 import { operation, type ToolContext } from "./tools/context.js";
 import { dataPoolShape, scopedBridge } from "./tools/datapool.js";
 import { registerFixtureTools } from "./tools/fixtures.js";
+import { registerViewTools } from "./tools/views.js";
+import { registerViewContentTools } from "./tools/view-content.js";
+import { registerUiTools } from "./tools/ui.js";
+import { registerLocalUiTools } from "./tools/localui.js";
+import { registerConnectionTools } from "./tools/connection.js";
+import { registerFastpathTools } from "./tools/fastpath.js";
+import { registerNativeCueTools } from "./tools/native-cues.js";
+import { registerFixtureDiagnosticTools } from "./tools/fixture-diagnostic.js";
+import { registerTrackingTools } from "./tools/tracking.js";
+import { registerJobTools } from "./tools/jobs.js";
+import { registerCheckpointTools } from "./tools/checkpoint.js";
+import { registerFocusTools } from "./tools/focus.js";
+import { registerColourTools } from "./tools/colour.js";
+import { registerMvrTools } from "./tools/mvr.js";
+import { registerMvrImportTools } from "./tools/mvr-import.js";
+import { registerWorkspaceTools } from "./tools/workspace.js";
+import { registerCameraWitnessTools } from "./tools/camera-witness.js";
+import { registerWorkspaceUiTools } from "./tools/workspace-ui.js";
 import { COMMAND_FALLBACK_NOTE, LUA_FALLBACK_NOTE, serverInstructions } from "./discovery.js";
 import { registerCueTools } from "./tools/cues.js";
+import { registerCueSettingsTools } from "./tools/cue-settings.js";
+import { registerCueRangeEditTools } from "./tools/cue-range-edits.js";
+import { registerCueTrackingActionTools } from "./tools/cue-tracking-actions.js";
 import { registerExecutorTools } from "./tools/executors.js";
 import { registerInspectionTools } from "./tools/inspection.js";
 import { registerInputTools } from "./tools/input.js";
@@ -44,15 +67,21 @@ import { annotatePlayback, readTargetState, registerLiveStateTools, stateAfterFr
 import { registerPoolUsageTools, shapeListing } from "./tools/poolusage.js";
 
 const env = process.env;
+const bridgePort = Number(env.GMA3_BRIDGE_PORT ?? 9800);
+if (!Number.isInteger(bridgePort) || bridgePort < 1 || bridgePort > 65535) throw new Error("GMA3_BRIDGE_PORT must be an integer in 1..65535");
+const expectedShows = env.GMA3_EXPECTED_SHOWS ? z.array(z.string().min(1).max(128)).min(1).parse(JSON.parse(env.GMA3_EXPECTED_SHOWS)) : undefined;
 const bridge = new Gma3Bridge({
   host: env.GMA3_BRIDGE_HOST ?? "127.0.0.1",
-  port: Number(env.GMA3_BRIDGE_PORT ?? 9800),
+  port: bridgePort,
+  expectedStation: env.GMA3_EXPECTED_STATION,
+  expectedShows,
   requestTimeoutMs: Number(env.GMA3_BRIDGE_TIMEOUT_MS ?? 15000),
 });
 const oscOptions = {
   host: env.GMA3_OSC_HOST ?? "127.0.0.1",
   port: Number(env.GMA3_OSC_PORT ?? 8000),
   prefix: env.GMA3_OSC_PREFIX?.replace(/^\/+|\/+$/g, "") || undefined,
+  disabled: /^(1|true|yes)$/i.test(env.GMA3_OSC_DISABLED ?? ""),
 };
 const osc = new OscSender(oscOptions);
 
@@ -104,9 +133,9 @@ function errorResult(err: unknown): ToolResult {
   let msg = err instanceof Error ? err.message : String(err);
   if (err instanceof BridgeError && !bridge.connected) {
     msg +=
-      `\n\nThe gma3_mcp_bridge plugin does not seem to be running in grandMA3 onPC (${bridge.description}). ` +
-      `Start it in the onPC command line with:  Plugin "gma3_mcp_bridge"  ` +
-      `(or call gma3_start_bridge if OSC input is enabled). Use gma3_status to check.`;
+      `\n\nThis server cannot currently reach the bridge at ${bridge.description}; that alone does not show whether the MA application is running. ` +
+      `Check the intended instance/network namespace and matching port. In that console start Plugin "gma3_mcp_bridge" "${bridgePort}" ` +
+      `(or use gma3_start_bridge if OSC reaches that instance). gma3_connection_check diagnoses responsiveness and identity; never replay an uncertain mutation.`;
   }
   return { content: [{ type: "text", text: msg }], isError: true };
 }
@@ -145,20 +174,35 @@ server.registerTool(
     const result: Record<string, unknown> = {
       server: { version: "0.1.0", build: { ...serverBuild.check(), stamp: serverBuild.running } },
       bridge: { address: bridge.description, connected: false },
-      osc: { address: osc.description },
+      osc: { address: osc.description, disabled: oscOptions.disabled },
       help: { dir: helpDir(), version: helpVersion() },
     };
     try {
       const ping = await bridge.request("ping", {}, 4000);
-      result.bridge = { address: bridge.description, connected: true, ...(ping as object) };
+      const metadata = ping && typeof ping === "object" && !Array.isArray(ping) ? ping as Record<string, unknown> : {};
+      result.bridge = { ...metadata, address: bridge.description, connected: true, tcpConnected: bridge.connected, responsive: true, state: bridge.diagnostics.state };
+      // A local manifest/diagnostic failure cannot change a successful transport observation.
+      try {
+        result.deployment = deploymentStatus(fileURLToPath(new URL("..", import.meta.url)), ping, serverBuild.running?.sourceHash);
+      } catch (error) {
+        result.deployment = { state: "unverified", reason: `Deployment diagnostics failed: ${error instanceof Error ? error.message : String(error)}` };
+      }
     } catch (err) {
+      const connection = bridge.diagnostics;
       result.bridge = {
         address: bridge.description,
+        // Compatibility: connected reports whether this ping replied; TCP state is separate.
         connected: false,
+        tcpConnected: connection.tcpConnected,
+        responsive: false,
+        state: connection.state,
         error: err instanceof Error ? err.message : String(err),
-        hint: 'In grandMA3 onPC run:  Plugin "gma3_mcp_bridge"   (install first with scripts/install-plugin.sh and Import Plugin Library "gma3_mcp_bridge.xml")',
+        hint: connection.tcpConnected
+          ? "TCP is still connected, but the console did not answer this ping. A long console operation may be blocking replies. Wait for in-flight work and use gma3_connection_check to recheck responsiveness. A timeout does not cancel work or prove a socket disconnect; never replay an uncertain mutation."
+          : `Check the intended instance/network namespace and configured port. If its bridge is not running, in that console run: Plugin "gma3_mcp_bridge" "${bridgePort}".`,
       };
     }
+    result.connection = bridge.diagnostics;
     return text(result);
   },
 );
@@ -168,14 +212,14 @@ server.registerTool(
   {
     title: "Start the bridge plugin via OSC",
     description:
-      'Fallback for when the bridge is not running: sends the command  Plugin "gma3_mcp_bridge"  to onPC over OSC (/cmd). ' +
+      'Fallback for when the bridge is not running: sends Plugin "gma3_mcp_bridge" "<configured bridge port>" to the intended onPC over OSC (/cmd). ' +
       "Requires the OSC configuration in onPC (Menu > In & Out > OSC) to have Enable Input on and Receive Command = Yes on a line matching GMA3_OSC_PORT (gma3_osc shows it; gma3_test_osc_input proves it). " +
       "Then waits briefly and pings the bridge.",
     inputSchema: {},
   },
   async () =>
     run(async () => {
-      await osc.sendCommand('Plugin "gma3_mcp_bridge"');
+      await osc.sendCommand(`Plugin "gma3_mcp_bridge" "${bridgePort}"`);
       await new Promise((r) => setTimeout(r, 1500));
       try {
         const ping = await bridge.request("ping", {}, 4000);
@@ -675,6 +719,9 @@ server.registerTool(
 
 registerFixtureTools(server, toolContext);
 registerCueTools(server, toolContext);
+registerCueSettingsTools(server, toolContext);
+registerCueRangeEditTools(server, toolContext);
+registerCueTrackingActionTools(server, toolContext);
 registerExecutorTools(server, toolContext);
 registerInspectionTools(server, toolContext);
 // KB-05: gated structured input (console keys, text, sequences). Everything dispatches in the Lua
@@ -704,6 +751,24 @@ registerOscTools(server, toolContext);
 registerShowTools(server, toolContext);
 registerTagTools(server, toolContext);
 registerTempoSyncTools(server, toolContext);
+registerViewTools(server, toolContext);
+registerViewContentTools(server, toolContext);
+registerUiTools(server, toolContext);
+registerLocalUiTools(server, toolContext, env.GMA3_LOCAL_UI_HELPER);
+registerConnectionTools(server, toolContext);
+registerFastpathTools(server, toolContext);
+registerNativeCueTools(server, toolContext);
+registerFixtureDiagnosticTools(server, toolContext);
+registerTrackingTools(server, toolContext);
+registerJobTools(server, toolContext);
+registerCheckpointTools(server, toolContext);
+registerFocusTools(server, toolContext);
+registerColourTools(server, toolContext);
+registerMvrTools(server, toolContext);
+registerMvrImportTools(server, toolContext);
+registerWorkspaceTools(server, toolContext);
+registerCameraWitnessTools(server, toolContext);
+registerWorkspaceUiTools(server, toolContext);
 registerPoolUsageTools(server, toolContext);
 
 server.registerResource(

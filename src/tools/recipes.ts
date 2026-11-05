@@ -17,10 +17,11 @@
  * preset, cue part, cue or whole sequence that does not depend on that background cook, the Merge, Overwrite and
  * Remove options, and the list of affected targets beforehand.
  *
- * First release: standard recipe lines with a group selection, a preset as values, a MAtricks reference, Enabled, Name and
- * SelectionMode. Phaser recipe lines, filters, worlds, shapes and SelectionFromValue are listed and kept but not edited,
- * and their coverage is not predicted (reported as not predicted). The per-line MAtricks columns (XBlock, X, FadeFromX,
- * ...) are written only by gma3_store_recipe_cues (not verified on a console: the #101 build set them from Lua).
+ * Recipe authoring also supports Filter/World references, SelectionFromValue, per-axis timing and phaser Shape
+ * creation/outer edits. Nested phaser source edits live in recipesteps.ts. Filtered and phaser coverage is observed
+ * rather than guessed.
+ * The per-line MAtricks columns other than per-axis timing (XBlock, X, XWings, ...) are written only by
+ * gma3_store_recipe_cues (not verified on a console: the #101 build set them from Lua).
  *
  * Console facts this module relies on (onPC 2.5.1, docs/probes/sb-05-recipes-macos-2.5.1.md):
  *   - Lines are StandardRecipe children of a cue part or preset, addressed `Sequence S Cue C Part P.L` / `Preset N.M.L`;
@@ -36,8 +37,10 @@
  *     (FailedCookedPart "Group", EmptyLastCooking Yes).
  */
 import { z } from "zod";
+import { registerRecipeStepTool } from "./recipesteps.js";
 import { BridgeError, type Gma3Bridge } from "../bridge.js";
 import { json, operation, type RegisterTools, type ToolContext } from "./context.js";
+import { RECIPE_TIMING_FIELDS, parseRecipeFilter, parseRecipeTiming, recipeProperty, type RecipeFilter, type RecipeTiming } from "./recipefields.js";
 import { presetId, type PresetRead, type PresetRow } from "./presets.js";
 import { cueRef, readObjects } from "./common.js";
 import { axisSettingsShape, matricksValue, matricksWanted } from "./groups.js";
@@ -130,6 +133,9 @@ export interface Line {
   values: { addr?: string; name?: string; preset?: string } | null;
   matricks: { no?: number; name?: string } | null;
   filter: string | null;
+  filterRef?: RecipeFilter | null;
+  shape?: number | null;
+  properties?: Record<string, unknown>;
   selectionMode?: string;
   selectionFromValue?: boolean | null;
   /** The line's own X / Y / Z column when it is set ("X 1"): only part of the group gets values (#101). */
@@ -137,7 +143,7 @@ export interface Line {
   status: { failedCookedPart?: string; emptyLastCooking?: boolean | null };
 }
 
-const LINE_FIELDS = ["Name", "Enabled", "Selection", "Values", "MAtricks", "Filter", "SelectionMode", "SelectionFromValue", "FailedCookedPart", "EmptyLastCooking", "X", "Y", "Z"];
+const LINE_FIELDS = ["Name", "Enabled", "Selection", "Values", "MAtricks", "Filter", "SelectionMode", "SelectionFromValue", "FailedCookedPart", "EmptyLastCooking", "Shape", "X", "Y", "Z", ...RECIPE_TIMING_FIELDS];
 
 /**
  * The X / Y / Z columns of a line that select part of its group: a number from 1, as a number or text (also "<2>", the
@@ -156,7 +162,7 @@ export function axisSelection(fields: Record<string, unknown>): string | undefin
   return set.length ? set.join(", ") : undefined;
 }
 
-const bool = (v: unknown): boolean | null => (typeof v === "boolean" ? v : typeof v === "string" ? (/^(yes|true|on)$/i.test(v) ? true : /^(no|false|off)$/i.test(v) ? false : null) : null);
+const bool = (v: unknown): boolean | null => (typeof v === "boolean" ? v : v === 1 ? true : v === 0 ? false : typeof v === "string" ? (/^(yes|true|on)$/i.test(v) ? true : /^(no|false|off)$/i.test(v) ? false : null) : null);
 const handle = (v: unknown): Handle | null => (v && typeof v === "object" && !Array.isArray(v) ? (v as Handle) : null);
 
 /** A list read that stopped at its bound: what is beyond it was not seen. */
@@ -193,6 +199,9 @@ export async function readLines(bridge: Gma3Bridge, t: Target, timeout: number):
       values: val && val.class === "Preset" ? { addr: val.addr, name: val.name } : null,
       matricks: mtx && mtx.class === "MAtrick" ? { no: mtx.index, name: mtx.name } : null,
       filter: flt ? flt.name ?? "?" : null,
+      filterRef: flt && (flt.class === "World" || flt.class === "Filter") && typeof flt.index === "number" ? { kind: flt.class === "World" ? "world" : "filter", number: flt.index } : null,
+      shape: handle(f.Shape)?.index ?? null,
+      properties: Object.fromEntries(RECIPE_TIMING_FIELDS.map((k) => [k, recipeProperty(f[k])])),
       selectionMode: typeof f.SelectionMode === "string" ? f.SelectionMode : undefined,
       selectionFromValue: bool(f.SelectionFromValue),
       ...(axisSelection(f) ? { axisSelect: axisSelection(f) } : {}),
@@ -434,6 +443,11 @@ interface EditArgs {
   enabled?: boolean;
   name?: string;
   selection_mode?: "strict" | "normal";
+  selection_from_value?: boolean;
+  filter?: RecipeFilter | null;
+  timing?: RecipeTiming;
+  kind?: "standard" | "phaser";
+  shape?: number;
   preview?: boolean;
 }
 
@@ -454,11 +468,11 @@ export function valuesPreset(field: string, value: unknown): { pool: number; num
 }
 
 function sameLine(a: Line, b: Line): boolean {
-  return a.class === b.class && (a.selection?.group ?? null) === (b.selection?.group ?? null) && (a.values?.addr ?? null) === (b.values?.addr ?? null) && (a.matricks?.no ?? null) === (b.matricks?.no ?? null) && a.enabled === b.enabled && (a.name ?? "") === (b.name ?? "") && (a.selectionMode ?? "").toLowerCase() === (b.selectionMode ?? "").toLowerCase() && (a.filter ?? null) === (b.filter ?? null);
+  return a.class === b.class && (a.selection?.group ?? null) === (b.selection?.group ?? null) && (a.values?.addr ?? null) === (b.values?.addr ?? null) && (a.matricks?.no ?? null) === (b.matricks?.no ?? null) && a.enabled === b.enabled && (a.name ?? "") === (b.name ?? "") && (a.selectionMode ?? "").toLowerCase() === (b.selectionMode ?? "").toLowerCase() && JSON.stringify(a.filterRef ?? a.filter ?? null) === JSON.stringify(b.filterRef ?? b.filter ?? null) && a.selectionFromValue === b.selectionFromValue && a.shape === b.shape && JSON.stringify(a.properties) === JSON.stringify(b.properties);
 }
 
 /** Every requested field of a line, compared per property. */
-export function checkLineFields(l: Line, n: number, f: { selection?: number; valuesAddr?: string | null; matricks?: number; enabled?: boolean; name?: string; selectionMode?: string }): string[] {
+export function checkLineFields(l: Line, n: number, f: { selection?: number; valuesAddr?: string | null; matricks?: number; enabled?: boolean; name?: string; selectionMode?: string; selectionFromValue?: boolean; filter?: RecipeFilter | null; timing?: RecipeTiming; shape?: number }): string[] {
   const out: string[] = [];
   if (f.selection !== undefined && l.selection?.group !== f.selection) out.push(`line ${n} selection reads ${l.selection ? `Group ${l.selection.group}` : "none"}`);
   if (f.valuesAddr === null && l.values) out.push(`line ${n} still has values`);
@@ -467,14 +481,37 @@ export function checkLineFields(l: Line, n: number, f: { selection?: number; val
   if (f.enabled !== undefined && l.enabled !== f.enabled) out.push(`line ${n} enabled reads ${l.enabled}`);
   if (f.name !== undefined && (l.name ?? "") !== f.name) out.push(`line ${n} name reads ${JSON.stringify(l.name ?? null)}`);
   if (f.selectionMode !== undefined && (l.selectionMode ?? "").toLowerCase() !== f.selectionMode.toLowerCase()) out.push(`line ${n} selection mode reads ${JSON.stringify(l.selectionMode ?? null)}`);
+  if (f.selectionFromValue !== undefined && l.selectionFromValue !== f.selectionFromValue) out.push(`line ${n} SelectionFromValue reads ${l.selectionFromValue}`);
+  if (f.filter === null && l.filter) out.push(`line ${n} still has a filter or world`);
+  if (f.filter !== undefined && JSON.stringify(l.filterRef ?? null) !== JSON.stringify(f.filter)) out.push(`line ${n} filter reads ${JSON.stringify(l.filterRef ?? l.filter)}`);
+  if (f.shape !== undefined && l.shape !== f.shape) out.push(`line ${n} shape reads ${l.shape}`);
+  for (const [property, value] of Object.entries(f.timing ?? {})) if (recipeProperty(l.properties?.[property]) !== value) out.push(`line ${n} ${property} reads ${JSON.stringify(l.properties?.[property])}, expected ${value}`);
   return out;
 }
 
 /** A set reply compared per property (a boolean property by its truth value, others as text). */
 export function setReplyMatches(property: string, sent: string, got: unknown): boolean {
-  if (property === "Enabled") return bool(got) !== null && bool(got) === bool(sent);
+  if (property === "Enabled" || property === "SelectionFromValue") return bool(got) !== null && bool(got) === bool(sent);
+  if ((RECIPE_TIMING_FIELDS as readonly string[]).includes(property)) return recipeProperty(got) === recipeProperty(sent);
   if (sent === "") return got === "" || got === null || got === undefined || (typeof got === "object" && !got);
   return String(got ?? "").trim().toLowerCase() === sent.toLowerCase();
+}
+
+async function writeRecipeProperty(bridge: Gma3Bridge, name: string, ref: string, property: string, value: string, timeout: number): Promise<StepResult> {
+  try {
+    const result = await bridge.request("set", { ref, property, value }, timeout) as { value?: unknown; readOk?: boolean };
+    let got = result.value;
+    // Native Set replies use the display role: 120 BPM reads "2.000000" Hz and phases carry a degree suffix. Compare canonical stored properties,
+    // rather than assuming the user's display units or replaying a write whose final raw value already matched.
+    if ((RECIPE_TIMING_FIELDS as readonly string[]).includes(property)) {
+      const raw = await bridge.request("objects", { ref, fields: [property], asText: false, limit: 1 }, timeout) as { items?: Array<{ fields?: Record<string, unknown> }> };
+      if (raw.items?.length !== 1) throw new Error("the edited recipe line did not resolve for canonical timing readback");
+      got = raw.items[0].fields?.[property];
+    }
+    return result.readOk !== false && setReplyMatches(property, value, got)
+      ? { name, status: "succeeded", op: "set", ...((RECIPE_TIMING_FIELDS as readonly string[]).includes(property) ? { detail: { storedValue: got, unit: property.startsWith("Speed") ? "BPM" : property.startsWith("Phase") ? "degrees" : "seconds", displayReply: result.value } } : {}) }
+      : { name, status: "failed", op: "set", detail: { readBack: got, displayReply: result.value }, error: `${property} reads ${JSON.stringify(got)} after the write` };
+  } catch (error) { return stepFromError(name, error, { op: "set" }); }
 }
 
 export async function editRecipe(ctx: ToolContext, raw: EditArgs): Promise<OperationResult> {
@@ -489,14 +526,23 @@ export async function editRecipe(ctx: ToolContext, raw: EditArgs): Promise<Opera
   const values = raw.values === undefined || raw.values === null ? raw.values : v.check(() => valuesPreset("values", raw.values));
   const matricks = raw.matricks === undefined ? undefined : v.check(() => objectNumber("matricks", raw.matricks, { max: 9999 }));
   const name = v.check(() => objectName("name", raw.name, { optional: true }));
+  const filter = v.check(() => parseRecipeFilter(raw.filter));
+  const timing = v.check(() => parseRecipeTiming(raw.timing));
+  const shape = raw.shape === undefined ? undefined : v.check(() => objectNumber("shape", raw.shape, { max: 9999 }));
+  if (raw.kind !== undefined && raw.kind !== "standard" && raw.kind !== "phaser") v.fail("kind must be standard or phaser");
+  if (raw.selection_from_value !== undefined && typeof raw.selection_from_value !== "boolean") v.fail("selection_from_value must be boolean");
+  if (raw.selection_from_value === true && selection !== undefined) v.fail("give selection or selection_from_value: true, not both");
   if (raw.enabled !== undefined && typeof raw.enabled !== "boolean") v.fail("enabled must be true or false");
   if (raw.selection_mode !== undefined && !(raw.selection_mode in SELECTION_MODES)) v.fail("selection_mode must be strict or normal");
-  const fields = { selection, values, matricks, enabled: raw.enabled, name, selection_mode: raw.selection_mode };
+  const fields = { selection, values, matricks, enabled: raw.enabled, name, selection_mode: raw.selection_mode, filter, timing, shape, selection_from_value: raw.selection_from_value };
   const anyField = Object.values(fields).some((x) => x !== undefined);
   // Only for a missing field: an invalid one has its own error.
-  if (action === "add" && (raw.selection === undefined || raw.values === undefined || raw.values === null)) v.fail("add needs selection (a group) and values (a preset): a line without both cooks nothing");
+  if (action === "add" && raw.kind !== "phaser" && ((raw.selection === undefined && raw.selection_from_value !== true) || raw.values === undefined || raw.values === null)) v.fail("add needs selection (a group) and values (a preset): a line without both cooks nothing");
+  if (action === "add" && raw.kind === "phaser" && (raw.selection === undefined || raw.shape === undefined)) v.fail("add phaser needs selection and shape");
+  if (action === "add" && raw.kind !== "phaser" && raw.shape !== undefined) v.fail("shape requires kind: phaser when adding a recipe");
+  if (action === "add" && raw.kind === "phaser" && raw.values !== undefined) v.fail("phaser creation takes a Shape reference; use step/source editing for values");
   if ((action === "set" || action === "move" || action === "remove") && line === undefined) v.fail(`${action} needs line`);
-  if (action === "set" && !anyField) v.fail("set needs at least one of selection, values, matricks, enabled, name, selection_mode");
+  if (action === "set" && !anyField) v.fail("set needs at least one line field (selection, values, matricks, enabled, name, selection_mode, filter, timing, shape, selection_from_value)");
   if (action === "move" && to === undefined) v.fail("move needs to");
   if ((action === "move" || action === "remove") && anyField) v.fail(`${action} takes no line fields`);
   const target: Record<string, unknown> = { target: raw.target, action };
@@ -522,7 +568,7 @@ export async function editRecipe(ctx: ToolContext, raw: EditArgs): Promise<Opera
           if (!b) return asRead({ name: "read_lines", status: "failed", op: "children", error: `${label(t)} does not exist (store the ${t.kind === "preset" ? "preset" : "cue"} first)` });
           if (line !== undefined && !b.some((l) => l.line === line)) return asRead({ name: "read_lines", status: "failed", op: "children", error: `${label(t)} has no recipe line ${line} (it has ${b.length})` });
           const l = b.find((x) => x.line === line);
-          if (l && l.class !== "StandardRecipe" && action !== "move" && action !== "remove") return asRead({ name: "read_lines", status: "failed", op: "children", error: `line ${line} is a ${l.class}; only standard recipe lines are edited by this release` });
+          if (l && shape !== undefined && l.class !== "PhaserRecipe") return asRead({ name: "read_lines", status: "failed", error: "shape requires a phaser recipe line" });
           if (action === "move" && (to! > b.length)) return asRead({ name: "read_lines", status: "failed", op: "children", error: `to must be 1-${b.length}` });
           return asRead({ name: "read_lines", status: "succeeded", op: "children", detail: { lines: b.length } });
         },
@@ -536,6 +582,10 @@ export async function editRecipe(ctx: ToolContext, raw: EditArgs): Promise<Opera
             if (values) {
               const p = await readData(bridge, `Preset ${values.pool}.${values.number}`, tm);
               if (!p) missing.push(`Preset ${values.pool}.${values.number}`);
+            }
+            for (const ref of [...(filter ? [`${filter.kind === "world" ? "World" : "Filter"} ${filter.number}`] : []), ...(shape !== undefined ? [`Shape ${shape}`] : [])]) {
+              const found = (await bridge.request("objects", { ref, fields: [], limit: 1 }, tm).catch((err: unknown) => notFound(err) ? null : Promise.reject(err))) as { items?: unknown[] } | null;
+              if (!found?.items?.length) missing.push(ref);
             }
             if (matricks !== undefined) {
               const m = (await bridge.request("objects", { ref: `MAtricks ${matricks}`, fields: [], limit: 1 }, tm).catch((err: unknown) => (notFound(err) ? null : Promise.reject(err)))) as { items?: unknown[] } | null;
@@ -571,12 +621,18 @@ export async function editRecipe(ctx: ToolContext, raw: EditArgs): Promise<Opera
     const n = action === "add" ? b.length + 1 : line!;
     const ref = lineRef(t, n);
     if (action === "add" || action === "set") {
+      if (action === "add" && raw.kind === "phaser") commands.push({ name: "create_phaser", command: `Store Type "PhaserRecipe" ${ref} /NoConfirmation` });
       if (selection !== undefined) commands.push({ name: "assign_selection", command: `Assign Group ${selection} At ${ref}` });
       // A disabled line is switched off before its values, so it never cooks.
       if (raw.enabled === false) commands.push({ name: "set_enabled", set: { property: "Enabled", value: "No" } });
       if (values) commands.push({ name: "assign_values", command: `Assign Preset ${values.pool}.${values.number} At ${ref}` });
       if (values === null) commands.push({ name: "clear_values", set: { property: "Values", value: "" } });
       if (matricks !== undefined) commands.push({ name: "assign_matricks", command: `Assign MAtricks ${matricks} At ${ref}` });
+      if (filter) commands.push({ name: "assign_filter", command: `Assign ${filter.kind === "world" ? "World" : "Filter"} ${filter.number} At ${ref}` });
+      if (filter === null) commands.push({ name: "clear_filter", set: { property: "Filter", value: "" } });
+      if (shape !== undefined) commands.push({ name: "assign_shape", command: `Assign Shape ${shape} At ${ref}` });
+      for (const [property, value] of Object.entries(timing ?? {})) commands.push({ name: `set_${property}`, set: { property, value: value === null ? "None" : String(value) } });
+      if (raw.selection_from_value !== undefined) commands.push({ name: "set_selection_from_value", set: { property: "SelectionFromValue", value: raw.selection_from_value ? "Yes" : "No" } });
       if (raw.selection_mode) commands.push({ name: "set_selection_mode", set: { property: "SelectionMode", value: SELECTION_MODES[raw.selection_mode] } });
       if (name !== undefined) commands.push({ name: "set_name", set: { property: "Name", value: name } });
       if (raw.enabled === true) commands.push({ name: "set_enabled", set: { property: "Enabled", value: "Yes" } });
@@ -600,11 +656,7 @@ export async function editRecipe(ctx: ToolContext, raw: EditArgs): Promise<Opera
         run: () =>
           c.command
             ? commandStep(bridge, c.name, c.command, tm)
-            : requestStep(bridge, c.name, "set", { ref, property: c.set!.property, value: c.set!.value }, (res) => {
-                const got = (res as { value?: unknown } | null)?.value;
-                const ok = setReplyMatches(c.set!.property, c.set!.value, got);
-                return ok ? { name: c.name, status: "succeeded", op: "set" } : { name: c.name, status: "failed", op: "set", detail: { readBack: got }, error: `${c.set!.property} reads ${JSON.stringify(got)} after the write` };
-              }, tm),
+            : writeRecipeProperty(bridge, c.name, ref, c.set!.property, c.set!.value, tm),
       })),
     );
     const steps = [...inspect.steps, ...main.steps];
@@ -618,12 +670,12 @@ export async function editRecipe(ctx: ToolContext, raw: EditArgs): Promise<Opera
       const a = after ?? [];
       const problems: string[] = [];
       const valuesAddr = values ? (await readData(bridge, `Preset ${values.pool}.${values.number}`, tm))?.addr ?? "?" : values === null ? null : undefined;
-      const want = { selection, valuesAddr, matricks, enabled: raw.enabled, name, selectionMode: raw.selection_mode ? SELECTION_MODES[raw.selection_mode] : undefined };
+      const want = { selection, valuesAddr, matricks, filter, timing, shape, selectionFromValue: raw.selection_from_value, enabled: raw.enabled, name, selectionMode: raw.selection_mode ? SELECTION_MODES[raw.selection_mode] : undefined };
       if (action === "add") {
         if (a.length !== b.length + 1) problems.push(`${a.length} line(s) after adding to ${b.length}`);
         const l = a[n - 1];
         if (!l) problems.push(`line ${n} was not created`);
-        else problems.push(...checkLineFields(l, n, want));
+        else { if (raw.kind === "phaser" && l.class !== "PhaserRecipe") problems.push(`line ${n} is not a PhaserRecipe`); problems.push(...checkLineFields(l, n, want)); }
         for (let i = 0; i < b.length; i++) if (!a[i] || !sameLine(a[i], b[i])) problems.push(`line ${i + 1} changed`);
       } else if (action === "set") {
         if (a.length !== b.length) problems.push(`${a.length} line(s) after the edit, ${b.length} before`);
@@ -1259,6 +1311,7 @@ async function readColumns(bridge: Gma3Bridge, t: Target, props: string[], timeo
 const targetSchema = z.object({ preset: z.string().optional(), sequence: z.number().optional(), cue: z.union([z.number(), z.string()]).optional(), part: z.number().optional() });
 
 export const registerRecipeTools: RegisterTools = (server, ctx) => {
+  registerRecipeStepTool(server, ctx);
   server.registerTool(
     "gma3_recipes",
     {
@@ -1284,7 +1337,7 @@ export const registerRecipeTools: RegisterTools = (server, ctx) => {
       description:
         "Edit one standard recipe line of a preset or cue part (the target must exist). action add {selection: group, values: \"N.M\" preset, matricks?, name?, enabled?, selection_mode?} appends a line; set {line, ...fields} changes it (values: null clears the values); move {line, to} reorders; remove {line} deletes it. " +
         "References are checked first; the result reads every line back (the edited one and that the others are unchanged or moved as asked). The console re-cooks an edited line by itself (MergeLowPriority) and a removed line's output disappears: the result shows the target's coverage before and after (autoCooked). " +
-        "The console also re-cooks a group or preset change by itself a moment later (in the background); gma3_cook_recipes cooks at once, verifies, and offers Merge, Overwrite and Remove. enabled: false switches a new line off before it gets values, so it never cooks. Phaser lines, filters and the per-line MAtricks columns are not edited by this tool (many cues at once, with the columns: gma3_store_recipe_cues). values is the plain string \"4.2\", never a number. preview: true returns the planned commands.",
+        "The console also re-cooks a group or preset change by itself a moment later (in the background); gma3_cook_recipes cooks at once, verifies, and offers Merge, Overwrite and Remove. enabled: false switches a new line off before it gets values, so it never cooks. Supports Filter/World references, SelectionFromValue, per-axis timing, and creating or editing phaser recipes via Shape references. Coverage for filtered and phaser lines is read back but not predicted. The per-line X/Y/Z, wings, block and group MAtricks columns are not edited by this tool (many cues at once, with the columns: gma3_store_recipe_cues). values is the plain string \"4.2\", never a number. preview: true returns the planned commands.",
       inputSchema: {
         target: targetSchema.describe("Preset or cue part."),
         action: z.enum(["add", "set", "move", "remove"]),
@@ -1295,6 +1348,11 @@ export const registerRecipeTools: RegisterTools = (server, ctx) => {
         matricks: z.number().optional().describe("MAtricks pool number."),
         enabled: z.boolean().optional(),
         name: z.string().optional(),
+        filter: z.object({ kind: z.enum(["filter", "world"]), number: z.number() }).strict().nullable().optional().describe("Filter or World reference; null clears it."),
+        timing: z.record(z.string(), z.number().nullable()).optional().describe("Per-axis FadeFromX/FadeToX, DelayFromX/DelayToX, SpeedFromX/SpeedToX, PhaseFromX/PhaseToX (X/Y/Z); null clears a value."),
+        kind: z.enum(["standard", "phaser"]).optional().describe("For add: standard by default; phaser requires selection and shape."),
+        shape: z.number().optional().describe("Shape pool number, for phaser recipes."),
+        selection_from_value: z.boolean().optional(),
         selection_mode: z.enum(["strict", "normal"]).optional().describe("Strict: values only on the selected fixtures; Normal: passed down to sub-fixtures."),
         preview: z.boolean().optional(),
       },

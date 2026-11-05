@@ -33,6 +33,7 @@
  */
 import { z } from "zod";
 import { BridgeError, type Gma3Bridge } from "../bridge.js";
+import { createEnvironmentReader } from "../programmer-environment.js";
 import { operation, type RegisterTools, type ToolContext } from "./context.js";
 import { expandFixtures } from "./groups.js";
 import { prepareStorePreset, presetId, readPoolNames, nameHolder, sameName, ALL_POOLS, ON_NAME_TAKEN, STEP_DEFAULTS, type OnNameTaken, type PoolNames, type ProgrammerRow, type PresetContext, type PresetRead } from "./presets.js";
@@ -420,7 +421,8 @@ export interface Selector {
  */
 export function effectCommands(e: Effect, overrides: Override[] = [], select?: Selector): string[] {
   const out: string[] = [];
-  const kw = e.unit === "physical" ? " Physical" : "";
+  // Pin units instead of inheriting the current attribute/layer readout (including raw Decimal24).
+  const kw = e.unit === "physical" ? " Physical" : " Percent";
   const write = (attr: string, v: StepValue) => {
     if (v.absolute !== undefined) out.push(`Attribute "${attr}" At Absolute${kw} ${formatValue(v.absolute)}`);
     if (v.relative !== undefined) out.push(`Attribute "${attr}" At Relative${kw} ${formatValue(v.relative)}`);
@@ -455,16 +457,16 @@ export function effectCommands(e: Effect, overrides: Override[] = [], select?: S
   // Step timing only after every step exists: a step layer set while the programmer has a single step is ignored.
   e.steps.forEach((s, i) => {
     const layers: string[] = [];
-    if (s.width !== undefined) layers.push(`At Width ${formatValue(s.width)}`);
-    if (s.transition !== undefined) layers.push(`At Transition ${formatValue(s.transition)}`);
-    if (s.accel !== undefined) layers.push(`At Acceleration ${formatValue(s.accel)}`);
-    if (s.decel !== undefined) layers.push(`At Deceleration ${formatValue(s.decel)}`);
+    if (s.width !== undefined) layers.push(`At Width Percent ${formatValue(s.width)}`);
+    if (s.transition !== undefined) layers.push(`At Transition Percent ${formatValue(s.transition)}`);
+    if (s.accel !== undefined) layers.push(`At Acceleration Percent ${formatValue(s.accel)}`);
+    if (s.decel !== undefined) layers.push(`At Deceleration Percent ${formatValue(s.decel)}`);
     if (layers.length) out.push(`Step ${i + 1}`, ...layers);
   });
   const p = e.phaser;
   if (p.repeat) out.push(`Set Selection MAtricks "${REPEAT_PROPERTY[p.repeat.kind]}" ${p.repeat.count}`);
   if (p.shuffle !== undefined) out.push(`Set Selection MAtricks "XShuffle" ${p.shuffle}`);
-  if (p.speedBpm !== undefined) out.push(`At Speed ${formatValue(p.speedBpm)}`);
+  if (p.speedBpm !== undefined) out.push(`At Speed BPM ${formatValue(p.speedBpm)}`);
   if (p.phase) out.push(`At Phase ${formatValue(p.phase.from)} Thru ${formatValue(p.phase.to)}`);
   if (p.measure !== undefined) out.push(`At Measure ${formatValue(p.measure)}`);
   if (p.speedMaster !== undefined) out.push(`At SpeedMaster ${p.speedMaster}`);
@@ -489,9 +491,11 @@ function expectedPercent(v: number, kind: "absolute" | "relative", unit: Unit, r
   const from = row.physicalFrom;
   const to = row.physicalTo;
   if (typeof from !== "number" || typeof to !== "number" || to === from) return `the physical range of ${row.attribute} is unknown`;
+  // Absolute programmer/preset values follow the ascending UI physical range, not DMX direction (captured onPC
+  // 2.5.1.1 Ultra Zoom 50.2 -> 6.6: Physical 25 reads 42.2018 %), as gma3_set_attributes read-back already assumes.
   // A relative value is a share of the range's size: a fixture with a reversed range (from > to) still reads +30° as
   // a positive percentage (Thrill Mini Profile Pan, SB-04 probe).
-  return kind === "absolute" ? ((v - from) / (to - from)) * 100 : (v / Math.abs(to - from)) * 100;
+  return kind === "absolute" ? ((v - Math.min(from, to)) / Math.abs(to - from)) * 100 : (v / Math.abs(to - from)) * 100;
 }
 
 const near = (a: unknown, b: unknown, tol: number) => typeof a === "number" && typeof b === "number" && Math.abs(a - b) <= tol;
@@ -550,8 +554,14 @@ export function expectedPhase(phase: { from: number; to: number }, k: number, n:
     // A wing of one fixture gets the centre end of the distribution (live 2026-10-15: wings 2 on two movers read 180 for
     // phase 0 Thru 180 on both).
     if (size === 1) return phase.to;
-    const pos = k % size;
-    idx = Math.floor(k / size) % 2 === 1 ? size - 1 - pos : pos;
+    if (repeat.count === 2) {
+      // Native nine-fixture witness: mirror about the actual centre, without repeating an odd centre fixture.
+      idx = Math.min(k, n - 1 - k);
+    } else {
+      // More than two wings retain the existing model; odd partial wings have not been qualified.
+      const pos = k % size;
+      idx = Math.floor(k / size) % 2 === 1 ? size - 1 - pos : pos;
+    }
     span = size;
   } else if (repeat?.kind === "blocks") { idx = Math.floor(k / repeat.count); span = Math.ceil(n / repeat.count); }
   if (distribution === "cycle") return phase.from + ((phase.to - phase.from) * idx) / span;
@@ -994,6 +1004,7 @@ export async function buildPhaser(ctx: ToolContext, raw: BuildArgs): Promise<Ope
   const body = async (): Promise<OperationResult> => {
     let normalBefore: Scan | null = null;
     const warnings: string[] = [];
+    const readEnvironment = createEnvironmentReader(bridge, t, async () => (await scan(bridge, t)).environment, (warning) => warnings.push(warning));
     const reports: JobReport[] = jobs.map((job) => ({ job, steps: [], members: [], stored: null, problems: [], implied: [], phases: null, plan: {}, status: "not_attempted" }));
     // Each target pool's names, read once for the call and shared with the stores (#102).
     const names: PoolNames = new Map();
@@ -1200,9 +1211,9 @@ export async function buildPhaser(ctx: ToolContext, raw: BuildArgs): Promise<Ope
             name: `${P}confirm_preview`,
             run: async () => {
               try {
-                const s = await scan(bridge, t);
+                const s = await readEnvironment();
                 if (s.environment !== "Preview") return failed(`${P}confirm_preview`, `the console left the Preview environment (now ${s.environment}); nothing more was built`);
-                return asRead({ name: `${P}confirm_preview`, status: "succeeded", op: "programmer" });
+                return asRead({ name: `${P}confirm_preview`, status: "succeeded", op: s.op });
               } catch (err) {
                 return readStepFromError(`${P}confirm_preview`, "programmer", err);
               }
@@ -1269,13 +1280,15 @@ export async function buildPhaser(ctx: ToolContext, raw: BuildArgs): Promise<Ope
       // Leave the Preview environment whatever happened, once it may have been entered. ClearAll is sent only after
       // the console confirms it is in Preview: in Normal it would discard the operator's programmer.
       if (entered) {
-        let env: string | undefined;
+        let env: string | undefined, environmentOp = "programmer";
         try {
-          env = (await scan(bridge, t)).environment;
+          const observation = await readEnvironment();
+          env = observation.environment ?? undefined;
+          environmentOp = observation.op;
         } catch {
           env = undefined;
         }
-        steps.push(asRead({ name: "confirm_preview", status: env === undefined ? "unknown" : "succeeded", op: "programmer", detail: { environment: env ?? null }, ...(env === undefined ? { error: "the environment could not be read, so nothing was cleared; run gma3_phaser_release" } : {}) }));
+        steps.push(asRead({ name: "confirm_preview", status: env === undefined ? "unknown" : "succeeded", op: environmentOp, detail: { environment: env ?? null }, ...(env === undefined ? { error: "the environment could not be read, so nothing was cleared; run gma3_phaser_release" } : {}) }));
         if (env === "Preview") {
           steps.push(await commandStep(bridge, "release_preview_programmer", "ClearAll", t));
           steps.push(await commandStep(bridge, "preview_off", "Preview Off", t));
@@ -1398,10 +1411,12 @@ export async function releasePhaser(ctx: ToolContext, raw: { clear_normal?: bool
     const bridge = ctx.bridge;
     const t = ctx.requestTimeoutMs;
     const steps: StepResult[] = [];
+    const readEnvironment = createEnvironmentReader(bridge, t, async () => (await scan(bridge, t)).environment);
     let env: string | undefined;
     try {
-      env = (await scan(bridge, t)).environment;
-      steps.push(asRead({ name: "read_environment", status: "succeeded", op: "programmer", detail: { environment: env } }));
+      const observation = await readEnvironment();
+      env = observation.environment ?? undefined;
+      steps.push(asRead({ name: "read_environment", status: "succeeded", op: observation.op, detail: { environment: env } }));
     } catch (err) {
       steps.push(readStepFromError("read_environment", "programmer", err));
       return buildResult({ operation: op, target: {}, steps });

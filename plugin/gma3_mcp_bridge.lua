@@ -157,7 +157,7 @@ local my_handle     = select(4, ...)
 local socket = require("socket")
 local json   = require("json")
 
-local VERSION      = "0.49.0"
+local VERSION      = "0.51.0"  -- 0.51.0: upstream 0.50.0 merged with the fork's verified programming line (runtime fingerprints, native cue ops)
 local DEFAULT_PORT = 9800
 -- Execution policy defaults for the "lua" op (see header). Changed per start with the
 -- "luatime=<ms>" / "luasteps=<n>" tokens, or at runtime with "lua on|off".
@@ -177,6 +177,19 @@ local MAX_DEPTH    = 6
 -- State survives repeated Plugin calls (file-level locals are re-created on ReloadAllPlugins only).
 _G.__gma3_mcp_bridge = _G.__gma3_mcp_bridge or { running = false, host = BIND_HOST, port = DEFAULT_PORT, server = nil, clients = {}, requests = 0 }
 local state = _G.__gma3_mcp_bridge
+-- Fingerprint of the bytecode actually imported into this Lua VM, computed once per component load.
+-- This is a non-cryptographic runtime identity, not a source-file SHA or a version-label claim.
+do
+  local chunk = debug.getinfo(1, "f").func
+  local ok, bytes = pcall(string.dump, chunk, true)
+  if ok then
+    local a, b = 1, 0
+    for i = 1, #bytes do a = (a + bytes:byte(i)) % 65521; b = (b + a) % 65521 end
+    state.pluginFingerprint = string.format("lua-bytecode-adler32:%08x:%d", b * 65536 + a, #bytes)
+  end
+end
+
+state.fastGeneration = tostring(os.time()) .. ":" .. tostring(socket.gettime()) .. ":" .. tostring({})
 -- Lua execution policy (older state tables from before 0.2.0 do not have it).
 state.lua = state.lua or { enabled = LUA_DEFAULT_ENABLED, maxMs = LUA_DEFAULT_MAX_MS, maxSteps = LUA_DEFAULT_MAX_STEPS, hookMode = LUA_DEFAULT_HOOK_MODE }
 state.lua.hookMode = state.lua.hookMode or LUA_DEFAULT_HOOK_MODE
@@ -261,21 +274,21 @@ local function handleSummary(h)
 end
 
 local toJsonSafe
-toJsonSafe = function(v, depth, seen)
+toJsonSafe = function(v, depth, seen, loss, maxDepth)
   depth = depth or 0
   seen = seen or {}
   local t = type(v)
   if t == "nil" or t == "boolean" or t == "string" then return v end
   if t == "number" then
-    if v ~= v or v == math.huge or v == -math.huge then return nil end
+    if v ~= v or v == math.huge or v == -math.huge then if loss then loss.nonFinite=true end;return nil end
     return v
   end
   if isHandle(v) then return handleSummary(v) end
-  if t == "function" then return "<function>" end
-  if t == "thread" then return "<thread>" end
+  if t == "function" then if loss then loss.unsupportedType=true end;return "<function>" end
+  if t == "thread" then if loss then loss.unsupportedType=true end;return "<thread>" end
   if t == "table" then
-    if seen[v] then return "<cycle>" end
-    if depth >= MAX_DEPTH then return "<table: max depth>" end
+    if seen[v] then if loss then loss.cycle=true end;return "<cycle>" end
+    if depth >= (maxDepth or MAX_DEPTH) then if loss then loss.depthLimit=true end;return "<table: max depth>" end
     seen[v] = true
     -- array-like?
     local n = 0
@@ -286,18 +299,20 @@ toJsonSafe = function(v, depth, seen)
     local out
     if n >= 0 and n == #v then
       out = {}
-      for i = 1, #v do out[i] = toJsonSafe(v[i], depth + 1, seen) end
+      for i = 1, #v do out[i] = toJsonSafe(v[i], depth + 1, seen, loss, maxDepth) end
       if #out == 0 then setmetatable(out, { __jsontype = "array" }) end
     else
       out = {}
       for k, val in pairs(v) do
         local key = type(k) == "string" and k or tostring(k)
-        out[key] = toJsonSafe(val, depth + 1, seen)
+        if loss and type(k)~="string" and type(k)~="number" then loss.unsupportedKey=true end
+        out[key] = toJsonSafe(val, depth + 1, seen, loss, maxDepth)
       end
     end
     seen[v] = nil
     return out
   end
+  if loss then loss.unsupportedType=true end
   return tostring(v)
 end
 
@@ -983,9 +998,16 @@ local function attributeMeta(attr)
   return m
 end
 
-local function channelSetRows(cf)
+local function channelSetRows(cf, detailsBudget)
   local out = {}
-  for _, cs in ipairs(safeCall(cf, "Children") or {}) do
+  local children = safeCall(cf, "Children")
+  if detailsBudget and type(children) ~= "table" then return nil, "unavailable" end
+  for _, cs in ipairs(children or {}) do
+    if detailsBudget then
+      if detailsBudget.used >= detailsBudget.limit then return emptyArray(out), "truncated" end
+      if not isHandle(cs) then return nil, "unavailable" end
+      detailsBudget.used = detailsBudget.used + 1
+    end
     out[#out + 1] = {
       name = safeProp(cs, "name"), dmxFrom = textProp(cs, "DmxFrom"), dmxTo = textProp(cs, "DmxTo"),
       physicalFrom = numProp(cs, "PhysicalFrom"), physicalTo = numProp(cs, "PhysicalTo"), wheelSlotIndex = numProp(cs, "WheelSlotIndex"),
@@ -1121,7 +1143,7 @@ local function resolveMode(main)
   return nil
 end
 
-local function walkMode(main, includeSets, limitations)
+local function walkMode(main, includeSets, limitations, keepLogicalHandles)
   local mode = resolveMode(main)
   if not mode then table.insert(limitations, "no DMX mode handle could be resolved for the fixture type (Get(\"Mode\"), FixtureType.DMXModes); the fixture type could not be walked"); return nil end
   local channelsNode
@@ -1140,6 +1162,7 @@ local function walkMode(main, includeSets, limitations)
     if defCf then entry.defaultChannelFunction = safeProp(defCf, "name") end
     for _, lc in ipairs(safeCall(dc, "Children") or {}) do
       local lce = { name = safeProp(lc, "name"), attribute = attributeMeta(handleProp(lc, "Attribute")), functions = {} }
+      if keepLogicalHandles then lce.logicalHandle = lc end
       for _, cf in ipairs(safeCall(lc, "Children") or {}) do lce.functions[#lce.functions + 1] = channelFunctionMeta(cf, includeSets) end
       entry.logicalChannels[#entry.logicalChannels + 1] = lce
     end
@@ -1167,7 +1190,7 @@ local function pickChannelSet(sets, raw, bits)
 end
 
 -- Attribute rows through the UI channel API. nil when the API is unavailable (caller falls back to the type walk).
-local function uiChannelAttributes(fx, includeSets, rtRows, limitations)
+local function uiChannelAttributes(fx, includeSets, rtRows, limitations, functionParents)
   local okU, uis = callApi("GetUIChannels", fx, false)
   if not okU then table.insert(limitations, "GetUIChannels unavailable: " .. tostring(uis)); return nil end
   if type(uis) ~= "table" or #uis == 0 then table.insert(limitations, "GetUIChannels returned no UI channels for this fixture"); return nil end
@@ -1202,6 +1225,7 @@ local function uiChannelAttributes(fx, includeSets, rtRows, limitations)
           merge(row, channelFunctionMeta(cf, includeSets))
           local lc = safeCall(cf, "Parent")
           if lc then
+            if functionParents then functionParents[row] = lc end
             local names = {}
             for _, f in ipairs(safeCall(lc, "Children") or {}) do names[#names + 1] = safeProp(f, "name") end
             if #names > 0 then row.channelFunctions = names end
@@ -1222,8 +1246,8 @@ local function uiChannelAttributes(fx, includeSets, rtRows, limitations)
 end
 
 -- Attribute rows from the static fixture-type walk (one row per logical channel of the DMX mode).
-local function fixtureTypeAttributes(main, includeSets, rtRows, limitations)
-  local walk = walkMode(main, includeSets, limitations)
+local function fixtureTypeAttributes(main, includeSets, rtRows, limitations, functionParents)
+  local walk = walkMode(main, includeSets, limitations, functionParents ~= nil)
   if not walk then return {} end
   local rows = {}
   for _, entry in ipairs(walk) do
@@ -1234,6 +1258,7 @@ local function fixtureTypeAttributes(main, includeSets, rtRows, limitations)
       local names = {}
       for _, f in ipairs(lc.functions) do names[#names + 1] = f.channelFunction end
       if #names > 0 then row.channelFunctions = names end
+      if functionParents then functionParents[row] = lc.logicalHandle end
       row.dmxChannel = { name = entry.name, dmxBreak = entry.dmxBreak, coarseOffset = entry.coarse, fineOffset = entry.fine, ultraOffset = entry.ultra, geometry = entry.geometry, default = entry.default }
       if rtRows then
         local rt = matchRtChannel(rtRows, nil, entry.name)
@@ -1375,6 +1400,7 @@ local function programmerRow(p, ui, sfIdx, sf, attrCache, stats)
     if type(st) == "table" then
       row.steps[#row.steps + 1] = {
         step = s, channelFunction = st.channel_function, absolute = st.absolute, absoluteValue = st.absolute_value, relative = st.relative,
+        absoluteKind = st.abs_release == true and "release" or nil, relativeKind = st.rel_release == true and "release" or nil,
         accel = st.accel, accelType = st.accel_type, decel = st.decel, decelType = st.decel_type, trans = st.trans, width = st.width,
         integratedPreset = presetRef(st.integrated),
       }
@@ -1383,6 +1409,8 @@ local function programmerRow(p, ui, sfIdx, sf, attrCache, stats)
   if stepCount == 1 and type(p[1]) == "table" then
     row.value = p[1].absolute
     row.valueRaw = p[1].absolute_value
+    row.valueKind = p[1].abs_release == true and "release" or nil
+    row.relativeKind = p[1].rel_release == true and "release" or nil
     row.relative = p[1].relative
   end
   -- speed in Hz, measure x100 (beats), speedMaster 0-based (SB-04 probe); gridPosMatricks the MAtricks-transformed position.
@@ -2037,7 +2065,7 @@ end
 local function moduleSummary()
   local out = {}
   for key, rec in pairs(state.modules) do
-    out[key] = { loaded = rec.loaded, version = rec.version, error = rec.error }
+    out[key] = { loaded = rec.loaded, version = rec.version, error = rec.error, fingerprint = rec.module and rec.module.RUNTIME_FINGERPRINT or nil }
   end
   return out
 end
@@ -2528,6 +2556,8 @@ ops["input.fake"] = function(args, ctx)
   return { backend = "fake", events = b.events, down = down, counters = b.counters, confirmMode = b.confirmMode == nil and "nil" or b.confirmMode }
 end
 
+do
+local importedFingerprint = state.pluginFingerprint
 ops.ping = function(args)
   local build = {}
   local ok, b = pcall(BuildDetails)
@@ -2542,6 +2572,7 @@ ops.ping = function(args)
   pcall(function() hostname = Root().maNetSocket.hostname end)
   return {
     bridgeVersion = VERSION,
+    plugin        = { fingerprint = importedFingerprint, generation = ops._fastpath and ops._fastpath.generation or state.fastGeneration, fingerprintKind = "imported Lua bytecode; non-cryptographic, VM-specific; not a source SHA" },
     host          = state.host,
     port          = state.port,
     luaVersion    = _VERSION,
@@ -2555,6 +2586,8 @@ ops.ping = function(args)
     input         = inputSummary(),
     control       = controlSummary(),
   }
+end
+
 end
 
 -- Read-only report of the console interaction modules this bridge loaded (KB-02). Usable with Lua
@@ -3050,21 +3083,22 @@ end
 -------------------------------------------------------------------------------
 
 -- FR-07: attribute discovery for one (sub)fixture.
---   args: { ref = "Fixture 601" | "Fixture 501.3", limit, offset, includeChannelSets }
+--   args: { ref = "Fixture 601" | "Fixture 501.3", limit, offset, includeChannelSets, includeChannelFunctions }
 ops.fixtureAttributes = function(args)
   local fx, main = resolveFixture(args.ref)
   local limit, offset = pageArgs(args, 100, 500)
   local includeSets = args.includeChannelSets == true
+  local functionParents = args.includeChannelFunctions == true and {} or nil
   local limitations = {}
   local res = fixtureIdentity(fx, main)
   res.subfixtures = listSubfixtures(fx)
   res.subfixtureCount = #res.subfixtures
   local rtRows, rtSource = fixtureRtChannels(fx, main, limitations)
-  local rows = uiChannelAttributes(fx, includeSets, rtRows, limitations)
+  local rows = uiChannelAttributes(fx, includeSets, rtRows, limitations, functionParents)
   if rows then
     res.source = "uiChannels"
   else
-    rows = fixtureTypeAttributes(main, includeSets, rtRows, limitations)
+    rows = fixtureTypeAttributes(main, includeSets, rtRows, limitations, functionParents)
     res.source = "fixtureTypeWalk"
   end
   res.channels = emptyArray(rtRows or {})
@@ -3073,6 +3107,47 @@ ops.fixtureAttributes = function(args)
   local page = paginate(rows, limit, offset)
   res.total, res.offset, res.count, res.attributes = page.total, page.offset, page.count, page.items
   res.includeChannelSets = includeSets
+  if functionParents then
+    local budget = { limit = MAX_EXPANDED_OBJECTS, used = 0, truncated = false }
+    for _, row in ipairs(page.items) do
+      local logical = functionParents[row]
+      local functions = logical and safeCall(logical, "Children")
+      local label = tostring(row.attribute or row.uiChannel or "(unnamed)")
+      if type(functions) ~= "table" then
+        table.insert(limitations, "detailed channel functions unavailable for " .. label)
+      else
+        local details = {}
+        for _, cf in ipairs(functions) do
+          if budget.used >= budget.limit then
+            row.channelFunctionDetailsTruncated, budget.truncated = true, true
+            table.insert(limitations, "detailed channel functions truncated at the " .. budget.limit .. "-item request budget for " .. label)
+            break
+          end
+          if not isHandle(cf) then
+            details = nil
+            table.insert(limitations, "detailed channel functions unavailable for " .. label .. ": a logical channel child is not a handle")
+            break
+          end
+          budget.used = budget.used + 1
+          local detail, attr = channelFunctionMeta(cf, false), attributeMeta(handleProp(cf, "Attribute"))
+          detail.name = detail.channelFunction
+          detail.attribute = attr.attribute or textProp(cf, "Attribute")
+          detail.attributeIndex, detail.physicalUnit = attr.attributeIndex, attr.physicalUnit
+          local setState
+          detail.channelSets, setState = channelSetRows(cf, budget)
+          if setState == "truncated" then
+            detail.channelSetsTruncated, budget.truncated = true, true
+            table.insert(limitations, "detailed channel sets truncated at the " .. budget.limit .. "-item request budget for " .. tostring(detail.name or label))
+          elseif setState == "unavailable" then
+            table.insert(limitations, "channel sets unavailable for channel function " .. tostring(detail.name or label))
+          end
+          details[#details + 1] = detail
+        end
+        if details then row.channelFunctionDetails = emptyArray(details) end
+      end
+    end
+    res.includeChannelFunctions, res.channelFunctionDetailsBudget = true, budget
+  end
   res.limitations = emptyArray(limitations)
   return res
 end
@@ -3081,6 +3156,15 @@ end
 --   args: { scope = "all" | "selection" | "fixtures", fixtures = "Fixture 1 Thru 5", limit, offset, maxChannels }
 ops.programmer = function(args)
   local scope = args.scope or "all"
+  local filter
+  if args.attributes ~= nil then
+    if type(args.attributes) ~= "table" or #args.attributes < 1 or #args.attributes > 128 then error("args.attributes must contain 1..128 attribute names", 0) end
+    filter = {}
+    for _, name in ipairs(args.attributes) do
+      if type(name) ~= "string" or #name < 1 or #name > 128 or name:find("[%c]") then error("invalid attribute filter name", 0) end
+      filter[name:lower()] = true
+    end
+  end
   local limit, offset = pageArgs(args, 200, 5000)
   local maxChannels = math.floor(tonumber(args.maxChannels) or 5000)
   if maxChannels < 1 then maxChannels = 1 elseif maxChannels > 50000 then maxChannels = 50000 end
@@ -3126,12 +3210,12 @@ ops.programmer = function(args)
   end
 
   local coverage = { complete = false, scannedFixtures = 0, totalFixtures = #indices, scannedChannels = 0 }
-  local stats = { channelsWithData = 0, channelsWithStepsButInactiveMask = 0, channelErrors = 0 }
+  local stats = { channelsWithData = 0, channelsWithStepsButInactiveMask = 0, channelErrors = 0, phaserReads = 0, filteredChannels = 0 }
   local rows, attrCache = {}, {}
   local stopped, firstError = nil, nil
   -- The scanned (sub)fixtures themselves, so a client can tell "no programmer value" from
   -- "not scanned" per fixture. Bounded; `fixturesTruncated` says when the list was cut.
-  local FIXTURE_LIST_MAX = 1000
+  local FIXTURE_LIST_MAX = 5000
   local fixtureList, fixturesTruncated = {}, false
   for i, idx in ipairs(indices) do
     if coverage.scannedChannels >= maxChannels then
@@ -3152,28 +3236,37 @@ ops.programmer = function(args)
     if okU and type(uis) == "table" then
       local seenAttr = {}
       for _, u in ipairs(uis) do
+        if coverage.scannedChannels >= maxChannels then stopped = string.format("channel budget (%d) reached in (sub)fixture index %d", maxChannels, idx); break end
         local ui = uiIndexOf(u)
         if ui ~= nil then
           coverage.scannedChannels = coverage.scannedChannels + 1
           -- The attributes this (sub)fixture has, so a client can tell "no value" from "no such
           -- attribute here" per cell. Same cache as programmerRow.
+          local attr = attrCache[ui]
+          if attr == nil then
+            local okA, a = callApi("GetAttributeByUIChannel", ui)
+            attr = (okA and isHandle(a)) and a or false
+            attrCache[ui] = attr
+          end
+          local an = attr and safeProp(attr, "name") or nil
           if entry then
-            local attr = attrCache[ui]
-            if attr == nil then
-              local okA, a = callApi("GetAttributeByUIChannel", ui)
-              attr = (okA and isHandle(a)) and a or false
-              attrCache[ui] = attr
-            end
-            local an = attr and safeProp(attr, "name") or nil
             if an and not seenAttr[an] then seenAttr[an] = true; entry.attributes[#entry.attributes + 1] = an end
           end
-          local okP, p = callApi("GetProgPhaser", ui, false)
-          if not okP then
+          if filter and type(an) ~= "string" then
             stats.channelErrors = stats.channelErrors + 1
-            firstError = firstError or tostring(p)
-          elseif type(p) == "table" then
-            local row = programmerRow(p, ui, idx, sf, attrCache, stats)
-            if row then rows[#rows + 1] = row end
+            firstError = firstError or "attribute name unavailable while filtering"
+          elseif filter and not filter[an:lower()] then
+            stats.filteredChannels = stats.filteredChannels + 1
+          else
+            stats.phaserReads = stats.phaserReads + 1
+            local okP, p = callApi("GetProgPhaser", ui, false)
+            if not okP then
+              stats.channelErrors = stats.channelErrors + 1
+              firstError = firstError or tostring(p)
+            elseif type(p) == "table" then
+              local row = programmerRow(p, ui, idx, sf, attrCache, stats)
+              if row then rows[#rows + 1] = row end
+            end
           end
         end
       end
@@ -3196,6 +3289,7 @@ ops.programmer = function(args)
     environment = (function() local ok, e = pcall(function() return CurrentEnvironment().name end); return ok and e or nil end)(),
     note = "rows are programmer content read with GetProgPhaser; they are not output values (use fixtureOutput or dmx for output)",
     coverage = coverage, stats = stats, maxChannels = maxChannels,
+    filter = filter and { attributes = args.attributes, completeness = "requested attributes only; other attributes were not read" } or nil,
     selectionCount = scope == "selection" and #indices or nil,
     scannedFixtures = (function() for _, e in ipairs(fixtureList) do emptyArray(e.attributes) end return emptyArray(fixtureList) end)(),
     fixturesTruncated = fixturesTruncated,
@@ -3647,9 +3741,9 @@ end
 -- A mode as reported to clients: breaks as a flat list of channel counts (break 1 first), which keeps
 -- patch.types inside the bridge's JSON nesting limit.
 local function modeOut(info)
-  local channels = {}
-  for _, b in ipairs(info.breaks) do channels[#channels + 1] = b.channels end
-  return { no = info.no, name = info.name, footprint = info.footprint, breaks = #info.breaks, breakChannels = emptyArray(channels) }
+  local channels, numbers = {}, {}
+  for _, b in ipairs(info.breaks) do channels[#channels + 1] = b.channels; numbers[#numbers + 1] = b["break"] end
+  return { no = info.no, name = info.name, footprint = info.footprint, breaks = #info.breaks, breakChannels = emptyArray(channels), breakNumbers = emptyArray(numbers) }
 end
 
 -- "U.AAA" -> universe, address (1-based) and the 0-based absolute address; nil for anything else.
@@ -3918,6 +4012,84 @@ end
 --   add    = { type, mode, fid, count, address?, findFreeFrom? }
 --   edits  = [ { fid, address? ("U.AAA", "" = unpatch), name? } ]
 --   fids   = [ fid, ... ]  (removal)
+do
+-- Explicit break plans: no packing guess for a multi-break fixture. Existing addresses are merged for
+-- edits; omitted add breaks stay unpatched. Per-break channel counts come from the mode's native footprint.
+local function patchBreakPlan(info, defs, address, current)
+  local sizes, out = {}, {}
+  for _, b in ipairs(info.breaks or {}) do sizes[b["break"]] = b.channels end
+  if current then for b = 1, 8 do out[b] = displayProp(current, "Break" .. b) or "" end end
+  if defs ~= nil and address ~= nil then raise("[bad-args] give breaks or address, not both") end
+  if address ~= nil then
+    if address ~= "" and #info.breaks > 1 then raise("[multi-break] use explicit breaks for a multi-break fixture") end
+    if address == "" then for b = 1, 8 do out[b] = "" end
+    else
+      local d = parseDmx(address)
+      if not d then raise("[bad-args] address must be U.AAA") end
+      if not sizes[1] then raise("[no-footprint] the mode has no first DMX break") end
+      out[1] = formatDmx(d.abs)
+    end
+  end
+  if defs ~= nil then
+    if type(defs) ~= "table" or #defs == 0 or #defs > 8 then raise("[bad-args] breaks must contain 1-8 {break,address} entries") end
+    local seen = {}
+    for _, def in ipairs(defs) do
+      if type(def) ~= "table" then raise("[bad-args] breaks entries must be objects") end
+      local b = integerArg(def["break"], "breaks[].break", 1, 8)
+      if seen[b] then raise("[bad-args] duplicate DMX break " .. b) end
+      seen[b] = true
+      if not sizes[b] then raise("[bad-args] DMX mode has no break " .. b) end
+      if def.address == "" then out[b] = ""
+      else
+        local d = parseDmx(def.address)
+        if not d then raise("[bad-args] breaks[].address must be U.AAA or an empty string") end
+        out[b] = formatDmx(d.abs)
+      end
+    end
+  end
+  if defs == nil and address == nil then return nil end
+  for b = 1, 8 do out[b] = out[b] or "" end
+  return out, sizes
+end
+
+local function patchPlanRanges(plan, sizes, fid, offset)
+  local ranges = {}
+  for b = 1, 8 do
+    if plan[b] ~= "" then
+      local d = parseDmx(plan[b]); local n = sizes[b]
+      if not d or not n then raise("[no-footprint] cannot establish DMX break " .. b .. " for FID " .. fid) end
+      local first = d.abs + (offset or 0) * n
+      if first + n > 1024 * 512 then raise("[bad-args] DMX break exceeds universe 1024") end
+      ranges[#ranges + 1] = { fid = fid, ["break"] = b, first = first, last = first + n - 1 }
+    end
+  end
+  return ranges
+end
+
+local function checkPatchExpected(entry, expected)
+  if expected == nil then return end
+  local now = fixtureRow(entry)
+  for _, k in ipairs({ "fid", "name", "type", "mode", "stage", "parentFid", "cid", "idType", "subfixtures" }) do
+    if expected[k] ~= nil and tostring(now[k]) ~= tostring(expected[k]) then raise("[stale-fixture] FID " .. tostring(now.fid) .. " changed " .. k .. " since preflight") end
+  end
+  if type(expected.breaks) == "table" then
+    local a, b = {}, {}
+    for _, d in ipairs(expected.breaks) do a[d["break"]] = d.address end
+    for _, d in ipairs(now.breaks) do b[d["break"]] = d.address end
+    for i = 1, 8 do if (a[i] or "") ~= (b[i] or "") then raise("[stale-fixture] FID " .. tostring(now.fid) .. " changed DMX break " .. i .. " since preflight") end end
+  end
+end
+
+local function patchSubtree(p, entry)
+  local rows, found = {}, false
+  for _, e in ipairs(walkFixtures(p)) do
+    if e.fixture == entry.fixture then found = true
+    elseif found and e.depth <= entry.depth then break
+    elseif found then rows[#rows + 1] = fixtureRow(e) end
+  end
+  return rows
+end
+
 ops["patch.check"] = function(args)
   local lp = ShowData().LivePatch
   local res = {}
@@ -3930,7 +4102,15 @@ ops["patch.check"] = function(args)
     res.mode = modeOut(info)
     res.singleBreak = #info.breaks <= 1
     res.fidFree = CheckFIDCollision(fid, count) == true
+    if a.breaks ~= nil then
+      local plan, sizes = patchBreakPlan(info, a.breaks, a.address)
+      local ranges = {}
+      for i = 0, count - 1 do for _, r in ipairs(patchPlanRanges(plan, sizes, fid + i, i)) do ranges[#ranges + 1] = r end end
+      res.conflicts, res.occupancyUnknown = rangeConflicts(lp, ranges, {})
+      res.dmxFree = #res.conflicts == 0 and #res.occupancyUnknown == 0
+    end
     if a.address ~= nil then
+      patchBreakPlan(info, nil, a.address)
       local start = parseDmx(a.address)
       if not start then raise("[bad-args] address must be U.AAA (universe 1-1024, address 1-512)") end
       res.address = formatDmx(start.abs)
@@ -3964,7 +4144,15 @@ ops["patch.check"] = function(args)
       local row = { fid = fid, exists = entry ~= nil }
       if entry then
         row.current = fixtureRow(entry)
+        if e.breaks ~= nil then
+          local info = fixtureMode(entry.fixture) and modeInfo(fixtureMode(entry.fixture)) or { breaks = {} }
+          local plan, sizes = patchBreakPlan(info, e.breaks, e.address, entry.fixture)
+          moving[fid] = true
+          for _, r in ipairs(patchPlanRanges(plan, sizes, fid)) do proposed[#proposed + 1] = r end
+        end
         if e.address ~= nil then
+          local info = fixtureMode(entry.fixture) and modeInfo(fixtureMode(entry.fixture)) or { breaks = {} }
+          patchBreakPlan(info, nil, e.address, entry.fixture)
           moving[fid] = true
           if e.address ~= "" then
             local start = parseDmx(e.address)
@@ -3982,13 +4170,17 @@ ops["patch.check"] = function(args)
     res.conflicts, res.occupancyUnknown = rangeConflicts(lp, proposed, moving)
   elseif type(args.fids) == "table" then
     local by = fixturesByFid(lp)
-    local rows = {}
+    local rows, descendants = {}, {}
     for _, f in ipairs(args.fids) do
       local fid = integerArg(f, "fids[]", 1, PATCH_MAX_FID)
       local entry = by[fid]
-      rows[#rows + 1] = entry and { fid = fid, exists = true, current = fixtureRow(entry) } or { fid = fid, exists = false }
+      if entry then
+        local children = patchSubtree(lp, entry)
+        rows[#rows + 1] = { fid = fid, exists = true, current = fixtureRow(entry), descendantCount = #children }
+        for _, row in ipairs(children) do row.rootFid = fid; descendants[#descendants + 1] = row end
+      else rows[#rows + 1] = { fid = fid, exists = false } end
     end
-    res.fixtures = emptyArray(rows)
+    res.fixtures, res.descendants = emptyArray(rows), emptyArray(descendants)
   else
     raise("[bad-args] patch.check needs add, edits or fids")
   end
@@ -4036,13 +4228,20 @@ ops["patch.add"] = function(args)
   local p = requireCopy(nil)
   patchStages.require(p, stageName)
   local ft, mode, info = modeArgs(p, args)
-  if #info.breaks > 1 then raise("[multi-break] DMX mode " .. info.name .. " has " .. #info.breaks .. " DMX breaks; multi-break modes are not supported by patch.add") end
+  local breakPlan, breakSizes = patchBreakPlan(info, args.breaks, args.address)
   local count = integerArg(args.count or 1, "count", 1, PATCH_MAX_COUNT)
   local fid = integerArg(args.fid, "fid", 1, PATCH_MAX_FID)
   local name = nameArg(args.name, "name")
   local by = fixturesByFid(p)
   for i = 0, count - 1 do if by[fid + i] then raise("[fid-taken] FID " .. (fid + i) .. " is taken in the copy") end end
   if CheckFIDCollision(fid, count) ~= true then raise("[fid-taken] FID " .. fid .. ".." .. (fid + count - 1) .. " is not free") end
+  if args.breaks ~= nil then
+    local ranges = {}
+    for i = 0, count - 1 do for _, r in ipairs(patchPlanRanges(breakPlan, breakSizes, fid + i, i)) do ranges[#ranges + 1] = r end end
+    local conflicts, unknown = rangeConflicts(p, ranges, {})
+    if #unknown > 0 then raise(occupancyUnknownError(unknown)) end
+    if #conflicts > 0 then raise({ code = "dmx-taken", message = "the requested DMX breaks overlap or cross a universe", conflicts = conflicts }) end
+  end
   local start
   if args.address ~= nil then
     start = parseDmx(args.address)
@@ -4063,6 +4262,13 @@ ops["patch.add"] = function(args)
     local spec = { mode = mode, amount = 1, fid = tostring(fid + i) }
     if name then spec.name = name end
     if start then spec.patch = { formatDmx(start.abs + i * (info.footprint or 0)) } end
+    if args.breaks ~= nil then
+      spec.patch = {}
+      local highest = 0
+      for _, b in ipairs(info.breaks) do highest = math.max(highest, b["break"]) end
+      for b = 1, highest do spec.patch[b] = "" end
+      for _, r in ipairs(patchPlanRanges(breakPlan, breakSizes, fid + i, i)) do spec.patch[r["break"]] = formatDmx(r.first) end
+    end
     local okA, r = pcall(AddFixtures, spec)
     ret = r
     if not okA then problem = "AddFixtures raised for FID " .. (fid + i) .. ": " .. tostring(r)
@@ -4075,6 +4281,15 @@ ops["patch.add"] = function(args)
   for i = 0, count - 1 do local e = after[fid + i]; if e then created[#created + 1] = fixtureRow(e); createdEntries[#createdEntries + 1] = e end end
   if not problem and #created ~= count then problem = "AddFixtures created " .. #created .. " of " .. count .. " fixtures at the requested FIDs" end
   local setByBridge = 0
+  if not problem and args.breaks ~= nil then
+    for i, e in ipairs(createdEntries) do
+      local wants = {}
+      for _, r in ipairs(patchPlanRanges(breakPlan, breakSizes, fid + i - 1, i - 1)) do wants[r["break"]] = formatDmx(r.first) end
+      for b = 1, 8 do
+        if (displayProp(e.fixture, "Break" .. b) or "") ~= (wants[b] or "") then problem = "created FID " .. tostring(fid + i - 1) .. " did not read back DMX break " .. b .. " as requested" end
+      end
+    end
+  end
   if not problem and start then
     -- Each fixture is added with its own address now; this fix-up stays as a safety net from when a block
     -- was one call and AddFixtures patched only its first fixture (KB-26 live, 2026-10-13). Every fixture
@@ -4121,69 +4336,55 @@ ops["patch.set"] = function(args)
   requireExclusive(args, "patch.set")
   local p = requireCopy(nil)
   if type(args.edits) ~= "table" or #args.edits == 0 then raise("[bad-args] edits must be a non-empty list") end
-  local by = fixturesByFid(p)
-  local edits, seen = {}, {}
+  local by, edits, seen, orig = fixturesByFid(p), {}, {}, {}
   for _, e in ipairs(args.edits) do
     local fid = integerArg(e.fid, "edits[].fid", 1, PATCH_MAX_FID)
-    if seen[fid] then raise("[bad-args] FID " .. fid .. " appears twice in edits") end
+    if seen[fid] then raise("[bad-args] duplicate FID " .. fid) end
     seen[fid] = true
     local entry = by[fid]
     if not entry then raise("[no-fixture] no fixture with FID " .. fid .. " in the copy") end
-    local ed = { fid = fid, entry = entry, name = nameArg(e.name, "edits[].name") }
-    if e.address ~= nil then
-      if e.address == "" then ed.address = ""
-      else
-        local d = parseDmx(e.address)
-        if not d then raise("[bad-args] edits[].address must be U.AAA or \"\" (unpatch)") end
-        ed.address = formatDmx(d.abs)
-        local mode = fixtureMode(entry.fixture)
-        local info = mode and modeInfo(mode) or { breaks = {} }
-        if #info.breaks > 1 then raise("[multi-break] FID " .. fid .. " uses a multi-break mode; readdressing it is not supported") end
-        if not info.footprint or info.footprint < 1 then raise("[no-footprint] FID " .. fid .. " has no DMX footprint to patch") end
-      end
-    end
-    if ed.address == nil and ed.name == nil then raise("[bad-args] edit for FID " .. fid .. " changes nothing (give address and/or name)") end
-    edits[#edits + 1] = ed
+    checkPatchExpected(entry, e.expected)
+    local mode = fixtureMode(entry.fixture)
+    local info = mode and modeInfo(mode) or { breaks = {} }
+    local plan, sizes = patchBreakPlan(info, e.breaks, e.address, entry.fixture)
+    local name = nameArg(e.name, "edits[].name")
+    if not plan and name == nil then raise("[bad-args] edit for FID " .. fid .. " changes nothing") end
+    edits[#edits + 1] = { fid = fid, entry = entry, plan = plan, sizes = sizes, name = name }
+    orig[fid] = { patch = displayProp(entry.fixture, "Patch") or "", name = tostring(safeProp(entry.fixture, "name")), breaks = {} }
+    for b = 1, 8 do orig[fid].breaks[b] = displayProp(entry.fixture, "Break" .. b) or "" end
   end
-  local orig = {}
-  for _, ed in ipairs(edits) do orig[ed.fid] = { patch = displayProp(ed.entry.fixture, "Patch") or "", name = tostring(safeProp(ed.entry.fixture, "name")) } end
+  local function writePlan(c, plan)
+    for b = 1, 8 do if (displayProp(c, "Break" .. b) or "") ~= (plan[b] or "") then c:Set("Break" .. b, plan[b] or "") end end
+  end
   local function restore()
-    for _, ed in ipairs(edits) do pcall(function() ed.entry.fixture:Set("Patch", "") end) end
+    local failures = {}
+    for _, ed in ipairs(edits) do if ed.plan then pcall(writePlan, ed.entry.fixture, {}) end end
     for _, ed in ipairs(edits) do
-      local o = orig[ed.fid]
-      pcall(function() ed.entry.fixture:Set("Patch", o.patch) end)
-      pcall(function() ed.entry.fixture:Set("Name", o.name) end)
+      local c, o = ed.entry.fixture, orig[ed.fid]
+      local ok = pcall(function() writePlan(c, o.breaks); if tostring(safeProp(c, "name")) ~= o.name then c:Set("Name", o.name) end end)
+      if not ok or tostring(safeProp(c, "name")) ~= o.name then failures[#failures + 1] = ed.fid end
+      for b = 1, 8 do if (displayProp(c, "Break" .. b) or "") ~= o.breaks[b] then failures[#failures + 1] = ed.fid; break end end
     end
+    return failures
   end
+  local proposed, ignore = {}, {}
+  for _, ed in ipairs(edits) do if ed.plan then
+    ignore[ed.fid] = true
+    for _, r in ipairs(patchPlanRanges(ed.plan, ed.sizes, ed.fid)) do proposed[#proposed + 1] = r end
+  end end
+  local conflicts, unknown = rangeConflicts(p, proposed, ignore)
+  if #conflicts > 0 or (#proposed > 0 and #unknown > 0) then raise({ code = "set-failed", message = #unknown > 0 and occupancyUnknownError(unknown).message or "the new DMX breaks overlap patched fixtures; every change of this call was restored in the copy (none were sent)", conflicts = conflicts }) end
   local okE, errE = pcall(function()
-    for _, ed in ipairs(edits) do if ed.address ~= nil then ed.entry.fixture:Set("Patch", "") end end
-    for _, ed in ipairs(edits) do if ed.address ~= nil and ed.address ~= "" then ed.entry.fixture:Set("Patch", ed.address) end end
-    for _, ed in ipairs(edits) do if ed.name ~= nil then ed.entry.fixture:Set("Name", ed.name) end end
-  end)
-  local problem, conflicts
-  if not okE then problem = "a Set raised: " .. tostring(errE) end
-  if not problem then
-    local ranges, ignore = {}, {}
+    for _, ed in ipairs(edits) do if ed.plan then writePlan(ed.entry.fixture, {}) end end
+    for _, ed in ipairs(edits) do if ed.plan then writePlan(ed.entry.fixture, ed.plan) end; if ed.name then ed.entry.fixture:Set("Name", ed.name) end end
     for _, ed in ipairs(edits) do
-      if ed.address ~= nil then
-        ignore[ed.fid] = true
-        local rs, why = fixtureRanges(ed.entry.fixture)
-        if why then problem = "FID " .. ed.fid .. ": " .. why end
-        for _, r in ipairs(rs) do ranges[#ranges + 1] = { fid = ed.fid, first = r.first, last = r.last } end
-        local now = displayProp(ed.entry.fixture, "Patch") or ""
-        if now ~= ed.address then problem = "FID " .. ed.fid .. " reads back patch " .. now .. ", not " .. (ed.address == "" and "unpatched" or ed.address) end
-      end
-      if ed.name ~= nil and tostring(safeProp(ed.entry.fixture, "name")) ~= ed.name then problem = "FID " .. ed.fid .. " reads back name " .. tostring(safeProp(ed.entry.fixture, "name")) end
+      if ed.plan then for b = 1, 8 do if (displayProp(ed.entry.fixture, "Break" .. b) or "") ~= (ed.plan[b] or "") then error("FID " .. ed.fid .. " DMX break " .. b .. " mismatched") end end end
+      if ed.name and tostring(safeProp(ed.entry.fixture, "name")) ~= ed.name then error("FID " .. ed.fid .. " name mismatched") end
     end
-    local unknown
-    conflicts, unknown = rangeConflicts(p, ranges, ignore)
-    -- Only new ranges need proven free space: a rename or an unpatch adds none.
-    if not problem and #ranges > 0 and #unknown > 0 then problem = occupancyUnknownError(unknown).message end
-    if not problem and #conflicts > 0 then problem = "the new addresses overlap patched fixtures" end
-  end
-  if problem then
-    restore()
-    raise({ code = "set-failed", message = problem .. "; every change of this call was restored in the copy", conflicts = conflicts })
+  end)
+  if not okE then
+    local failures = restore()
+    raise({ code = "set-failed", message = tostring(errE) .. (#failures == 0 and "; every change was restored and verified in the copy" or "; RESTORATION INCOMPLETE: inspect the patch copy"), restorationFailed = emptyArray(failures) })
   end
   local rows = {}
   for _, ed in ipairs(edits) do rows[#rows + 1] = { fid = ed.fid, before = orig[ed.fid], after = fixtureRow(ed.entry) } end
@@ -4203,22 +4404,51 @@ ops["patch.remove"] = function(args)
       seen[fid] = true
       local e = by[fid]
       if not e then raise("[no-fixture] no fixture with FID " .. fid .. " in the copy") end
-      if fixtureChildren(e.fixture) > 0 then raise("[has-subfixtures] FID " .. fid .. " has sub-fixtures; removing it is not supported (remove them first)") end
-      targets[#targets + 1] = { fid = fid, entry = e, row = fixtureRow(e) }
+      if fixtureChildren(e.fixture) > 0 and args.includeChildren ~= true then raise("[has-subfixtures] FID " .. fid .. " has sub-fixtures; include_children must be true to remove the complete subtree") end
+      local expected = type(args.expected) == "table" and args.expected[tostring(fid)] or nil
+      if expected then
+        checkPatchExpected(e, expected.current)
+        local descendants = patchSubtree(p, e)
+        if #descendants ~= #(expected.descendants or {}) then raise("[stale-fixture] FID " .. fid .. " changed descendants since preflight") end
+        for i, row in ipairs(descendants) do
+          local old = expected.descendants[i]
+          for _, k in ipairs({ "fid", "name", "type", "mode", "stage", "parentFid", "cid", "idType", "subfixtures" }) do if tostring(row[k]) ~= tostring(old[k]) then raise("[stale-fixture] FID " .. fid .. " descendant " .. i .. " changed " .. k) end end
+          local want, now = {}, {}
+          for _, d in ipairs(old.breaks or {}) do want[d["break"]] = d.address end
+          for _, d in ipairs(row.breaks or {}) do now[d["break"]] = d.address end
+          for b = 1, 8 do if (want[b] or "") ~= (now[b] or "") then raise("[stale-fixture] descendant DMX break changed since preflight") end end
+        end
+      end
+      targets[#targets + 1] = { fid = fid, entry = e, row = fixtureRow(e), descendants = patchSubtree(p, e) }
     end
   end
+  -- A requested parent already removes all its descendants. Do not delete a child twice.
+  local selected, keep = {}, {}
+  for _, t in ipairs(targets) do selected[t.entry.fixture] = true end
+  local parents = {}
+  for _, e in ipairs(walkFixtures(p)) do parents[e.fixture] = e.parent end
+  for _, t in ipairs(targets) do
+    local parent, nested = t.entry.parent, false
+    while parent do if selected[parent] then nested = true; break end; parent = parents[parent] end
+    if not nested then keep[#keep + 1] = t end
+  end
+  targets = keep
   -- Highest index first within each holder, so earlier positions stay valid.
   table.sort(targets, function(a, b) if a.entry.holder ~= b.entry.holder then return tostring(a.entry.holder) < tostring(b.entry.holder) end return a.entry.index > b.entry.index end)
-  local removed = {}
+  local removed, removedFids = {}, {}
   for _, t in ipairs(targets) do
+    removedFids[t.fid] = true
+    for _, row in ipairs(t.descendants) do if type(row.fid) == "number" then removedFids[row.fid] = true end end
     local ok, err = pcall(function() t.entry.holder:Delete(t.entry.index) end)
     if not ok then raise({ code = "remove-failed", message = "deleting FID " .. t.fid .. " raised: " .. tostring(err) .. " (" .. #removed .. " removed before it, in the copy only)", removed = emptyArray(removed) }) end
     removed[#removed + 1] = t.row
   end
   local left = fixturesByFid(p)
-  for _, t in ipairs(targets) do if left[t.fid] then raise({ code = "remove-failed", message = "FID " .. t.fid .. " is still in the copy after Delete", removed = emptyArray(removed) }) end end
+  for fid in pairs(removedFids) do if left[fid] then raise({ code = "remove-failed", message = "FID " .. fid .. " is still in the copy after Delete", removed = emptyArray(removed) }) end end
   return { removed = emptyArray(removed) }
 end
+
+end -- explicit DMX-break and compound-fixture helpers
 
 ops["patch.commit"] = function(args)
   requireExclusive(args, "patch.commit")
@@ -4309,6 +4539,33 @@ local function patchFingerprint(p, only, exclude, opts)
     if not (okP and isHandle(t)) then return nil end
     return guidOf(t) .. "/" .. tostring(safeProp(m, "name"))
   end
+  local function environmentalSelfReference(h, index)
+    local okT, propType = pcall(function() return h:PropertyType(index) end)
+    local okI, info = pcall(function() return h:PropertyInfo(index) end)
+    if not (okT and propType == "Handle" and okI and type(info) == "table" and info.ReadOnly == true) then return nil end
+    local okF, fixture = pcall(function() return h:Get("Fixture") end)
+    if not okF or fixture ~= h then return nil end
+    local okFT, ft = pcall(function() return h:Get("FixtureType") end)
+    if not okFT or safeCall(ft, "GetClass") ~= "FixtureType" or displayProp(ft, "SpecialPurpose") ~= "MVR Environmental" then return nil end
+    -- FIXTURE is this environmental Fixture's derived, read-only owner/self link. After AddFixtures,
+    -- its Display text can transiently name the appended fixture or be empty (onPC 2.5.1.1, live
+    -- 2026-10-26). Hash verified raw self-identity instead; every other reference remains hashed.
+    return "self"
+  end
+  -- onPC 2.5.1.1 (2026-10-30): a Fixture's raw FIXTURE handle is self,
+  -- while its Display text can name the next sibling (empty on the last one).
+  -- Adding a touched fixture changes that text on an untouched tail fixture.
+  -- Canonicalize only proven raw-self identity; non-self/unreadable references
+  -- keep the normal Display comparison, and a changed GUID remains visible.
+  local function fixtureSelfIdentity(h)
+    local ok, f = pcall(function() return h:Get("FIXTURE") end)
+    if not (ok and (isHandle(f) or (type(f) == "table" and type(f.Get) == "function"))) then return nil end
+    local address = safeCall(h, "Addr")
+    if address == nil or address == "" or safeCall(f, "Addr") ~= address then return nil end
+    local g = guidOf(h)
+    if g == "" or guidOf(f) ~= g then return nil end
+    return "self#" .. g
+  end
   local function add(h, depth, renumbered, isType, bare)
     if r.objects >= PATCH_FP_LIMIT then r.complete = false; r.reason = "more than " .. PATCH_FP_LIMIT .. " objects"; return false end
     local okc, n = pcall(function() return h:PropertyCount() end)
@@ -4321,11 +4578,21 @@ local function patchFingerprint(p, only, exclude, opts)
       pn = list; names[key] = list
     end
     local class = tostring(safeCall(h, "GetClass"))
+    -- onPC 2.5.1.1 normalizes Yes -> No in the edit copy for an imported MVR environmental
+    -- type's Geometries container (SceneObject, live 2026-10-26). This is naming-policy metadata,
+    -- not geometry data. Keep it hashed on every other class/parent/purpose; real geometry,
+    -- material, mode and fixture-pose properties remain part of the fingerprint.
+    local parent = class == "Geometries" and safeCall(h, "Parent") or nil
+    local copyNamingPolicy = parent and safeCall(parent, "GetClass") == "FixtureType"
+      and displayProp(parent, "SpecialPurpose") == "MVR Environmental"
     local unnumbered = renumbered or isType or bare or (opts.fixturePositions == false and class == "Fixture")
     local parts = { tostring(depth), class, unnumbered and "" or tostring(safeProp(h, "no")) }
-    for _, k in ipairs(pn) do
-      if not PATCH_FP_PROP_SKIP[k] and not (unnumbered and k == "INDEX") and not (bare and k == "NAME") then
-        local v = (k == "FIXTURETYPE" and typeIdentity(h)) or (k == "MODEDIRECT" and modeIdentity(h)) or ((isType and k == "NAME") and tostring(safeProp(h, "name"))) or nil
+    for i, k in ipairs(pn) do
+      if not PATCH_FP_PROP_SKIP[k] and not (unnumbered and k == "INDEX") and not (bare and k == "NAME")
+        and not (copyNamingPolicy and k == "IGNOREENFORCEUNIQUECHILDNAMES") then
+        local v = (k == "FIXTURETYPE" and typeIdentity(h)) or (k == "MODEDIRECT" and modeIdentity(h))
+          or (k == "FIXTURE" and class == "Fixture" and (environmentalSelfReference(h, i - 1) or fixtureSelfIdentity(h)))
+          or ((isType and k == "NAME") and tostring(safeProp(h, "name"))) or nil
         if v == nil then
           local okv, dv = pcall(function() return h:Get(k, Enums.Roles.Display) end)
           if not okv then r.complete = false; r.reason = "property " .. tostring(k) .. " of " .. tostring(safeProp(h, "name")) .. " could not be read"; return false end
@@ -7140,19 +7407,22 @@ local function presetRow(fixtureKey, attr, ch, typeCache)
     mode = PRESET_MODES[pm] or (pm and tostring(pm)) or nil,
     -- SB-05: produced by a recipe (mask_cooked non-zero; 511 on 2.5.1) rather than stored directly.
     cooked = (tonumber(ch.mask_cooked) or 0) ~= 0,
+    dictFlags = flags,
     hasAbsolute = flags.has_absolute == 1 or flags.has_absolute == true, hasRelative = flags.has_relative == 1 or flags.has_relative == true,
     fade = ch.fade, delay = ch.delay, speed = ch.speed, phase = ch.phase, measure = ch.measure, speedMaster = ch.speed_master, stepCount = #ch,
     absPreset = objectRefInfo(ch.abs_preset), relPreset = objectRefInfo(ch.rel_preset),
   }
   if #ch == 1 and type(ch[1]) == "table" then
     row.value = ch[1].absolute; row.valueRaw = ch[1].absolute_value; row.relative = ch[1].relative
+    row.valueKind = ch[1].abs_release == true and "release" or nil
+    row.relativeKind = ch[1].rel_release == true and "release" or nil
   elseif #ch > 1 then
     -- SB-04: every step with its layers (absent = the console default: width / trans 100, accel / decel 0) and
     -- the preset it integrates.
     row.steps = {}
     for i, st in ipairs(ch) do
       if type(st) == "table" then
-        row.steps[#row.steps + 1] = { step = i, absolute = st.absolute, relative = st.relative, accel = st.accel, decel = st.decel, accelType = st.accel_type, decelType = st.decel_type,
+        row.steps[#row.steps + 1] = { step = i, absolute = st.absolute, relative = st.relative, absoluteKind = st.abs_release == true and "release" or nil, relativeKind = st.rel_release == true and "release" or nil, accel = st.accel, decel = st.decel, accelType = st.accel_type, decelType = st.decel_type,
           trans = st.trans, width = st.width, integrated = objectRefInfo(st.integrated) }
       end
     end
@@ -7162,8 +7432,7 @@ end
 
 -- args: { ref (e.g. "Preset 4.12" or a numeric address), typesFor? = [subfixture index, ...] }. typesFor returns
 -- the fixture type the rows use for those subfixtures, so a client can tell which global row covers a fixture.
-ops["preset.read"] = function(args)
-  local h = resolve(args.ref)
+local function readPresetHandle(h, args)
   local class = safeCall(h, "GetClass")
   -- SB-05: a cue Part holds data the same way (GetPresetData works on it); its rows say which values were cooked.
   if class ~= "Preset" and class ~= "Part" then raise("[not-preset] " .. tostring(args.ref) .. " is a " .. tostring(class) .. ", not a preset or cue part") end
@@ -7231,6 +7500,290 @@ ops["preset.read"] = function(args)
     end
   end
   emptyArray(out.rows); emptyArray(out.dependencies)
+  return out, data
+end
+
+ops["preset.read"] = function(args)
+  return readPresetHandle(resolve(args.ref), args)
+end
+
+-- Saved View widgets and live ScreenContent use the same native ViewWidget/settings tree.
+-- Encode canonical configuration as a string so normal response depth limits cannot hide fields.
+ops["view.content"] = function(args)
+  local out = { complete = true, windows = {}, limitations = {} }
+  local ignored = {}
+  for word in ("GUID INDEX NO COUNT MEMORYFOOTPRINT UIWINDOW PREVIEWCOPY USEREXPANDED IGNORENETWORK DEPENDENCYEXPORT LOCK STRUCTURELOCKED SYSTEMLOCKED OWNED FADERENABLED"):gmatch("%S+") do ignored[word] = true end
+  local visited, properties, values = 0, 0, 0
+  local function configurationProperty(h,name,info)
+    -- Do not use generic getProp's unconditional userdata-to-handle conversion here: native
+    -- custom values can be userdata without being object handles, and must remain incomplete.
+    local ok,value,err
+    if name:upper()=="TAGS" then ok,value,err=pcall(getProp,h,name,false,true)
+    else ok,value=pcall(function() return h:Get(name) end) end
+    if not ok then return nil,tostring(value) end
+    if value==nil and info and tostring(info.type)=="Handle" then
+      -- View3DSettings.CAMERA has nil raw access even when assigned. Its Edit role contains
+      -- the exact native handle; the display label alone cannot establish target identity.
+      local editOk,edit=pcall(function() return h:Get(name,Enums.Roles.Edit) end)
+      local displayOk,display=pcall(function() return h:Get(name,Enums.Roles.Display) end)
+      if not editOk or not displayOk then return nil,"native Handle roles are unreadable" end
+      local emptyEdit=edit==nil or edit=="" or (type(edit)=="string" and edit:match("^#0+$")~=nil)
+      if emptyEdit and (display==nil or display=="") then return nil end
+      -- Native 2.5.1.1 View3DSettings uses no assigned RenderQuality handle while showing
+      -- the selected/default quality in angle brackets. Preserve that observed state and
+      -- label; do not fabricate a pool-object identity or discard this property.
+      if edit=="" and name:upper()=="RENDERQUALITY" and safeCall(h,"GetClass")=="View3DSettings" and display=="<Standard>" then
+        return {handleState="unassigned",edit=edit,display=display}
+      end
+      -- The bundled default_cameras.xml defines Front; native 2.5.1.1 exposes this
+      -- built-in View3DSettings camera with nil raw access, empty Edit and <Front>
+      -- Display. This is a mode, not a missing Camera pool reference. Qualify only
+      -- the observed role shape and label; retain both roles without inventing an address.
+      if edit=="" and name:upper()=="CAMERA" and safeCall(h,"GetClass")=="View3DSettings" and display=="<Front>" then
+        return {handleState="builtin",edit=edit,display=display}
+      end
+      if type(edit)~="string" or not edit:match("^#%x+$") or emptyEdit then return nil,"native Handle has no exact readable Edit identity" end
+      local resolved,target=pcall(StrToHandle,edit)
+      if edit:upper()=="#FFFFFFFFFFFFFFFF" and display=="" and resolved and isHandle(target) then
+        local validOk,valid=pcall(IsObjectValid,target)
+        if validOk and valid==false then return {handleState="invalid",edit=edit,display=display} end
+      end
+      local identityOk,address,class=pcall(function()
+        if not resolved or not isHandle(target) or not IsObjectValid(target) then return end
+        return target:Addr(),target:GetClass()
+      end)
+      if not identityOk or type(address)~="string" or address=="" or type(class)~="string" or class=="" then return nil,"native Edit Handle could not be resolved" end
+      value=target
+    end
+    if type(value)=="function" then return nil,"native method is not a saved property" end
+    return value,err
+  end
+  local function normalized(v, depth, anchor)
+    values = values + 1
+    if depth > 8 or values > 100000 then out.complete = false; return "<configuration bound>" end
+    if type(v) == "number" and (v ~= v or math.abs(v) == math.huge) then out.complete = false; return "<nonfinite>" end
+    if isHandle(v) then
+      local ok,summary=pcall(handleSummary,v)
+      if not ok or type(summary)~="table" or type(summary.addr)~="string" or type(summary.class)~="string" then
+        out.complete=false;return {unreadable="unsupported native userdata"}
+      end
+      -- A reference identifies its target; its target's cache population is not this window's
+      -- persisted configuration. Real window-tree children are still traversed separately below.
+      summary.childCount=nil
+      v=summary
+    end
+    if type(v)=="userdata" then out.complete=false;return {unreadable="unsupported native userdata",display=tostring(v)} end
+    if type(v) == "table" and type(v.addr)=="string" and anchor and (v.addr==anchor or v.addr:sub(1,#anchor+1)==anchor..".") then
+      local copy={};for k,value in pairs(v) do if k~="addrNative" then copy[k]=value end end
+      copy.addr="$window"..v.addr:sub(#anchor+1);v=copy
+    end
+    if type(v) ~= "table" then
+      if type(v) == "function" or type(v) == "thread" then out.complete = false; return "<unreadable>" end
+      return v
+    end
+    local list = {}
+    for k,value in pairs(v) do
+      if values>=100000 then out.complete=false;break end
+      local kind=type(k)
+      local valid=kind=="string" or (kind=="number" and k==k and math.abs(k)~=math.huge)
+      if not valid then out.complete=false end
+      list[#list+1]={key=valid and tostring(k) or "<unsupported native key>",keyType=kind,value=normalized(value,depth+1,anchor)}
+    end
+    table.sort(list,function(a,b) if a.keyType~=b.keyType then return a.keyType<b.keyType end; return a.key<b.key end)
+    emptyArray(list); return {entries=list}
+  end
+  local function tree(h, depth, anchor)
+    anchor=anchor or safeCall(h,"Addr")
+    visited=visited+1
+    if depth>10 or visited>5000 then out.complete=false; return {unreadable="native window tree bound"} end
+    local node={class=safeCall(h,"GetClass"),name=safeProp(h,"name"),properties={},children={}}
+    if type(node.class)~="string" then out.complete=false;node.class="<unreadable class>" end
+    if type(node.name)~="string" then out.complete=false;node.name="<unreadable name>" end
+    local count=safeCall(h,"PropertyCount")
+    local schema={}
+    if type(count)~="number" or count<0 or count%1~=0 or count>50000-properties then
+      out.complete=false;node.enumerationError="native property schema unavailable or exceeds bound"
+    else
+      schema=propertyNames(h)
+      if #schema~=count then out.complete=false;node.enumerationError="native property schema incomplete" end
+    end
+    for _,info in ipairs(schema) do
+      local name=info.name:upper()
+      -- Read-only runtime properties are excluded; DISPLAY is persisted window placement.
+      if not ignored[name] and (info.readOnly~=true or name=="DISPLAY") and tostring(info.type)~="Action" and tostring(info.type)~="Signal" then
+        properties=properties+1
+        if properties>50000 then out.complete=false; break end
+        if info.readOnly~=true and info.readOnly~=false then out.complete=false end
+        local value,err=configurationProperty(h,info.name,info)
+        if err then out.complete=false end
+        local entry={name=name,nilValue=value==nil,error=err};if value~=nil then entry.value=normalized(value,0,anchor) end;node.properties[#node.properties+1]=entry
+      end
+    end
+    table.sort(node.properties,function(a,b)return a.name<b.name end)
+    local children=safeCall(h,"Children")
+    if type(children)~="table" then out.complete=false;children={} end
+    for _,child in ipairs(children) do
+      if visited>=5000 then out.complete=false;break end
+      node.children[#node.children+1]=tree(child,depth+1,anchor)
+    end
+    emptyArray(node.properties);emptyArray(node.children);return node
+  end
+  if args.ref~=nil then
+    if args.screens~=nil then raise("[bad-args] choose ref or screens") end
+    local view=resolve(args.ref)
+    if safeCall(view,"GetClass")~="View" then raise("[not-view] ref must identify one saved View") end
+    out.ref=args.ref;out.kind="saved_view"
+    out.metadata={}
+    for _,field in ipairs({{"name","Name"},{"screenContentMask","ScreenContentMask"},{"requestedW","RequestedW"},{"requestedH","RequestedH"}}) do
+      local value,err=configurationProperty(view,field[2])
+      if err then out.complete=false end
+      out.metadata[field[1]]=normalized(value,0)
+    end
+    local children=safeCall(view,"Children")
+    if type(children)~="table" then out.complete=false;children={} end
+    for _,widget in ipairs(children) do
+      if visited>=5000 then out.complete=false;break end
+      local displayValue,displayError=configurationProperty(widget,"Display")
+      local screen=tonumber(displayValue)
+      if not screen or displayError then out.complete=false end
+      out.windows[#out.windows+1]={screen=screen,order=#out.windows+1,configuration=tree(widget,0)}
+    end
+  else
+    if type(args.screens)~="table" or #args.screens<1 or #args.screens>7 then raise("[bad-args] screens must contain1..7 explicit screens") end
+    out.kind="live_screens";out.screens={}
+    local config=CurrentScreenConfig();if not isHandle(config) then raise("[unreadable] screen configuration unavailable") end
+    local seen={}
+    for _,screen in ipairs(args.screens) do
+      if type(screen)~="number" or screen%1~=0 or screen<1 or screen>7 or seen[screen] then raise("[bad-args] screens must be distinct integers1..7") end
+      seen[screen]=true;out.screens[#out.screens+1]=screen
+      local content=config.ScreenContents:Ptr(screen)
+      if not isHandle(content) then raise("[unreadable] requested screen content unavailable") end
+      local children=safeCall(content,"Children")
+      if type(children)~="table" then out.complete=false;children={} end
+      for _,widget in ipairs(children) do
+        if visited>=5000 then out.complete=false;break end
+        out.windows[#out.windows+1]={screen=screen,order=#out.windows+1,configuration=tree(widget,0)}
+      end
+    end
+    table.sort(out.screens);emptyArray(out.screens)
+  end
+  -- Native child order is significant within each screen; group screens without reordering siblings.
+  table.sort(out.windows,function(a,b) if a.screen==b.screen then return a.order<b.order end;return (a.screen or 0)<(b.screen or 0) end)
+  for _,window in ipairs(out.windows) do window.order=nil end
+  emptyArray(out.windows)
+  out.contentJson=json.encode(out.windows)
+  if #out.contentJson>4*1024*1024 then out.complete=false;out.contentJson=nil end
+  out.windows=nil;out.nodes=visited;out.properties=properties
+  out.limitations[1]="Persisted writable window configuration and rectangles; GUIDs, runtime IDs, read-only engine state and pixels are excluded."
+  emptyArray(out.limitations);return out
+end
+
+-- Read the actual stored cue-part channels. No selection, playback, tracking edit or export.
+-- Full raw fields supplement the convenience projection, so checkpoint hashes do not hide edits.
+ops["cue.content"] = function(args, capture)
+  -- The second argument is internal-only; the paging wrapper supplies capture bounds.
+  local cueLimit = capture and capture.maxCueObjects or 500
+  local capturedBytes, capturedParts = 0, 0
+  local function captureBudget()
+    if capture and capture.deadline and now() > capture.deadline then raise("[capture-limit] native cue capture exceeded its time budget") end
+  end
+  local h = resolve(args.ref)
+  local class = safeCall(h, "GetClass")
+  if class ~= "Sequence" and class ~= "Cue" then raise("[not-cue] ref must resolve to one Sequence or Cue") end
+  local out = { ref = args.ref, source = "GetPresetData(CuePart,false,true)", complete = true, cues = {}, limitations = {} }
+  local budget = { entries = 0 }
+  local function raw(value, depth)
+    budget.entries = budget.entries + 1
+    if capture and budget.entries > 100000 then raise("[capture-limit] native cue capture exceeds 100000 raw entries") end
+    if budget.entries > 100000 or depth > 10 then out.complete = false; return { unreadable = "serialization bound" } end
+    if isHandle(value) then return { object = objectRefInfo(value) } end
+    local kind = type(value)
+    if kind == "nil" or kind == "string" or kind == "boolean" then return value end
+    if kind == "number" then
+      if value == value and math.abs(value) ~= math.huge then return value end
+      out.complete = false; return { unreadable = "nonfinite native number", display = tostring(value) }
+    end
+    if kind ~= "table" then out.complete = false; return { unreadable = "native type " .. kind } end
+    local entries = {}
+    for k, v in pairs(value) do
+      if type(k) ~= "string" and type(k) ~= "number" then out.complete = false end
+      entries[#entries + 1] = { keyType = type(k), key = tostring(k), value = raw(v, depth + 1) }
+    end
+    table.sort(entries, function(a,b) if a.keyType ~= b.keyType then return a.keyType < b.keyType end; return a.key < b.key end)
+    emptyArray(entries)
+    return { entries = entries }
+  end
+  local function props(object)
+    local fields = {}
+    for _, key in ipairs({ "No", "Name", "Tracking", "TrackingDistance", "CueOnly", "Break", "Shield", "Assert", "Release", "CueFade", "CueOutFade", "CueDelay", "CueOutDelay", "TrigType", "TrigTime" }) do
+      fields[key] = getProp(object, key, true)
+    end
+    return fields
+  end
+  local cues = class == "Cue" and { h } or safeCall(h, "Children")
+  if type(cues) ~= "table" then raise("[unreadable] cue children unavailable") end
+  if class == "Sequence" then out.sequence = { addr = safeCall(h,"Addr"), name = safeProp(h,"name"), fields = props(h) } end
+  for _, cue in ipairs(cues) do
+    if safeCall(cue,"GetClass") == "Cue" then
+      captureBudget()
+      if #out.cues >= cueLimit then out.complete = false; break end
+      local item = { addr = safeCall(cue,"Addr"), name = safeProp(cue,"name"), no = safeProp(cue,"no"), fields = props(cue), parts = {} }
+      if capture then item.fields.AllowDuplicates = getProp(cue, "AllowDuplicates", true) end
+      local parts = safeCall(cue,"Children")
+      if type(parts) ~= "table" then out.complete = false; parts = {} end
+      local seenParts = {}
+      for _, part in ipairs(parts) do
+        if safeCall(part,"GetClass") == "Part" then
+          captureBudget()
+          capturedParts = capturedParts + 1
+          if capture and capturedParts > 50000 then raise("[capture-limit] native cue capture exceeds 50000 parts") end
+          local addr = safeCall(part,"Addr")
+          local partNo = safeProp(part,"no")
+          if capture then
+            -- Part number is a separate native property, not the child index in Addr.
+            partNo = getProp(part, "Part", false)
+            if type(partNo) == "string" and partNo:match("^%d+$") then partNo = tonumber(partNo) end
+            -- On 2.5.1.1 the internal OffCue/CueZero main parts have no Part property.
+            local internal = (item.name == "OffCue" and item.no == nil) or (item.name == "CueZero" and item.no == 0)
+            if partNo == nil and internal and #parts == 1 and type(item.addr) == "string"
+              and addr == item.addr .. ".0" and safeProp(part, "name") == "Part 0" then partNo = 0 end
+            if type(partNo) ~= "number" or partNo % 1 ~= 0 or partNo < 0 or partNo > 999 or seenParts[partNo] then
+              partNo = nil
+              out.complete = false
+            else
+              seenParts[partNo] = true
+            end
+          end
+          -- Reuse the supported preset reader for its normalized steps, links and fixture identity.
+          local content
+          local okRead, read, data = pcall(readPresetHandle, part, { ref = addr })
+          if okRead then content = read else out.complete = false; content = { error = tostring(read) } end
+          local okData = okRead
+          if not capture then okData, data = callApi("GetPresetData", part, false, true) end
+          local rawChannels
+          if okData and type(data) == "table" then
+            rawChannels = raw(data,0)
+            local expected = tonumber(data.count)
+            if not content or content.truncated or content.byFixtures ~= true or (expected and expected ~= content.count) then out.complete = false end
+          else out.complete = false end
+          item.parts[#item.parts+1] = { addr = addr, no = partNo, name = safeProp(part,"name"), fields = props(part), encoding = "json", contentJson = content and json.encode(content), rawChannelsJson = rawChannels and json.encode(rawChannels) }
+        end
+      end
+      emptyArray(item.parts)
+      if capture then
+        captureBudget()
+        local cueBytes = #json.encode(item)
+        if cueBytes > capture.maxPageBytes then raise("[capture-limit] one cue exceeds the 8MiB page data budget") end
+        capture.cueBytes[#capture.cueBytes + 1] = cueBytes
+        capturedBytes = capturedBytes + cueBytes
+        if capturedBytes > 32 * 1024 * 1024 then raise("[capture-limit] native cue capture exceeds 32MiB") end
+      end
+      out.cues[#out.cues+1] = item
+    end
+  end
+  emptyArray(out.cues)
+  if not out.complete then out.limitations[1] = "Native content was unreadable, unmapped or exceeded bounds; never use this result as a complete checkpoint." end
+  emptyArray(out.limitations)
   return out
 end
 
@@ -7281,6 +7834,7 @@ local TC_TOKENS = { ["Go+"] = true, ["Go-"] = true, Goto = true, Load = true, On
   Pause = true, Kill = true, Flash = true, Temp = true, Swap = true, Select = true, ["<<<"] = true, [">>>"] = true }
 local TC_STATUS_TOKENS = { Flash = true, Temp = true, Swap = true }
 GUARDED_OPS["timecode.edit"] = "a timecode change"
+GUARDED_OPS["timecode.create"] = "a timecode change"
 
 local function tcShow(n)
   n = tonumber(n)
@@ -7327,9 +7881,32 @@ local function tcCue(e)
   return { addr = safeCall(c, "Addr"), name = safeProp(c, "name"), no = safeProp(c, "no"), sequence = isHandle(parent) and safeProp(parent, "no") or nil }
 end
 
-local function tcEvent(e, index)
+local function tcEvent(e, index, includeFields)
   local raw = safeCall(e, "Get", "RawTime")
+  local class = safeCall(e, "GetClass")
+  local fields, fieldsComplete
+  -- Preserve non-command native events, including recorded fader automation, without guessing their schema.
+  if class ~= "CmdEvent" and includeFields ~= false then
+    fields, fieldsComplete = {}, true
+    local n = safeCall(e, "PropertyCount")
+    if type(n) ~= "number" or n < 1 then fieldsComplete = false
+    else
+      if n > 64 then fieldsComplete = false end
+      for i = 0, math.min(n - 1, 63) do
+        local name = safeCall(e, "PropertyName", i)
+        if type(name) ~= "string" then fieldsComplete = false
+        else
+          local value, why = getProp(e, name, false, true)
+          fields[name] = value
+          if why then fieldsComplete = false end
+        end
+      end
+    end
+  end
   return {
+    class = class, fields = fields, fieldsComplete = fieldsComplete,
+    faderValue = class == "FaderEvent" and tonumber(safeCall(e, "Get", "FaderValue")) or nil,
+    fadeOverrideSeconds = class == "FaderEvent" and tonumber(safeCall(e, "Get", "FadeOverride")) or nil,
     index = index, raw = tonumber(raw), time = getProp(e, "Time", true), name = safeProp(e, "name"),
     token = getProp(e, "Token", true), tokenCode = tonumber(safeCall(e, "Get", "Token")), status = getProp(e, "Status", true),
     cue = tcCue(e), executeCommand = getProp(e, "ExecuteCommand", true), fadeOverride = getProp(e, "FadeOverride", true), note = getProp(e, "Note", true),
@@ -7339,6 +7916,20 @@ end
 local TC_SHOW_FIELDS = { "Name", "Cursor", "Duration", "LoopMode", "LoopCount", "TCSlot", "OffsetTCSlot", "AutoStart", "AutoStop", "SwitchOff", "Goto",
   "AssertPrevEvents", "PlaybackAndRecord", "RestartOption", "FrameReadout", "TimeDisplayFormat", "Lock" }
 
+local function tcFaderSchema(e)
+  local out={class=safeCall(e,"GetClass"),properties={}}
+  local count=safeCall(e,"PropertyCount")
+  if type(count)~="number" or count>128 then return {complete=false,reason="property schema unavailable or exceeds bound"} end
+  for i=0,count-1 do
+    local name=safeCall(e,"PropertyName",i)
+    if type(name)=="string" and ({FADERVALUE=true,FADEOVERRIDE=true,RAWTIME=true,TOKEN=true})[name:upper()] then
+      out.properties[name:upper()]={type=safeCall(e,"PropertyType",i),info=toJsonSafe(safeCall(e,"PropertyInfo",i)),raw=getProp(e,name,false),display=getProp(e,name,true)}
+    end
+  end
+  out.complete=out.properties.FADERVALUE~=nil and out.properties.RAWTIME~=nil
+  return out
+end
+
 -- Flat lists (the reply encoder nests at most 6 levels): every track, range, subtrack and event names its path.
 ops["timecode.read"] = function(args)
   local tc = tcShow(args.timecode)
@@ -7347,6 +7938,7 @@ ops["timecode.read"] = function(args)
   for _, f in ipairs(TC_SHOW_FIELDS) do out.settings[f] = getProp(tc, f, true) end
   out.settings.RawDuration = tonumber(safeCall(tc, "Get", "RawDuration"))
   pcall(function() out.playing = tc:HasActivePlayback() end)
+  pcall(function() out.recording = tc.IsRecording() end)
   for gi, g in ipairs(tcChildren(tc, "TrackGroup")) do
     local markers = 0
     for _, m in ipairs(tcChildren(g, "MarkerTrack")) do local okM, n = pcall(m.Count, m); markers = markers + (okM and n or 0) end
@@ -7358,12 +7950,13 @@ ops["timecode.read"] = function(args)
           offset = getProp(r, "Offset", true), speedFactor = getProp(r, "SpeedFactor", true), play = getProp(r, "Play", true), rec = getProp(r, "Rec", true) }
         for si, st in ipairs(tcChildren(r, nil)) do
           local okN, n = pcall(st.Count, st)
-          out.subtracks[#out.subtracks + 1] = { group = gi, track = ti, range = ri, subtrack = si, class = safeCall(st, "GetClass"), name = safeProp(st, "name"), count = okN and n or nil }
+          out.subtracks[#out.subtracks + 1] = { group = gi, track = ti, range = ri, subtrack = si, class = safeCall(st, "GetClass"), name = safeProp(st, "name"), count = okN and n or nil, faderToken = safeCall(st,"GetClass") == "FaderSubTrack" and getProp(st,"FaderToken",false) or nil }
           for ei, e in ipairs(tcChildren(st, nil)) do
             out.eventCount = out.eventCount + 1
             if #out.events >= maxEvents then out.truncated = true
             else
-              local ev = tcEvent(e, ei)
+              local ev = tcEvent(e, ei, args.eventFields ~= false)
+              if args.faderSchema == true and not out.faderSchema and ev.class == "FaderEvent" then out.faderSchema = tcFaderSchema(e) end
               ev.group, ev.track, ev.range, ev.subtrack = gi, ti, ri, si
               out.events[#out.events + 1] = ev
             end
@@ -7376,11 +7969,30 @@ ops["timecode.read"] = function(args)
   return out
 end
 
+-- Absence and exact target are checked in the same non-yielding plugin operation as Store. No overwrite,
+-- current-selection target, recording, playback or live fader command is used by this create-only route.
+ops["timecode.create"] = function(args)
+  local n, sequence = args.timecode, args.sequence
+  if type(n) ~= "number" or n ~= math.floor(n) or n < 1 or n > 99999 then raise("[bad-args] timecode must be an integer 1-99999") end
+  if type(sequence) ~= "number" or sequence ~= math.floor(sequence) or sequence < 1 or sequence > 99999 then raise("[bad-args] sequence must be an integer 1-99999") end
+  local existing = objectList(string.format("Timecode %d",n))
+  if existing and #existing > 0 then raise("[already-exists] Timecode " .. n .. " exists; create-only never overwrites") end
+  local targets = objectList(string.format("Sequence %d",sequence))
+  local target = targets and targets[1]
+  if not isHandle(target) or #targets ~= 1 or safeCall(target,"GetClass") ~= "Sequence" then raise("[not-found] exact sequence target does not exist") end
+  if type(args.expectedTargetAddr) ~= "string" or safeCall(target,"Addr") ~= args.expectedTargetAddr then raise("[target-changed] exact sequence address differs; nothing created") end
+  local ok, response = pcall(Cmd,string.format("Store Timecode %d /NoConfirmation",n))
+  if not ok or response ~= "OK" then raise({code="create-uncertain",message="Store did not confirm OK; inspect the new timecode before another create",response=tostring(response)}) end
+  local created = tcShow(n)
+  return {created=true,no=n,addr=safeCall(created,"Addr"),targetAddr=args.expectedTargetAddr}
+end
+
 -- One structural step per request (see above). Every argument is checked before anything is appended.
 ops["timecode.edit"] = function(args)
   local action = args.action
-  if action ~= "add_group" and action ~= "add_track" and action ~= "set_target" and action ~= "add_events" then raise("[bad-args] action must be add_group, add_track, set_target or add_events") end
+  if action ~= "add_group" and action ~= "add_track" and action ~= "set_target" and action ~= "add_events" and action ~= "add_fader_events" then raise("[bad-args] action must be add_group, add_track, set_target, add_events or add_fader_events") end
   local tc = tcShow(args.timecode)
+  if args.expectedTimecodeAddr ~= nil and safeCall(tc,"Addr") ~= args.expectedTimecodeAddr then raise("[timecode-changed] exact timecode address differs; nothing appended or written") end
   if action == "add_group" then
     local g = tc:Append("TrackGroup")
     if not isHandle(g) then raise("[failed] the track group was not created") end
@@ -7400,9 +8012,48 @@ ops["timecode.edit"] = function(args)
     local h = list and list[1]
     if not isHandle(h) then raise("[not-found] " .. args.target .. " does not exist") end
     if safeCall(h, "GetClass") ~= "Sequence" then raise("[unsupported] only sequences are targets in this release (" .. args.target .. " is a " .. tostring(safeCall(h, "GetClass")) .. ")") end
+    if args.expectedTargetAddr ~= nil and safeCall(h,"Addr") ~= args.expectedTargetAddr then raise("[target-changed] exact target address differs; nothing assigned") end
     local okS, err = pcall(t.Set, t, "Target", h)
     if not okS then raise("[failed] the target was not set: " .. tostring(err)) end
     return { action = action, target = tcTarget(t) }
+  end
+  if action == "add_fader_events" then
+    local r = tcNth(t,"TimeRange",args.range or 1,"time range")
+    if #tcChildren(r,nil) ~= 0 then raise("[not-empty] direct fader authoring needs an empty range; existing events are never replaced") end
+    local target = tcTarget(t)
+    if not target or target.class ~= "Sequence" or type(args.expectedTargetAddr) ~= "string" or target.addr ~= args.expectedTargetAddr then raise("[target-changed] exact sequence target differs; no fader event appended") end
+    local okPlay, playing = pcall(tc.HasActivePlayback,tc)
+    local okRec, recording = pcall(function() return tc.IsRecording() end)
+    if not okPlay or not okRec or playing ~= false or recording ~= false then raise("[not-idle] timecode playback/recording must be confirmed idle") end
+    if type(args.events) ~= "table" or #args.events < 1 or #args.events > 512 then raise("[bad-args] events must contain1-512 fader events") end
+    local plan, previous = {}, -1
+    local maxRaw = (255*3600+59*60+59)*16777216
+    for i, ev in ipairs(args.events) do
+      local raw, value, fade = ev.raw, ev.value, ev.fadeSeconds
+      if fade == nil then fade = 0 end
+      if type(raw) ~= "number" or raw ~= math.floor(raw) or raw < 0 or raw > maxRaw or raw < previous then raise("[bad-args] fader raw times must be bounded nonnegative integers in storage/time order") end
+      if type(value) ~= "number" or value ~= math.floor(value) or value < 0 or value > 100 then raise("[bad-args] fader values must be integer percentages0-100") end
+      if type(fade) ~= "number" or fade ~= fade or fade < 0 or raw+fade*16777216 > maxRaw then raise("[bad-args] fade seconds must be finite, nonnegative and inside the timecode bound") end
+      previous = raw; plan[i] = {raw=raw,value=value,fade=fade}
+    end
+    local st = r:Append("FaderSubTrack")
+    if not isHandle(st) then raise("[not-ready] FaderSubTrack was not created; target must settle in an earlier request") end
+    local okToken, tokenError = pcall(st.Set,st,"FaderToken","Master")
+    if not okToken or getProp(st,"FaderToken",false) ~= "Master" then raise({code="partial",message="new fader subtrack Master token did not read back; no event appended",error=tostring(tokenError)}) end
+    local added = {}
+    for i,p in ipairs(plan) do
+      local e = st:Append("FaderEvent")
+      if not isHandle(e) then raise({code="partial",message="FaderEvent "..i.." was not created; no retry",added=emptyArray(added)}) end
+      local ok, err = pcall(function()
+        -- Typed numeric arguments are deliberate: a display string is not the native storage contract.
+        e:Set("RawTime",p.raw); e:Set("Token","FaderMaster"); e:Set("FaderValue",p.value); e:Set("FadeOverride",p.fade)
+      end)
+      local read = tcEvent(e,i,false); added[#added+1] = read
+      if not ok or read.raw ~= p.raw or read.faderValue ~= p.value or not read.fadeOverrideSeconds or math.abs(read.fadeOverrideSeconds-p.fade)>1e-8 then
+        raise({code="partial",message="native fader event readback differs at"..i.."; inspect without replay: "..tostring(err),added=emptyArray(added)})
+      end
+    end
+    return {action=action,added=emptyArray(added),target=target}
   end
   if action == "add_events" then
     local r = tcNth(t, "TimeRange", args.range or 1, "time range")
@@ -7470,6 +8121,443 @@ end
 -- Error replies: "error" is always "[code] message" (first line only), "code" the bracketed code when
 -- there is one, and "detail" the module's structured error table (partial progress, owner, lease) when
 -- the op raised one. A string error keeps its text; a "[code]" prefix in it is reported as the code.
+ops._fastpath = (function()
+  local generation = state.fastGeneration
+  local fastpath = { generation = generation }
+  -- Bounded work executed by the bridge loop between client-service passes. A cancellation can
+  -- stop the next step; it cannot undo or interrupt a native command already in progress.
+  local leases, batches, snapshots, cueSnapshots = {}, {}, {}, {}
+  local serial, contextEpoch, previousIdentity, batchCursor = 0, 0, nil, 0
+  local READ_OPS = {}
+  for word in ("ping modules object children objects dump getfader executor executors api fixtureAttributes programmer fixtureOutput dmx cueContents cue.content view.content feedback.describe feedback.read feedback.context feedback.watch feedback.unwatch input.status input.routing input.sequence.status control.status patch.state patch.types patch.list patch.check patch.collections patch.fingerprint patch.library patch.libraryStat patch.typeInfo patch.typeStructure patch.importState patch.cellLayout patch.moveCheck patch.moveState patch.groupsOf dmx.output vars.get tags tags.of show.files dialog.read osc.read group.read selection.grid preset.read preset.context timecode.read fast.context fast.batch programmer.snapshot"):gmatch("%S+") do READ_OPS[word] = true end
+  local BATCH_READS = {}
+  for word in ("object children objects getfader fixtureAttributes programmer fixtureOutput cueContents cue.content view.content feedback.read feedback.context group.read selection.grid preset.read timecode.read"):gmatch("%S+") do BATCH_READS[word] = true end
+  local function fail(code, message) error({ code = code, message = message }, 0) end
+  local function id(prefix) serial = serial + 1; return prefix .. ":" .. generation .. ":" .. serial end
+  local function identity()
+    local out, uncertain = { generation = generation }, {}
+    local readers = {
+      hostname = function() return Root().maNetSocket.hostname end,
+      showfile = function() return Root().MANetSocket:Get("ShowFile") end,
+      user = function() return CurrentUser().name end,
+      profile = function() return CurrentProfile().name end,
+    }
+    local pieces = {}
+    for _, k in ipairs({ "generation", "hostname", "showfile", "user", "profile" }) do
+      local ok, value = true, out[k]
+      if readers[k] then ok, value = pcall(readers[k]) end
+      if not ok or type(value) ~= "string" or value == "" then uncertain[#uncertain + 1] = k
+      else out[k] = value; pieces[#pieces + 1] = #value .. ":" .. value end
+    end
+    local rawKey = #uncertain == 0 and table.concat(pieces, "|") or "unavailable"
+    if rawKey ~= previousIdentity then contextEpoch = contextEpoch + 1; previousIdentity = rawKey end
+    out.epoch = contextEpoch
+    local okE, env = pcall(function() return CurrentEnvironment().name end)
+    return { identity = out, contextKey = #uncertain == 0 and (rawKey .. "|epoch:" .. contextEpoch) or nil,
+      identityUncertain = emptyArray(uncertain), environment = okE and env or nil, observedAt = now(), atomic = false }
+  end
+  local function guard(key)
+    local current = identity()
+    if not current.contextKey then fail("identity-unavailable", "show, host, user or profile identity could not be verified") end
+    if type(key) ~= "string" or key ~= current.contextKey then fail("context-changed", "contextKey differs from the current bridge generation/show/user/profile; nothing was dispatched") end
+    return current
+  end
+  local function lease()
+    if leases.current and leases.current.expiresAt <= now() then leases.current = nil end
+    return leases.current
+  end
+  local function ownedLease(client, token)
+    local l = lease()
+    if not l or l.client ~= client or l.token ~= token then fail("writer-lease", "a current writer lease token owned by this connection is required") end
+    guard(l.contextKey)
+    return l
+  end
+  function fastpath.admit(op, client)
+    if READ_OPS[op] or op == "fast.lease" or op:match("^input%.release") or op == "input.close" or op == "input.end" or op == "input.recover" or op == "control.close" or op == "control.recover" then return end
+    local l = lease()
+    for _,b in pairs(batches) do
+      if b.status == "running" and b.client == client then fail("batch-busy", "this connection has a running batch; cancel or await it before another mutation") end
+    end
+    if l then
+      if l.client ~= client then fail("writer-busy", "another bridge connection owns a writer lease; reads remain available") end
+      guard(l.contextKey)
+    end
+  end
+  ops["fast.context"] = function()
+    local current = identity()
+    current.previewCommandSeries = 1
+    return current
+  end
+  ops["fast.lease"] = function(args, ctx)
+    local action = args.action or "status"
+    local l = lease()
+    if action == "status" then return { active = l ~= nil, owned = l and l.client == ctx.client or false, expiresAt = l and l.expiresAt or nil, note = "coordinates bridge clients only; does not exclude an operator or other plugins" } end
+    if action == "release" then
+      if not l or l.client ~= ctx.client or l.token ~= args.token then fail("writer-lease", "this connection does not own that lease token") end
+      leases.current = nil; return { released = true }
+    end
+    if action ~= "acquire" and action ~= "renew" then fail("validation", "lease action must be acquire, renew, release or status") end
+    local ttl = tonumber(args.ttlMs) or 10000
+    if ttl % 1 ~= 0 or ttl < 100 or ttl > 30000 then fail("validation", "ttlMs must be an integer 100..30000") end
+    if action == "acquire" then
+      guard(args.contextKey)
+      if l then fail("writer-busy", "a writer lease already exists; renew or release the existing token") end
+      l = { client = ctx.client, token = id("lease"), contextKey = args.contextKey }
+      leases.current = l
+    else l = ownedLease(ctx.client, args.token) end
+    l.expiresAt = now() + ttl / 1000
+    return { token = l.token, expiresAt = l.expiresAt, contextKey = l.contextKey, note = "cooperative bridge writer lease; console operator and unrelated plugins are not locked" }
+  end
+  local function sweep()
+    local t = now()
+    for k,s in pairs(snapshots) do if s.expiresAt <= t then snapshots[k] = nil end end
+    for k,s in pairs(cueSnapshots) do if s.expiresAt <= t then cueSnapshots[k] = nil end end
+    for k,b in pairs(batches) do if b.status ~= "running" and b.endedAt and t - b.endedAt > 60 then batches[k] = nil end end
+  end
+  -- Freeze one bounded native capture, then page the retained plain data without native rescans.
+  -- Capture itself is an observed read, not a console transaction; pages share exactly that read.
+  local nativeCueContent = ops["cue.content"]
+  local CUE_PAGE_BYTES = 8 * 1024 * 1024
+  local function cueMembership(ref)
+    local object = resolve(ref)
+    local class = safeCall(object,"GetClass")
+    if class ~= "Sequence" and class ~= "Cue" then fail("not-cue","ref must resolve to one Sequence or Cue") end
+    local children = class == "Cue" and {object} or safeCall(object,"Children")
+    if type(children) ~= "table" then fail("unreadable","cue membership is unavailable") end
+    local order, seen = {}, {}
+    for _,cue in ipairs(children) do
+      if safeCall(cue,"GetClass") == "Cue" then
+        local address = safeCall(cue,"Addr")
+        if type(address) ~= "string" or address == "" or #address > 128 or seen[address] then fail("unreadable","cue membership is missing, oversized or duplicated") end
+        seen[address] = true; order[#order+1] = address
+        if #order > 10002 then fail("snapshot-limit","native cue capture exceeds 10002 objects") end
+      end
+    end
+    return emptyArray(order)
+  end
+  local function cuePage(s, offset, limit)
+    local out = {}; for k,v in pairs(s.result) do out[k] = v end
+    local cues, bytes = {}, 0
+    for i=offset+1,math.min(#s.result.cues,offset+limit) do
+      bytes = bytes + s.cueBytes[i]
+      if bytes > CUE_PAGE_BYTES then break end
+      cues[#cues+1]=s.result.cues[i]
+    end
+    out.cues,out.offset,out.count=emptyArray(cues),offset,#cues
+    out.protocol,out.snapshotId,out.contextKey="gma3-cue-snapshot-v1",s.id,s.contextKey
+    out.environment,out.capturedAt,out.expiresAt=s.environment,s.capturedAt,s.expiresAt
+    out.frozen,out.atomic,out.total,out.capturedCount=true,false,#s.result.cues,#s.result.cues
+    if offset==0 then out.cueOrder=s.order end
+    out.nextCursor=offset+#cues<#s.result.cues and (s.id.."/"..tostring(offset+#cues)) or nil
+    return out
+  end
+  ops["cue.content"] = function(args,ctx)
+    if args.action == nil then return nativeCueContent({ref=args.ref}) end
+    if args.action == "capabilities" then return {protocol="gma3-cue-snapshot-v1",frozen=true,atomic=false,maxCueObjects=10002,maxPageCues=200,maxPageDataBytes=CUE_PAGE_BYTES,maxSnapshotBytes=32*1024*1024,maxCaptureMs=30000} end
+    sweep()
+    local action,limit=args.action,args.limit or 200
+    if type(limit)~="number" or limit%1~=0 or limit<1 or limit>200 then fail("validation","cue page limit must be an integer 1..200") end
+    if action=="create" then
+      if type(args.ref)~="string" or #args.ref==0 or #args.ref>1024 then fail("validation","cue snapshot ref must have 1..1024 bytes") end
+      local count,own,bytes=0,0,0
+      for _,s in pairs(cueSnapshots) do count=count+1;bytes=bytes+s.bytes;if s.client==ctx.client then own=own+1 end end
+      if count>=8 or own>=2 then fail("snapshot-limit","at most two cue snapshots per connection and eight globally; release an old snapshot") end
+      local ttl,captureMs=args.ttlMs or 60000,args.maxCaptureMs or 15000
+      if type(ttl)~="number" or ttl%1~=0 or ttl<1000 or ttl>60000 then fail("validation","cue snapshot ttlMs must be an integer 1000..60000") end
+      if type(captureMs)~="number" or captureMs%1~=0 or captureMs<100 or captureMs>30000 then fail("validation","cue maxCaptureMs must be an integer 100..30000") end
+      local before=identity();guard(before.contextKey)
+      if before.environment~="Normal" and before.environment~="Preview" then fail("identity-unavailable","cue snapshot environment could not be verified") end
+      local order=cueMembership(args.ref)
+      local capture = {maxCueObjects=10002,deadline=now()+captureMs/1000,cueBytes={},maxPageBytes=CUE_PAGE_BYTES}
+      local result=nativeCueContent({ref=args.ref},capture)
+      local after=guard(before.contextKey)
+      if after.environment~=before.environment or encode(cueMembership(args.ref))~=encode(order) then fail("context-changed","cue membership/order or environment changed during capture") end
+      if #result.cues~=#order then fail("context-changed","native cue capture does not cover original membership") end
+      for i,cue in ipairs(result.cues) do if cue.addr~=order[i] then fail("context-changed","native cue capture order changed") end end
+      local size=#json.encode(result)
+      if size>32*1024*1024 or bytes+size>64*1024*1024 then fail("snapshot-limit","cue snapshots exceed the 32MiB capture/64MiB retained budget") end
+      local s={id=id("cue-snapshot"),client=ctx.client,result=result,order=order,cueBytes=capture.cueBytes,bytes=size,contextKey=before.contextKey,environment=before.environment,capturedAt=before.observedAt,expiresAt=now()+ttl/1000}
+      cueSnapshots[s.id]=s;return cuePage(s,0,limit)
+    end
+    local s=cueSnapshots[args.snapshotId]
+    if not s or s.client~=ctx.client then fail("snapshot-unavailable","cue snapshot expired, disconnected, or belongs to another connection") end
+    if action=="release" then cueSnapshots[s.id]=nil;return {released=true} end
+    if action~="page" then fail("validation","cue snapshot action must be create, page or release") end
+    local valid,current=pcall(guard,s.contextKey)
+    if not valid then cueSnapshots[s.id]=nil;error(current,0) end
+    if current.environment~=s.environment then cueSnapshots[s.id]=nil;fail("context-changed","cue snapshot environment changed") end
+    local prefix=s.id.."/";local cursor=args.cursor
+    if type(cursor)~="string" or cursor:sub(1,#prefix)~=prefix then fail("cursor-invalid","cursor does not belong to this cue snapshot") end
+    local suffix=cursor:sub(#prefix+1)
+    if not suffix:match("^%d+$") then fail("cursor-invalid","invalid cue snapshot cursor") end
+    local offset=tonumber(suffix)
+    if not offset or offset<0 or offset>=#s.result.cues then fail("cursor-invalid","cue snapshot cursor offset is out of bounds") end
+    return cuePage(s,offset,limit)
+  end
+  local function page(s, offset, limit)
+    local out = {}
+    for k,v in pairs(s.result) do out[k] = v end
+    local rows = {}
+    for i = offset + 1, math.min(#s.result.rows, offset + limit) do rows[#rows + 1] = s.result.rows[i] end
+    out.rows, out.offset, out.count = emptyArray(rows), offset, #rows
+    out.snapshotId, out.capturedAt, out.expiresAt, out.contextKey = s.id, s.capturedAt, s.expiresAt, s.contextKey
+    out.atomic, out.frozen, out.capturedCount = false, true, #s.result.rows
+    out.nextCursor = offset + #rows < #s.result.rows and (s.id .. "/" .. tostring(offset + #rows)) or nil
+    return out
+  end
+  ops["programmer.snapshot"] = function(args,ctx)
+    sweep()
+    local action = args.action or "create"
+    local limit = tonumber(args.limit) or 200
+    if limit % 1 ~= 0 or limit < 1 or limit > 5000 then fail("validation", "limit must be an integer 1..5000") end
+    if action == "create" then
+      local count, bytes = 0, 0
+      for _,s in pairs(snapshots) do count = count + 1; bytes = bytes + s.bytes end
+      if count >= 16 then fail("snapshot-limit", "at most 16 retained programmer snapshots; release an old snapshot") end
+      local own = 0; for _,s in pairs(snapshots) do if s.client == ctx.client then own = own + 1 end end
+      if own >= 4 then fail("snapshot-limit", "at most four snapshots per connection; release an old snapshot") end
+      local before = identity(); guard(args.contextKey or before.contextKey)
+      if type(before.environment) ~= "string" then fail("identity-unavailable", "programmer environment could not be verified") end
+      local ttl = tonumber(args.ttlMs) or 10000
+      if ttl % 1 ~= 0 or ttl < 100 or ttl > 30000 then fail("validation", "ttlMs must be an integer 100..30000") end
+      local scan = {}; for k,v in pairs(args) do scan[k] = v end; scan.offset, scan.limit = 0, 5000
+      local result = ops.programmer(scan)
+      local after = guard(before.contextKey)
+      if after.environment ~= before.environment then fail("context-changed", "programmer environment changed during capture") end
+      local size = #encode(result)
+      if size > 4 * 1024 * 1024 or bytes + size > 16 * 1024 * 1024 then fail("snapshot-limit", "snapshot exceeds retained byte budget; narrow fixture/attribute scope") end
+      result.snapshotTruncated = result.total > #result.rows
+      if result.snapshotTruncated then result.coverage.complete = false; result.limitations[#result.limitations + 1] = "snapshot captures at most 5000 rows; narrow scope for full coverage" end
+      local s = { id = id("snapshot"), client = ctx.client, result = result, bytes = size, contextKey = before.contextKey, environment = before.environment, capturedAt = before.observedAt, expiresAt = now() + ttl / 1000 }
+      snapshots[s.id] = s
+      return page(s,0,limit)
+    end
+    local s = snapshots[args.snapshotId]
+    if not s or s.client ~= ctx.client then fail("snapshot-unavailable", "snapshot expired, disconnected, or belongs to another connection") end
+    if action == "release" then snapshots[s.id] = nil; return { released = true } end
+    if action ~= "page" then fail("validation", "snapshot action must be create, page or release") end
+    local valid, current = pcall(guard,s.contextKey)
+    if not valid then snapshots[s.id] = nil; error(current,0) end
+    if current.environment ~= s.environment then snapshots[s.id] = nil; fail("context-changed", "snapshot programmer environment changed") end
+    local prefix = s.id .. "/"
+    local cursor = args.cursor
+    if type(cursor) ~= "string" or cursor:sub(1,#prefix) ~= prefix then fail("cursor-invalid", "cursor does not belong to this snapshot") end
+    local suffix = cursor:sub(#prefix + 1)
+    if not suffix:match("^%d+$") then fail("cursor-invalid", "invalid snapshot cursor offset") end
+    local offset = tonumber(suffix)
+    if not offset or offset < 0 or offset >= #s.result.rows then fail("cursor-invalid", "snapshot cursor offset is out of bounds") end
+    return page(s,offset,limit)
+  end
+  local function commandAllowed(command)
+    if type(command) ~= "string" or #command == 0 or #command > 8192 or command:find("[;%c]") then return false end
+    -- Do not accept raw Lua (including via a command-line Lua keyword), nested Cmd or plugin calls.
+    local plain = command:gsub('"[^"]*"', '""'):gsub("'[^']*'", "''"):lower()
+    for token in plain:gmatch("[%a_][%w_]*") do if token == "lua" or token == "cmd" or token == "plugin" then return false end end
+    return true
+  end
+  local function batchView(b)
+    local completed = 0
+    for _,r in ipairs(b.results) do if r.kind == "mutation" and r.status == "succeeded" then completed = completed + 1 end end
+    local outcome
+    if b.status ~= "running" then outcome = b.status == "succeeded" and "succeeded" or b.status == "unknown" and "unknown" or completed > 0 and "partial" or "failed" end
+    return { id = b.id, status = b.status, outcome = outcome, completedMutations = completed, contextKey = b.contextKey, createdAt = b.createdAt, endedAt = b.endedAt,
+      steps = emptyArray(b.results), nextStep = b.next, error = b.error, cancelRequested = b.cancelRequested or false,
+      note = "one step per bridge frame; native operations cannot be interrupted; no retries; operator edits are not excluded" }
+  end
+  ops["fast.batch"] = function(args,ctx)
+    sweep()
+    local action = args.action or "start"
+    if action == "list" then
+      local out = {}; for _,b in pairs(batches) do if b.client == ctx.client then out[#out + 1] = batchView(b) end end
+      return { batches = emptyArray(out), note = "only this connection's retained batches; inspect before any retry after a lost start reply" }
+    end
+    if action ~= "start" then
+      local b = batches[args.id]
+      if not b or b.client ~= ctx.client then fail("batch-unavailable", "batch expired, disconnected, or belongs to another connection") end
+      if action == "cancel" then b.cancelRequested = true elseif action ~= "status" then fail("validation", "batch action must be start, status, cancel or list") end
+      return batchView(b)
+    end
+    guard(args.contextKey)
+    if type(args.steps) ~= "table" or #args.steps < 1 or #args.steps > 128 then fail("validation", "batch needs 1..128 ordered steps") end
+    local count = 0
+    for _,b in pairs(batches) do count = count + 1; if b.client == ctx.client and b.status == "running" then fail("batch-busy", "this connection already has a running batch") end end
+    if count >= 32 then fail("batch-limit", "at most 32 retained batches; completed batches expire after 60 seconds") end
+    if #encode(args.steps) > 128 * 1024 then fail("validation", "batch input exceeds 128 KiB") end
+    local mutating, results = false, {}
+    for i,s in ipairs(args.steps) do
+      if type(s) ~= "table" or type(s.args) ~= "table" then fail("validation", "every step needs op and args") end
+      if s.op ~= "cmd" and s.op ~= "set" and not BATCH_READS[s.op] then fail("validation", "unsupported batch op: " .. tostring(s.op)) end
+      if s.op == "cmd" and not commandAllowed(s.args.command) then fail("validation", "batch commands must be single bounded commands without semicolons, control characters, Lua, Cmd or Plugin keywords") end
+      if s.name ~= nil and (type(s.name) ~= "string" or #s.name > 128) then fail("validation", "step name must be a string of at most 128 bytes") end
+      if s.expect ~= nil and (type(s.expect) ~= "table" or type(s.expect.path) ~= "string" or #s.expect.path > 256 or s.expect.value == nil) then fail("validation", "step expect needs a bounded dot path and non-null value") end
+      if s.op == "set" and (type(s.args.ref) ~= "string" or type(s.args.property) ~= "string" or (type(s.args.value) ~= "string" and type(s.args.value) ~= "number" and type(s.args.value) ~= "boolean")) then fail("validation", "set step needs ref, property and primitive value") end
+      local mutation = s.op == "cmd" or s.op == "set"; mutating = mutating or mutation
+      results[i] = { name = s.name or tostring(i), op = s.op, kind = mutation and "mutation" or "read", status = "skipped" }
+    end
+    if mutating then ownedLease(ctx.client,args.leaseToken) end
+    local b = { id = id("batch"), client = ctx.client, contextKey = args.contextKey, leaseToken = args.leaseToken, mutating = mutating,
+      steps = args.steps, results = results, next = 1, status = "running", createdAt = now(), bytes = 0 }
+    batches[b.id] = b
+    return batchView(b)
+  end
+  local function classify(result)
+    local f = result and result.feedback
+    if f == true then return "succeeded" elseif f == false then return "failed" end
+    if type(f) ~= "string" then return "unknown" end
+    local text = f:lower():gsub("^%s+", "")
+    for _,word in ipairs({ "error", "illegal", "invalid", "unknown", "failed", "not allowed", "not executed", "no such", "no valid", "not found", "does not exist", "doesn't exist", "cannot", "can't", "access denied", "insufficient", "read-only", "read only", "nothing to", "nothing selected", "empty selection", "out of range" }) do if text:find(word,1,true) then return "failed" end end
+    return text:sub(1,2) == "ok" and not text:sub(3,3):match("[%w_]") and "succeeded" or "unknown"
+  end
+  local previewUnits = { Percent = true, PercentFine = true, Physical = true, Natural = true,
+    Decimal8 = true, Decimal16 = true, Decimal24 = true }
+  local function previewSelection(command)
+    local expression = command:match("^Fixture (%d.*)$")
+    if not expression then return false end
+    for token in expression:gmatch("%S+") do
+      if token ~= "+" and token ~= "-" and token:lower() ~= "thru" and not token:match("^%d[%d%.]*$") then return false end
+    end
+    return true
+  end
+  local function previewValue(command)
+    local intensity = tonumber(command:match("^At ([%d%.]+)$"))
+    if intensity then return intensity >= 0 and intensity <= 100 end
+    local value = tonumber(command:match('^Attribute "[%a][%w_.]*" At Absolute (%-?[%d%.]+)$'))
+    if value then return math.abs(value) < math.huge end
+    local unit, number = command:match('^Attribute "[%a][%w_.]*" At Absolute (%w+) (%-?[%d%.]+)$')
+    local numeric = tonumber(number)
+    return previewUnits[unit] == true and numeric ~= nil and math.abs(numeric) < math.huge
+  end
+  -- Keep the pre-Store readback outside this operation. Only adjacent static look commands are
+  -- coalesced, with an identity/environment check and an individual receipt for each command.
+  ops["fast.previewCommands"] = function(args, ctx)
+    local commands = args.commands
+    if type(commands) ~= "table" or #commands < 3 or #commands > 16 then
+      fail("validation", "Preview command series needs 3..16 commands")
+    end
+    for i, command in ipairs(commands) do
+      if not commandAllowed(command) or #command > 1024 or
+         (i == 1 and command ~= "ClearSelection") or
+         (i == 2 and not previewSelection(command)) or
+         (i >= 3 and not previewValue(command)) then
+        fail("validation", "Unsupported command in the Preview static look series")
+      end
+    end
+    local function ready()
+      if guard(args.contextKey).environment ~= "Preview" then fail("preview-required", "Preview environment is required") end
+      if inputBusy() then fail("busy", "Console input ownership is active") end
+    end
+    ready()
+    local steps, status = {}, "succeeded"
+    for i, command in ipairs(commands) do
+      local allowed, reason = pcall(ready)
+      if not allowed then
+        steps[i] = { command = command, status = "failed", error = type(reason) == "table" and reason.message or tostring(reason) }
+      else
+        local ok, result = pcall(ops.cmd, { command = command }, ctx)
+        if ok then
+          steps[i] = { command = command, status = classify(result), feedback = result and result.feedback }
+        else
+          steps[i] = { command = command, status = "unknown", error = type(result) == "table" and result.message or tostring(result) }
+        end
+      end
+      status = steps[i].status
+      if status ~= "succeeded" then break end
+    end
+    return { status = status, steps = steps }
+  end
+  local function stop(b,status,message) b.status,b.error,b.endedAt = status,message,now() end
+  local function equal(a,b,depth)
+    if type(a) ~= type(b) then return false end
+    if type(a) ~= "table" then return a == b end
+    if depth > 16 then return false end
+    for k,v in pairs(a) do if not equal(v,b[k],depth+1) then return false end end
+    for k in pairs(b) do if a[k] == nil then return false end end
+    return true
+  end
+  function fastpath.service()
+    sweep()
+    local active = {}
+    for k,b in pairs(batches) do if b.status == "running" then active[#active + 1] = k end end
+    table.sort(active)
+    if #active == 0 then return end
+    batchCursor = (batchCursor % #active) + 1
+    local b = batches[active[batchCursor]]
+    do
+      if b.status == "running" then
+        if b.cancelRequested then stop(b,"cancelled","cancelled before next step")
+        else
+          local ok,err = pcall(function()
+            guard(b.contextKey)
+            if b.mutating then ownedLease(b.client,b.leaseToken) end
+            if b.results[b.next].kind == "mutation" then
+              local busy = inputBusy(); if busy then fail("busy","console input ownership became active") end
+            end
+          end)
+          if not ok then stop(b,"failed",type(err)=="table" and err.message or tostring(err))
+          else
+            local step, result = b.steps[b.next], b.results[b.next]
+            result.startedAt = now()
+            local okR, value = pcall(ops[step.op],step.args,{client=b.client,now=now()})
+            result.endedAt = now()
+            local receiptOk,receiptError=pcall(function()
+            if not okR then result.status,result.error = result.kind == "mutation" and "unknown" or "failed",type(value)=="table" and value.message or tostring(value)
+            else
+              local serializationLoss={}
+              result.detail = toJsonSafe(value,nil,nil,serializationLoss); result.status = "succeeded"
+              if step.op == "cmd" then result.status = classify(value)
+              elseif step.op == "set" then
+                if value.readOk ~= true then result.status = "unknown"
+                else
+                  local stored=value.exact
+                  if stored==nil then stored=value.value end
+                  if stored==nil then stored="" end
+                  if tostring(stored)~=tostring(step.args.value) then result.status="failed" end
+                end
+              elseif type(value) == "table" and (value.complete==false or value.truncated==true or value.snapshotTruncated==true or (type(value.coverage)=="table" and value.coverage.complete~=true)) then result.status,result.error = "failed","read coverage is incomplete" end
+              if next(serializationLoss) then
+                result.status,result.error=result.kind=="mutation" and "unknown" or "failed","receipt serialization is incomplete"
+                result.serializationLoss=serializationLoss
+              end
+              if step.expect and result.status == "succeeded" then
+                local observed = value
+                for part in step.expect.path:gmatch("[^.]+") do observed = type(observed)=="table" and observed[tonumber(part) or part] or nil end
+                if not equal(observed,step.expect.value,0) then result.status,result.error = "failed","read-back expectation mismatched or unavailable" end
+              end
+            end
+            -- A strict encoder failure is lost receipt evidence, not a successful fallback envelope.
+            b.bytes = b.bytes + #json.encode(result)
+            if b.bytes > 1024 * 1024 then result.detail = nil; result.status,result.error = result.kind == "mutation" and "unknown" or "failed","batch result budget reached; narrow reads" end
+            end)
+            if not receiptOk then
+              result.detail=nil
+              result.status=result.kind=="mutation" and "unknown" or "failed"
+              result.error="receipt processing failed: "..(type(receiptError)=="string" and receiptError:sub(1,512) or "unreadable native value")
+              result.serializationLoss={processingError=true}
+            end
+            if result.status ~= "succeeded" then stop(b,result.status,result.error or "step did not report known success")
+            else b.next = b.next + 1; if b.next > #b.steps then stop(b,"succeeded") end end
+          end
+        end
+      end
+    end
+  end
+  function fastpath.close(client)
+    if leases.current and leases.current.client == client then leases.current = nil end
+    for k,s in pairs(snapshots) do if s.client == client then snapshots[k] = nil end end
+    for k,s in pairs(cueSnapshots) do if s.client == client then cueSnapshots[k] = nil end end
+    for k,b in pairs(batches) do if b.client == client then batches[k] = nil end end
+  end
+  function fastpath.reset()
+    leases,batches,snapshots,cueSnapshots = {},{},{},{}
+    contextEpoch,previousIdentity,batchCursor = 0,nil,0
+    generation = tostring(os.time()) .. ":" .. tostring(socket.gettime()) .. ":" .. tostring({})
+    fastpath.generation = generation
+    state.fastGeneration = generation
+  end
+  return fastpath
+end)()
+state._serviceFastpath = ops._fastpath.service
+
 local function errorReply(id, opName, err)
   local msg, code, detail
   if type(err) == "table" then
@@ -7494,11 +8582,13 @@ local function handleLine(client, line)
   end
   local id = req.id
   local op = ops[req.op or ""]
-  if not op then
+  if type(op) ~= "function" then
     return encode({ id = id, ok = false, error = "unknown op '" .. tostring(req.op) .. "'" })
   end
   local args = req.args or {}
   local ctx = { client = client, now = now() }
+  local admitted, admissionError = pcall(ops._fastpath.admit, req.op, client)
+  if not admitted then return errorReply(id, req.op, admissionError) end
   -- Interaction admission (KB-05): a mutating op is refused while input ownership is active anywhere.
   local guard = GUARDED_OPS[req.op]
   if guard then
@@ -7512,7 +8602,10 @@ local function handleLine(client, line)
   end
   local okR, result = xpcall(function() return op(args, ctx) end, debug.traceback)
   if okR then
-    return encode({ id = id, ok = true, result = toJsonSafe(result) })
+    -- Batch details were already converted once before retention. Converting the envelope again
+    -- would spend its depth budget on steps/detail and silently truncate native phaser steps.
+    local detailDepth = req.op == "fixtureAttributes" and args.includeChannelFunctions == true and 8 or nil
+    return encode({ id = id, ok = true, result = req.op == "fast.batch" and result or toJsonSafe(result, nil, nil, nil, detailDepth) })
   end
   return errorReply(id, req.op, result)
 end
@@ -7547,6 +8640,7 @@ end
 local function closeClient(i, reason)
   local c = state.clients[i]
   if c then
+    ops._fastpath.close(c)
     releaseClientSession(c, reason or "disconnect")
     pcall(function() c.sock:close() end)
   end
@@ -7646,6 +8740,7 @@ local function serverMain()
     end
 
     serviceClients()
+    ops._fastpath.service()
 
     coroutine.yield()
   end
@@ -8069,6 +9164,7 @@ local function MainImpl(display_handle, argument)
   state.running = true
   state.stopRequested = false
   state.clients = {}
+  ops._fastpath.reset()
   loadModules()
   if opts.bank then applyBankPolicy(opts) end
   if opts.control then applyControlPolicy(opts) end
