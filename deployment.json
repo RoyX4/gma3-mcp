@@ -1,24 +1,24 @@
 {
   "schemaVersion": 1,
-  "release": "programming-completion-20261104",
-  "serverSourceHash": "eefd1a227bfe6a5a9286c73a8f0e551ae996db98324677e72635570a480ffc05",
+  "release": "merge-all-20261105",
+  "serverSourceHash": "1a648557d51049a22eb0f7a7aae4d8e77e1e10467199e296c786f2f4c568635f",
   "pluginSources": {
-    "gma3_mcp_bridge.lua": "d2a15f1db0c50c04c307654450375d2ba2b33f15f7b398b9c9fee64d99110993",
+    "gma3_mcp_bridge.lua": "95981fd88f68eab73892c59458835990ac265107d87c08a6420f1e78fe3c6875",
     "gma3_mcp_hardkeys.lua": "ff53c18317bffc8055d7f475445911dc28ff282080934205b1eaac2c5198e689",
-    "gma3_mcp_feedback.lua": "51e96fb86f70e013c62f230d95abedcdbda304f2ecf4a801792d37eaa1adf9bb",
+    "gma3_mcp_feedback.lua": "c343eae9e9fb398ba92dda19d2aa8b9e7fc265344c96d833be9239c167b43548",
     "gma3_mcp_control.lua": "41588b296d10f90d62ed8455a0a67addb6298ba69c2453ab520591602b9e34cc",
-    "gma3_mcp_bridge.xml": "1e0992261b564c69197a9837804acef2b763cc7c968900ba1207d6e683ba43db"
+    "gma3_mcp_bridge.xml": "c7c7028bf4622245829d513da0de520d736f86f653eef544c17b432626f28b60"
   },
   "runtimeQualification": {
     "luaVersion": "Lua 5.5",
     "softwareVersion": "2.5.1.1",
     "fingerprints": {
-      "bridge": "lua-bytecode-adler32:f5472759:280311",
+      "bridge": "lua-bytecode-adler32:767af6aa:292511",
       "hardkeys": "lua-bytecode-adler32:a2e3b386:192485",
-      "feedback": "lua-bytecode-adler32:de402112:55520",
+      "feedback": "lua-bytecode-adler32:10f367d5:55872",
       "control": "lua-bytecode-adler32:f1d381ea:57989"
     },
-    "scope": "Imported bytecode identity in the isolated lab with checked static Preview preparation, scoped cue edits and tracking controls, native channel inspection, and paged cue checkpoints. Feature and platform scope is documented in the qualification record.",
+    "scope": "Imported bytecode identity of bridge 0.51.0 / feedback 0.8.1 in the isolated lab, reproduced across two launches. Native checks after the upstream merge: scoped and multipart range edits, Block/Unblock, Break World/Filter, Tracking Distance, channel-function details, timed parts, call-level store_cues trigger/time with cue notes, pool usage, and stable live patch fingerprints across all collections. Paging and durable-job code is unchanged since programming-completion-20261104 and was not re-run.",
     "platform": {
       "os": "Ubuntu 26.04.1",
       "architecture": "x86_64",
@@ -29,8 +29,9 @@
       "Physical checks and show merging are deferred.",
       "Native Block/Unblock qualification is scoped to static main-part data.",
       "Large native reads are bounded by capture time, part count, data size and reconstruction limits.",
+      "Paging (>500 cues) and durable 501-cue jobs were qualified on programming-completion-20261104; that code is byte-identical here and was not re-run.",
       "Only the documented onPC 2.5.1.1 lab deployment was tested in this pass."
     ],
-    "evidence": "docs/qualification/programming-completion-2026-11-04.md"
+    "evidence": "docs/qualification/merge-all-2026-11-05.md"
   }
 }
