@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
-  "release": "merge-all-20261105",
-  "serverSourceHash": "1a648557d51049a22eb0f7a7aae4d8e77e1e10467199e296c786f2f4c568635f",
+  "release": "selection-bounds-20261117",
+  "serverSourceHash": "3b2cc47546f9b850241781c69d2d85f0b1780c7106eb4fd851a774650bcf6d66",
   "pluginSources": {
     "gma3_mcp_bridge.lua": "95981fd88f68eab73892c59458835990ac265107d87c08a6420f1e78fe3c6875",
     "gma3_mcp_hardkeys.lua": "ff53c18317bffc8055d7f475445911dc28ff282080934205b1eaac2c5198e689",
@@ -30,8 +30,9 @@
       "Native Block/Unblock qualification is scoped to static main-part data.",
       "Large native reads are bounded by capture time, part count, data size and reconstruction limits.",
       "Paging (>500 cues) and durable 501-cue jobs were qualified on programming-completion-20261104; that code is byte-identical here and was not re-run.",
-      "Only the documented onPC 2.5.1.1 lab deployment was tested in this pass."
+      "Only the documented onPC 2.5.1.1 lab deployment was tested in this pass.",
+      "selection-bounds-20261117 changes only the Node server (bounded selection commands, RoyX4/gma3-mcp#2). The plugin files are byte-identical to merge-all-20261105, so these runtime fingerprints and native checks carry over; building an over-bound look in parts was verified with the fake console, unit tests and CI, not natively."
     ],
-    "evidence": "docs/qualification/merge-all-2026-11-05.md"
+    "evidence": "docs/qualification/selection-bounds-2026-11-17.md"
   }
 }
