@@ -2,20 +2,22 @@
  * Bounded fixture selections.
  *
  * grandMA3 rejected a 9,273-character `Fixture a + b + …` selection (530 fixtures, Night Shift console, 2026-10) and
- * accepted a 5,663-character one. The parser's exact limit is not known, so a selection command is kept within the
- * bounds that Night Shift's authorer used natively: at most 128 entries and 4,096 characters.
+ * accepted a 5,663-character one. The parser's exact limit is not known; the evidence is about characters, so a
+ * selection command is kept within 4,096 characters, the bound Night Shift's authorer used natively.
  *
- * A selection inside the bounds is returned unchanged, character for character. Only a selection over them is
- * rewritten, in two exact steps:
- *   1. compact: three or more consecutive ascending fixture ids become one range (`Fixture 1 + 2 + 3` -> `Fixture 1
- *      Thru 3`). The set and the selection order are the same; sub-fixture ids (`501.1`) and other keywords are kept.
- *   2. split: when the compact form is still over the bounds, it is cut into several selections, each within them.
+ * A selection within the bound is returned unchanged, character for character. Only a selection over it is rewritten,
+ * and only in exact ways:
+ *   1. compact: a keyword that repeats the one in force is dropped (`Fixture 1 + Fixture 3` -> `Fixture 1 + 3`), and
+ *      three or more consecutive ascending fixture ids become one range (`Fixture 1 + 2 + 3` -> `Fixture 1 Thru 3`).
+ *      The set and the selection order are the same; sub-fixture ids (`501.1`) and other keywords keep their entries.
+ *   2. split: when the compact form is still over the bound, it is cut into several selections, each within it.
  *      A split selection is never sent as consecutive select commands: grandMA3 adds a second `Fixture …` to the
  *      selection only while the selected fixtures have no active values and replaces it otherwise. Callers instead
  *      run their whole per-selection work (ClearSelection, select, values, read-back) once per part.
- * A selection that uses `-` (removal) is never split, because a removal can refer to an earlier part.
+ * A selection this cannot read exactly (one that removes fixtures with `-`, or an open `Thru`) is left as it is, and a
+ * caller that cannot split (a phaser, which spreads across its whole selection) sends the compact form: in both cases
+ * one command, as before, and the console decides.
  */
-export const MAX_SELECTION_ENTRIES = 128;
 export const MAX_SELECTION_CHARACTERS = 4096;
 
 interface Entry {
@@ -26,14 +28,6 @@ interface Entry {
 
 const KEYWORDS = new Map(["fixture", "group", "channel", "subfixture"].map((k) => [k, k[0].toUpperCase() + k.slice(1)]));
 const ID = /^\d+(?:\.\d+)*$/;
-
-function entryCount(selection: string): number {
-  return selection.split(" ").filter((t) => t === "+" || t === "-").length + 1;
-}
-
-function withinBounds(selection: string): boolean {
-  return selection.length <= MAX_SELECTION_CHARACTERS && entryCount(selection) <= MAX_SELECTION_ENTRIES;
-}
 
 /**
  * The entries of `Keyword id [Thru id] (+ [Keyword] id [Thru id])*`, each with the keyword it inherits (grandMA3
@@ -66,7 +60,11 @@ function parse(selection: string): Entry[] | null {
   return entries.length ? entries : null;
 }
 
-const plainId = (e: Entry): number | null => (e.keyword === "Fixture" && e.to === undefined && /^\d+$/.test(e.from) ? Number(e.from) : null);
+function plainId(e: Entry): number | null {
+  if (e.keyword !== "Fixture" || e.to !== undefined || !/^\d+$/.test(e.from)) return null;
+  const n = Number(e.from);
+  return Number.isSafeInteger(n) ? n : null;
+}
 
 /** Runs of three or more consecutive ascending plain fixture ids become one `a Thru b` entry, in place. */
 function compact(entries: Entry[]): Entry[] {
@@ -88,41 +86,34 @@ function render(entries: Entry[]): string {
     .join(" + ");
 }
 
-/**
- * The same selection, shorter when it is over the bounds (consecutive ids as ranges), otherwise unchanged. For a
- * caller that must send one command; the result may still be over the bounds.
- */
+/** The same selection, shorter when it is over the bound, otherwise unchanged. The result may still be over it. */
 export function compactSelection(selection: string): string {
-  if (withinBounds(selection)) return selection;
+  if (selection.length <= MAX_SELECTION_CHARACTERS) return selection;
   const entries = parse(selection);
   return entries ? render(compact(entries)) : selection;
 }
 
 /**
- * The selection as one or more selections, each within the bounds. One part means it fits (unchanged when it was
- * within the bounds, compacted otherwise); several parts must each get their own ClearSelection and per-selection
- * work. An error when it is over the bounds and cannot be split exactly.
+ * The selection as one or more selections that each fit one command. One part: within the bound (unchanged), compacted
+ * to fit, or not readable exactly (unchanged, may be over the bound). Several parts: each needs its own ClearSelection
+ * and per-selection work.
  */
-export function boundSelection(selection: string): { parts: string[] } | { error: string } {
-  if (withinBounds(selection)) return { parts: [selection] };
+export function splitSelection(selection: string): string[] {
+  if (selection.length <= MAX_SELECTION_CHARACTERS) return [selection];
   const entries = parse(selection);
-  if (!entries) {
-    return {
-      error: `the selection is ${selection.length} characters and ${entryCount(selection)} entries, over the ${MAX_SELECTION_CHARACTERS}-character / ${MAX_SELECTION_ENTRIES}-entry bound for one grandMA3 command, and it cannot be split exactly${/(^| )-( |$)/.test(selection) ? " because it removes fixtures with -" : ""}; list the fixtures as ids and Thru ranges joined by +, or store them as a Group and select that`,
-    };
-  }
+  if (!entries) return [selection];
   const compacted = compact(entries);
   const whole = render(compacted);
-  if (withinBounds(whole)) return { parts: [whole] };
+  if (whole.length <= MAX_SELECTION_CHARACTERS) return [whole];
   const parts: Entry[][] = [];
   let part: Entry[] = [];
   for (const entry of compacted) {
-    if (part.length && (part.length === MAX_SELECTION_ENTRIES || render([...part, entry]).length > MAX_SELECTION_CHARACTERS)) {
+    if (part.length && render([...part, entry]).length > MAX_SELECTION_CHARACTERS) {
       parts.push(part);
       part = [];
     }
     part.push(entry);
   }
   if (part.length) parts.push(part);
-  return { parts: parts.map(render) };
+  return parts.map(render);
 }

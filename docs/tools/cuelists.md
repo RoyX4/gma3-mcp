@@ -25,15 +25,16 @@ activates the fixture's whole colour group (KB-17), so a cue can hold more value
 
 **Large selections.** grandMA3 rejects a selection command that is too long: a 530-fixture `Fixture a + b + …` of
 9,273 characters was refused, while one of 5,663 characters was accepted. The exact limit isn't known, so one selection
-command holds at most 128 entries and 4,096 characters (`src/selection-batches.ts`). A selection within those bounds
-is sent exactly as given. One over them is first compacted (three or more consecutive ascending fixture ids become
-`a Thru b`: the same fixtures in the same order), and if it still doesn't fit, the look is built in parts. Each part
-gets its own `ClearSelection`, its share of the selection and the look's whole content, and is checked on its own, so
-every fixture gets every value and every check. The report lists each part with `selectionPart` (`"2/5"`). Two
-cases are refused before anything is sent: a phaser look that doesn't fit one command (a phaser spreads across its
-whole selection), and an over-bound selection that removes fixtures with `-`. For those, store the fixtures as a Group
-and give the group. The single-command tools (`gma3_select`, the `gma3_set_*` tools, cue filters) compact an
-over-bound selection the same way but still send one command.
+command holds at most 4,096 characters (`src/selection-batches.ts`). A selection within that bound is sent exactly as
+given. One over it is first compacted: a repeated keyword is dropped (`Fixture 1 + Fixture 3` becomes `Fixture 1 + 3`)
+and three or more consecutive ascending fixture ids become `a Thru b`, giving the same fixtures in the same order. If it
+still doesn't fit, the look is built in parts. Each part gets its own `ClearSelection`, its share of the selection and
+the look's whole content, and is checked on its own, so every fixture gets every value and every check. With
+`detail: true` the report lists each part with `selectionPart` (`"2/5"`), under the look's own number.
+`gma3_edit_cue_values` builds every part the same way. Some selections stay one command, as they were before this
+bound: a phaser look (a phaser spreads across its whole selection), a selection that removes fixtures with `-`, and
+the single-command tools (`gma3_select`, the `gma3_set_*` tools, cue store filters), which only compact. If one of
+those is still too long, the console decides; storing the fixtures as a Group and giving the group avoids it.
 
 Timing on a `values` entry applies to that attribute. Cue-level `fade` and `delay` set the general timing on Part 0.
 Use a Dimmer value entry for individual intensity timing. For example, `{"attribute":"Dimmer","value":40,"unit":"percent","fade":1.25,"delay":0}`.

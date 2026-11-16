@@ -111,7 +111,11 @@ export async function editCueValues(unscoped: ToolContext, raw: unknown) {
   const [validated] = validateCues(v, [{ cue: 1, fixtures, values: input.values, presets: input.presets, intensity: input.intensity }], undefined);
   if (!input.preview && !input.exclusive) v.fail("exclusive:true is required when applying to the console's Preview programmer");
   if (!v.ok || !fixtures || !validated) return validationFailure(OPERATION, target, v.errors);
-  const look = validated.looks[0];
+  // An over-bound selection arrives as several looks with the same content, one per part of the selection: build
+  // every part, and describe the edit (values, presets, fingerprint) once, over the whole selection.
+  const parts = validated.looks;
+  const { selectionPart: _part, ...first } = parts[0];
+  const look = parts.length === 1 ? parts[0] : { ...first, fixtures };
   const values: RangeValue[] = look.values.map(x => ({ attribute: x.attribute, layer: x.layer ?? "absolute", value: x.value }));
   if (look.intensity !== undefined) values.push({ attribute: "Dimmer", layer: "absolute", value: look.intensity });
   const ctx = inDataPool(unscoped, input), ref = `Sequence ${input.sequence}`, timeout = ctx.requestTimeoutMs;
@@ -166,7 +170,7 @@ export async function editCueValues(unscoped: ToolContext, raw: unknown) {
     if (input.preview) return buildResult({ operation: OPERATION, target, steps: [inspect], extra: { preview: true, plan, fingerprint } });
     const built = await buildCueBatch(ctx, {
       sequence: input.sequence, mode: "merge", verify: true, cue_only: input.tracking === "cue_only" ? "on" : "off",
-      cues: selected.map(c => ({ cue: String(c), part: input.part, looks: [look], timing: {} })),
+      cues: selected.map(c => ({ cue: String(c), part: input.part, looks: parts, timing: {} })),
       storeScope: { fixtures, attributes: filterAttributes },
       verifyStored: async cue => {
         const number = Math.round(Number(cue.cue) * 1000);
