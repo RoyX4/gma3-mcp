@@ -76,6 +76,7 @@ import { HeldLock } from "../mutations.js";
 import { VarTracker, variablePresence, variableRefs } from "./variables.js";
 import { dataPoolShape, inDataPool } from "./datapool.js";
 import { fixtureRange } from "./inspection.js";
+import { MAX_SELECTION_CHARACTERS, MAX_SELECTION_ENTRIES, boundSelection } from "../selection-batches.js";
 
 export const MAX_CUES = 100;
 export const MAX_LOOKS = 16;
@@ -111,6 +112,8 @@ export interface LookSpec {
   releases?: ReleaseSpec[];
   /** SU-14: a phaser built on the look's fixtures (steps and phaser layers, as gma3_build_phaser takes them). */
   phaser?: Effect;
+  /** Set when one look's selection was over the one-command bound and was split: this is part `index` of `of`. */
+  selectionPart?: { index: number; of: number };
 }
 function canGroupLook(look: LookSpec): boolean {
   return !look.presets.length && !look.phaser && !look.releases?.length
@@ -278,15 +281,35 @@ export function validateLooks(v: Validator, raw: Record<string, unknown>, path: 
       return [];
     }
     if (raw.looks.length > MAX_LOOKS) v.fail(`${path}: at most ${MAX_LOOKS} looks per cue`);
-    return raw.looks.slice(0, MAX_LOOKS).flatMap((l, i) => validateLook(v, l, `${path}.looks[${i}]`, defaultFixtures) ?? []);
+    return raw.looks.slice(0, MAX_LOOKS).flatMap((l, i) => splitLook(v, validateLook(v, l, `${path}.looks[${i}]`, defaultFixtures), `${path}.looks[${i}]`));
   }
   if (!shorthand) {
     if (allowEmpty) return [];
     v.fail(`${path}: give its content (presets, intensity, values, phaser or looks), or a command`);
     return [];
   }
-  const look = validateLook(v, raw, path, defaultFixtures);
-  return look ? [look] : [];
+  return splitLook(v, validateLook(v, raw, path, defaultFixtures), path);
+}
+
+/**
+ * A look whose selection is over the bound for one grandMA3 command becomes one look per part of it
+ * (selection-batches.ts). Each part is built like any other look (ClearSelection, select, presets, values, releases,
+ * read-back), so every fixture still gets every value and every check; consecutive select commands are never relied on
+ * to add up. A phaser spreads across its whole selection, so a phaser look is refused instead of split.
+ */
+function splitLook(v: Validator, look: LookSpec | undefined, path: string): LookSpec[] {
+  if (!look) return [];
+  const bounded = boundSelection(look.fixtures);
+  if ("error" in bounded) {
+    v.fail(`${path}.fixtures: ${bounded.error}`);
+    return [];
+  }
+  if (bounded.parts.length === 1) return [{ ...look, fixtures: bounded.parts[0] }];
+  if (look.phaser) {
+    v.fail(`${path}: a phaser look's selection must fit one command (${MAX_SELECTION_CHARACTERS} characters, ${MAX_SELECTION_ENTRIES} entries) because the phaser spreads across the whole selection; it needs ${bounded.parts.length}. Store the fixtures as a Group and give the group, or use Thru ranges`);
+    return [];
+  }
+  return bounded.parts.map((fixtures, i) => ({ ...look, fixtures, selectionPart: { index: i + 1, of: bounded.parts.length } }));
 }
 
 /**
@@ -420,7 +443,7 @@ interface CueReport {
   /** The cue's look check (before the store) and property read-back (after), combined. */
   verification: Verification;
   name?: string | null;
-  looks?: Array<{ fixtures: string; presets: string[]; verification: string; detail?: string }>;
+  looks?: Array<{ fixtures: string; presets: string[]; verification: string; detail?: string; selectionPart?: string }>;
   error?: string;
 }
 
@@ -552,7 +575,7 @@ export interface PreviewItemReport {
   status: PreviewItemStatus;
   /** The look checks in the programmer before the store (not_requested without verify). */
   verification: Verification;
-  looks?: Array<{ fixtures: string; presets: string[]; verification: string; detail?: string }>;
+  looks?: Array<{ fixtures: string; presets: string[]; verification: string; detail?: string; selectionPart?: string }>;
   error?: string;
   /** This item's steps (looks, store), in order. */
   steps: StepResult[];
@@ -749,7 +772,7 @@ export async function buildInPreview(ctx: ToolContext, o: { items: PreviewItem[]
         plan.push({ name: `${pre}clear`, run: () => commandStep(bridge, `${pre}clear`, "ClearAll", t) });
       }
       item.looks.forEach((look, j) => {
-        const lp = `${pre}look ${j + 1} `;
+        const lp = `${pre}look ${j + 1}${look.selectionPart ? ` (selection part ${look.selectionPart.index}/${look.selectionPart.of})` : ""} `;
         const grouped = seriesContext !== undefined && canGroupLook(look);
         const valueCommands = [
           ...(look.intensity === undefined ? [] : [{ name: "intensity", command: `At ${formatValue(look.intensity)}` }]),
@@ -767,7 +790,7 @@ export async function buildInPreview(ctx: ToolContext, o: { items: PreviewItem[]
           plan.push({ name: `${lp}clear_selection`, run: () => commandStep(bridge, `${lp}clear_selection`, "ClearSelection", t) });
           plan.push({ name: `${lp}select`, run: () => commandStep(bridge, `${lp}select`, look.fixtures, t) });
         }
-        const entry: NonNullable<PreviewItemReport["looks"]>[number] = { fixtures: look.fixtures, presets: look.presets.map((p) => p.ref), verification: o.verify ? "matched" : "not_requested" };
+        const entry: NonNullable<PreviewItemReport["looks"]>[number] = { fixtures: look.fixtures, presets: look.presets.map((p) => p.ref), verification: o.verify ? "matched" : "not_requested", ...(look.selectionPart ? { selectionPart: `${look.selectionPart.index}/${look.selectionPart.of}` } : {}) };
         report.looks!.push(entry);
         const parts: Verification[] = [];
         // A check right after the command it verifies: a later preset in the same look may take over an earlier one's

@@ -8,6 +8,7 @@ import { operation, type RegisterTools, type ToolContext } from "./context.js";
 import { dataPoolShape, inDataPool } from "./datapool.js";
 import { expandFixtures } from "./groups.js";
 import { lockState } from "./playback.js";
+import { compactSelection } from "../selection-batches.js";
 
 type Row = Record<string, unknown>;
 type Layer = EffectiveNativeCell["layer"];
@@ -142,7 +143,7 @@ function prepare(observation: Observation, scope: Scope, action: Action, sequenc
   const after = simulated(observation, nativeScope, action, changes);
   if (!after.complete || !sameEffective(observation.reconstruction, after)) throw new Error(`Cue ${scope.cue} ${scope.attribute} would change an effective value. Inspect its tracking distances and cue-part ownership.`);
   const keyword = action === "block" ? "Block" : "Unblock";
-  const command = `${keyword} ${cueRef(sequence, scope.cue)} If Fixture ${scope.fixtures.join(" + ")} Attribute "${nativeScope.attribute}" EndIf`;
+  const command = `${keyword} ${cueRef(sequence, scope.cue)} If ${compactSelection(`Fixture ${scope.fixtures.join(" + ")}`)} Attribute "${nativeScope.attribute}" EndIf`;
   return { ...nativeScope, command, changes, beforeHash: preservedHash(observation.native, nativeScope) };
 }
 
