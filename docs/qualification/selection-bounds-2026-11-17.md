@@ -18,6 +18,7 @@ Break, Tracking Distance, timed parts, pool usage, patch fingerprints) carries o
 | Check | Result |
 | --- | --- |
 | `npm test` on the merged tip | 1,481 tests, 1,457 pass, 0 fail, 24 skipped (no Lua interpreter on PATH; no Lua changed) |
+| `npm test` and `npm run test:lua` with Lua 5.4.8 on PATH (2026-11-24, `main` at b57110f) | 1,481 / 1,481 pass, 0 skipped; Lua harnesses 2,877 passed, 0 failed |
 | CI on the PR | `test (24)` passed on both runs |
 | `test/selection-batches.test.ts` | 11 tests: unchanged within the bound, compaction, splitting by characters, the exact bound, sub-fixture and unsafe ids, `-` and open ranges left whole |
 | Fake console, `gma3_store_cues` | a 530-fixture, 4,245-character look is built in two parts; all 530 fixtures stored with every value, one store |

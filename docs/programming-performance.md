@@ -99,6 +99,29 @@ The installed manual covers these mechanisms in `cue_tracking.html`, `cue_tracki
 
 The earlier soak is a failed attempt, not a completed long-session qualification: 26 samples covered 134.733 verified seconds. Its one persistent socket recorded one connection, zero disconnects and one ping timeout. The four-second ping overlapped a 4.671-second FixtureTypes fingerprint request; that is timing evidence consistent with a busy synchronous native handler, not an observed TCP drop. The matched Intel matrix began after that attempt ended, with zero overlap. FINALv4 corrects the status hint so an open but unresponsive socket is not described as an absent plugin. This diagnostic fix does not make the original timeout disappear. The final-build NVIDIA nine-sample comparison and current renderer/process proof passed. The new strict read-only soak passed: 239 samples covered 1,200,047.534537 ms of verified span (1,200,363.277672 ms elapsed), with one connection, zero disconnects and zero timeouts. Station/show/user/profile, bridge generation and module fingerprints stayed stable in that observation window. The native workload was idle apart from the declared read-only checks; host load was retained. This does not establish responsiveness during heavy native work or after a later show/plugin generation change. [Passed report](qualification/2026-10-30.md), [all samples](qualification/2026-10-30.md). The post-reboot route and eleven-section persistence checks also passed. Later general-PSR reproduction show loads are separate from that accepted soak generation/window.
 
+## Patch fingerprint cost per object, 24 November 2026
+
+Native lab run (onPC 2.5.1.1, bridge 0.51.0 `767af6aa:292511`, release `selection-bounds-20261117`): five `patchAdd`
+blocks of 240 one-channel dimmers into the lab show. Each block made 34 bridge requests; the 18 `patch.fingerprint`
+requests took 15.01 s of 21.25 s (70.6 %), 17.30 s of 24.25 s (71.4 %) and 20.06 s of 30.21 s (66.4 %) in blocks 3, 4
+and 5, growing with the patch. `patch.add` itself took 4.55 s in block 3.
+
+Per collection in block 3, one fingerprint per side (copy and live each cost the same):
+
+| Collection | Objects | Console ms | Per object |
+| --- | ---: | ---: | ---: |
+| FixtureTypes (6 types) | 3,845 | 3,038 | 0.79 ms |
+| Stages (489 fixtures, the session's own left out) | 595 | 2,610 | 4.39 ms |
+| DmxUniverses (shallow) | 1,025 | 1,022 | 1.00 ms |
+| AttributeDefinitions | 403 | 562 | 1.39 ms |
+
+The time is the per-object walk itself: every property of every object is read with `Get(k, Enums.Roles.Display)`
+inside a `pcall` and joined into the FNV-1a input. A fixture costs most because it has the most properties. The
+measurements still do not separate the property reads from the hashing. `runtime/lab-qualification/bench-fingerprint.mjs`
+in the grandma3 hub times the walk alone, the walk with raw `Get`, the walk with Display `Get`, and the console's
+native `Export` of the same collection (with a stability check), so the next change can target the part that costs
+the most. It has not been run yet.
+
 ## Qualification protocol for the current implementation
 
 The desired-state/provenance compiler, native CuePart read, durable job engine, filtered/snapshotted reads and native bounded batches now exist in source. Compare the unchanged baseline full-state method, the new full-state method and the new delta job against the same complete states on the same disposable rig. Rotate run order, retain all samples and include startup, identity guards, Store, native postconditions, cleanup and Save. Report request counts and whole-job elapsed time separately from isolated read latency. Do not run the CPU-heavy regression suite during that comparison.
