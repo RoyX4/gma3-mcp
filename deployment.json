@@ -31,7 +31,7 @@
       "Large native reads are bounded by capture time, part count, data size and reconstruction limits.",
       "Paging (>500 cues) and durable 501-cue jobs were qualified on programming-completion-20261104; that code is byte-identical here and was not re-run.",
       "Only the documented onPC 2.5.1.1 lab deployment was tested in this pass.",
-      "selection-bounds-20261117 changes only the Node server (bounded selection commands, RoyX4/gma3-mcp#2). The plugin files are byte-identical to merge-all-20261105, so these runtime fingerprints and native checks carry over; building an over-bound look in parts was verified with the fake console, unit tests and CI, not natively."
+      "selection-bounds-20261117 changes only the Node server (bounded selection commands, RoyX4/gma3-mcp#2). The plugin files are byte-identical to merge-all-20261105, so these runtime fingerprints and native checks carry over. Building an over-bound look in parts was checked natively in the lab on 2026-11-24 (600 fixtures, two parts, all stored); the console's exact selection length limit was not measured."
     ],
     "evidence": "docs/qualification/selection-bounds-2026-11-17.md"
   }
