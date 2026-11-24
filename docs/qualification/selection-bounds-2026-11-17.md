@@ -24,11 +24,22 @@ Break, Tracking Distance, timed parts, pool usage, patch fingerprints) carries o
 | Fake console, `gma3_edit_cue_values` | the same selection edits all 530 fixtures in both cues (red without the fix) |
 | Independent review | two passes; the first found a partial edit in `gma3_edit_cue_values` (fixed), the second checked 3,000 random over-bound selections with 0 mismatches |
 
+## Native check on the lab console (2026-11-24)
+
+Isolated lab console (station Roy-McpLab, onPC 2.5.1.1, `MCPLab-Qualification` loaded `/NoSave` and never saved),
+bridge 0.51.0 `lua-bytecode-adler32:767af6aa:292511`, server `selection-bounds-20261117` from the repo checkout.
+
+| Step | Result |
+| --- | --- |
+| Scratch patch | 1,200 `Dimmer` / `Mode 0` fixtures, fids 20001-21200, universes 10-12, five `patchAdd` blocks of 240, each `matched` (21-29 s per block) |
+| `gma3_store_cues` on the 600 odd fids | selection 4,805 characters; built as two parts of 4,093 and 717 characters, each `matched`; one store; 3.06 s |
+| Selection commands the console received (bridge trace) | 4,093 and 717 characters, both accepted |
+| Stored cue read natively (`readNativeCueContent`) | 600 Dimmer rows, all 70 % (69.999998807907); 0 missing, 0 wrong, no even fid in the cue |
+| Normal programmer before and after | empty |
+
 ## Not verified natively
 
 - The console's real selection length limit (somewhere between 5,663 accepted and 9,273 rejected characters).
-- A split look on a console. The pattern (one `ClearSelection`, selection part and full look content per part) is the
-  one Night Shift's authorer ran natively, but this server's version has not been run against grandMA3.
 - `Fixture 1 Thru 3` selecting the same fixtures in the same order as `Fixture 1 + 2 + 3` (standard grandMA3
   behaviour, not captured here).
 - `gma3_edit_cue_values` still sends its Store filter as one command; past the console's limit the Store is rejected
